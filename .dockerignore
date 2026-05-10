@@ -1,0 +1,32 @@
+# Don't ship local node_modules / build artifacts into the image build context.
+# Without this, Docker would copy ~1.5 GB from the laptop to the daemon — slow,
+# and we want a clean install inside the image anyway.
+node_modules
+**/node_modules
+.medusa
+**/.medusa
+
+# Git metadata
+.git
+.gitignore
+.gitattributes
+
+# Local secrets — never bake into image
+.env
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Editor / OS junk
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+
+# Don't include the Dockerfile itself in the build context unnecessarily
+.dockerignore
+Dockerfile
+
+# Documentation
+README.md
+LICENSE
