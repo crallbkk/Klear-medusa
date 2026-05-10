@@ -28,7 +28,10 @@ RUN cd apps/backend && npm run build
 
 # Install production-only deps inside the .medusa/server bundle.
 # This is what Medusa v2 docs prescribe for production deploys.
-RUN cd apps/backend/.medusa/server && npm install --omit=dev
+# --legacy-peer-deps: Medusa v2.14.2 has an internal React 18/19 peer-dep
+# conflict between @medusajs/icons (wants 19) and the rest of the bundle (18).
+# Known harmless quirk; without this flag npm refuses to install.
+RUN cd apps/backend/.medusa/server && npm install --omit=dev --legacy-peer-deps
 
 # ---- Stage 2: runner ----
 # Minimal image: only the .medusa/server bundle. The full source tree and
