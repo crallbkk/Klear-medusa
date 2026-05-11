@@ -16,7 +16,7 @@ const redisModules = redisUrl
       },
       {
         resolve: "@medusajs/medusa/workflow-engine-redis",
-        options: { redisUrl },
+        options: { redis: { redisUrl } },
       },
     ]
   : []
