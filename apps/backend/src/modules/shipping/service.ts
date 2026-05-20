@@ -15,19 +15,19 @@ export const SHIPPING_MODULE = "klear_shipping";
 
 // Klear-specific shipping service.
 //
-// Wraps Shippop (the chosen aggregator — DECISIONS.md 2026-05-20). Distinct
-// from Medusa's built-in fulfillment module: this one handles label
-// creation, multi-carrier rate quoting, tracking-webhook ingestion, and
-// cancellation against the Thai carrier network. The Medusa core
-// fulfillment module continues to manage the order-side lifecycle.
+// Wraps Shippop (DECISIONS.md 2026-05-20). Default routed carrier comes
+// from env (SHIPPING_DEFAULT_CARRIER, default "FLE" = Flash Express);
+// per-shipment overrides flow through createShipment.input.carrier.
 //
-// Default routed carrier comes from env (SHIPPING_DEFAULT_CARRIER, e.g.
-// "flash"); per-shipment overrides flow through createShipment.input.carrier.
+// Architectural note: this module is currently invoked from subscribers
+// and admin actions, not from Medusa's native fulfillment lifecycle. The
+// conversion to an `AbstractFulfillmentProviderService` is tracked as
+// task 2.11 in DEV_TRACKER.md.
 
 function resolveProvider(): IShippingProvider {
   const apiKey = process.env.SHIPPOP_API_KEY;
   const baseUrl = process.env.SHIPPOP_API_BASE_URL;
-  const webhookSecret = process.env.SHIPPOP_WEBHOOK_SECRET;
+  const webhookSecret = process.env.SHIPPOP_WEBHOOK_PATH_SECRET;
 
   if (!apiKey || !baseUrl || !webhookSecret) {
     return new UnconfiguredShippopProvider();
@@ -35,21 +35,21 @@ function resolveProvider(): IShippingProvider {
   return new ShippopProvider({
     api_key: apiKey,
     api_base_url: baseUrl,
-    webhook_secret: webhookSecret,
+    webhook_path_secret: webhookSecret,
   });
 }
 
 function resolveDefaultCarrier(): ThaiCarrier {
   const fromEnv = process.env.SHIPPING_DEFAULT_CARRIER as ThaiCarrier | undefined;
-  return fromEnv ?? "flash";
+  return fromEnv ?? "FLE";
 }
 
 export default class ShippingModuleService {
   private readonly provider: IShippingProvider;
   private readonly defaultCarrier: ThaiCarrier;
 
-  constructor() {
-    this.provider = resolveProvider();
+  constructor(_container?: unknown, providerOverride?: IShippingProvider) {
+    this.provider = providerOverride ?? resolveProvider();
     this.defaultCarrier = resolveDefaultCarrier();
   }
 
@@ -66,17 +66,22 @@ export default class ShippingModuleService {
     });
   }
 
-  getTracking(tracking_number: string): Promise<TrackingEvent[]> {
-    return this.provider.getTracking(tracking_number);
+  getTracking(shippop_tracking_code: string): Promise<TrackingEvent[]> {
+    return this.provider.getTracking(shippop_tracking_code);
   }
 
-  cancelShipment(shipment_id: string): Promise<void> {
-    return this.provider.cancelShipment(shipment_id);
+  cancelShipment(courier_tracking_code: string): Promise<void> {
+    return this.provider.cancelShipment(courier_tracking_code);
+  }
+
+  getLabelHtml(purchase_id: number): Promise<string> {
+    return this.provider.getLabelHtml(purchase_id);
   }
 
   verifyAndParseWebhook(input: {
     raw_body: string;
     headers: Record<string, string>;
+    path_secret?: string;
   }): Promise<ShippingWebhookEvent> {
     return this.provider.verifyAndParseWebhook(input);
   }

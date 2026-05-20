@@ -11,9 +11,9 @@ import {
 
 const NOT_CONFIGURED_MSG =
   "Shippop is selected as the shipping provider (DECISIONS.md 2026-05-20) " +
-  "but SHIPPOP_API_KEY is not set. Provision a Shippop merchant account, " +
-  "add SHIPPOP_API_KEY + SHIPPOP_API_BASE_URL to Railway env, then swap " +
-  "UnconfiguredShippopProvider for ShippopProvider in service.ts.";
+  "but SHIPPOP_API_KEY / SHIPPOP_API_BASE_URL / SHIPPOP_WEBHOOK_PATH_SECRET " +
+  "are not set. Provision a Shippop merchant account, add the env vars to " +
+  "Railway, then ShippingModuleService will auto-resolve to ShippopProvider.";
 
 export class UnconfiguredShippopProvider implements IShippingProvider {
   readonly name = "shippop" as const;
@@ -26,17 +26,22 @@ export class UnconfiguredShippopProvider implements IShippingProvider {
     throw new ShippingError("not_configured", NOT_CONFIGURED_MSG);
   }
 
-  async getTracking(_tracking_number: string): Promise<TrackingEvent[]> {
+  async getTracking(_shippop_tracking_code: string): Promise<TrackingEvent[]> {
     throw new ShippingError("not_configured", NOT_CONFIGURED_MSG);
   }
 
-  async cancelShipment(_shipment_id: string): Promise<void> {
+  async cancelShipment(_courier_tracking_code: string): Promise<void> {
+    throw new ShippingError("not_configured", NOT_CONFIGURED_MSG);
+  }
+
+  async getLabelHtml(_purchase_id: number): Promise<string> {
     throw new ShippingError("not_configured", NOT_CONFIGURED_MSG);
   }
 
   async verifyAndParseWebhook(_input: {
     raw_body: string;
     headers: Record<string, string>;
+    path_secret?: string;
   }): Promise<ShippingWebhookEvent> {
     throw new ShippingError("not_configured", NOT_CONFIGURED_MSG);
   }

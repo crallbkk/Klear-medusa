@@ -4,12 +4,11 @@ import { ShippingError, type ThaiAddress, type ParcelDims } from "../types";
 const sampleAddress: ThaiAddress = {
   name: "Test Recipient",
   phone: "0812345678",
-  line1: "123 Sukhumvit",
-  subdistrict: "Khlong Tan",
-  district: "Khlong Toei",
+  address: "123 Sukhumvit",
+  district: "Khlong Tan",
+  state: "Khlong Toei",
   province: "Bangkok",
   postcode: "10110",
-  country: "TH",
 };
 
 const sampleParcel: ParcelDims = {
@@ -57,15 +56,15 @@ describe("ShippingModuleService — interface shape", () => {
     expect(svc.getProviderName()).toBe("shippop");
   });
 
-  it("default carrier defaults to 'flash' when env not set", () => {
+  it("default carrier defaults to 'FLE' (Flash Express) when env not set", () => {
     const svc = new ShippingModuleService();
-    expect(svc.getDefaultCarrier()).toBe("flash");
+    expect(svc.getDefaultCarrier()).toBe("FLE");
   });
 
   it("default carrier honours SHIPPING_DEFAULT_CARRIER env override", () => {
-    process.env.SHIPPING_DEFAULT_CARRIER = "thailand_post_ems";
+    process.env.SHIPPING_DEFAULT_CARRIER = "EMST";
     const svc = new ShippingModuleService();
-    expect(svc.getDefaultCarrier()).toBe("thailand_post_ems");
+    expect(svc.getDefaultCarrier()).toBe("EMST");
     delete process.env.SHIPPING_DEFAULT_CARRIER;
   });
 
@@ -97,12 +96,19 @@ describe("ShippingModuleService — interface shape", () => {
 
   it("getTracking throws ShippingError(not_configured) without an API key", async () => {
     const svc = new ShippingModuleService();
-    await expect(svc.getTracking("TH123")).rejects.toBeInstanceOf(ShippingError);
+    await expect(svc.getTracking("SP123")).rejects.toBeInstanceOf(ShippingError);
   });
 
   it("cancelShipment throws ShippingError(not_configured) without an API key", async () => {
     const svc = new ShippingModuleService();
-    await expect(svc.cancelShipment("ship_1")).rejects.toBeInstanceOf(
+    await expect(svc.cancelShipment("TH123456789")).rejects.toBeInstanceOf(
+      ShippingError
+    );
+  });
+
+  it("getLabelHtml throws ShippingError(not_configured) without an API key", async () => {
+    const svc = new ShippingModuleService();
+    await expect(svc.getLabelHtml(452002)).rejects.toBeInstanceOf(
       ShippingError
     );
   });
