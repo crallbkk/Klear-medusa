@@ -25,6 +25,7 @@ const klearModules = [
   { resolve: "./src/modules/prescription" },
   { resolve: "./src/modules/lms" },
   { resolve: "./src/modules/payment" },
+  { resolve: "./src/modules/shipping" },
 ]
 
 module.exports = defineConfig({
