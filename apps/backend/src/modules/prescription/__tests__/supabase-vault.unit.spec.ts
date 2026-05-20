@@ -74,8 +74,12 @@ describe("decryptPrescription", () => {
     ];
     // decryption RPC calls — one per non-null ciphertext (7 here).
     for (let i = 0; i < 7; i++) {
-      handlers.push((_url, init) => {
+      handlers.push((url, init) => {
+        // Verify we hit the canonical Vault RPC name + send the
+        // prescription_master_key alias on every call.
+        expect(url).toContain("/rpc/decrypt_with_vault_key");
         const body = JSON.parse((init?.body as string) ?? "{}");
+        expect(body.key_alias).toBe("prescription_master_key");
         const pt = plaintexts[body.ciphertext];
         return jsonResponse(200, pt);
       });
