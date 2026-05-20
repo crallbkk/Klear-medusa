@@ -115,11 +115,17 @@ export async function decryptPrescription(
     );
   }
 
-  // Decrypt each field via the Vault decrypt RPC.
+  // Decrypt each field via the canonical Supabase Vault RPC
+  // `decrypt_with_vault_key(ciphertext text, key_alias text)`, defined in
+  // the storefront repo's `supabase/migrations/0002_pgcrypto.sql`. The
+  // `prescription_master_key` alias is what the storefront uses for the
+  // same data path (see `src/lib/encryption/vault.ts:VAULT_KEYS.PRESCRIPTION`).
+  // Service-role is required — EXECUTE on this function is revoked from
+  // authenticated/anon.
   async function dec(field: string): Promise<number | null> {
     const ciphertext = row[field];
     if (ciphertext === null) return null;
-    const res = await fetchImpl(`${url}/rest/v1/rpc/decrypt_prescription_field`, {
+    const res = await fetchImpl(`${url}/rest/v1/rpc/decrypt_with_vault_key`, {
       method: "POST",
       headers: {
         apikey: serviceRoleKey,
@@ -127,7 +133,10 @@ export async function decryptPrescription(
         "Content-Type": "application/json",
         Accept: "application/json",
       },
-      body: JSON.stringify({ ciphertext }),
+      body: JSON.stringify({
+        ciphertext,
+        key_alias: "prescription_master_key",
+      }),
     });
     if (!res.ok) {
       throw new SupabaseVaultError(
