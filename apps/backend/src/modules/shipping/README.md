@@ -20,13 +20,21 @@ Verified against the Shippop Postman collection 2026-05-20 — see
 
 ## Files
 
-- `service.ts` — `ShippingModuleService` (module entrypoint)
+- `service.ts` — `ShippingModuleService` (lower-level Klear module; non-lifecycle uses)
 - `types.ts` — vendor-neutral types + `IShippingProvider` + `ShippingError`
 - `providers/_unconfigured.ts` — used when env vars are missing
 - `providers/shippop.ts` — real provider against the verified API
+- `provider/service.ts` — `ShippopFulfillmentService` (extends `AbstractFulfillmentProviderService`, registered with Medusa's built-in fulfillment module)
+- `provider/index.ts` — `ModuleProvider(Modules.FULFILLMENT, ...)` registration
 - `__tests__/shippop.unit.spec.ts` — 14 cases against a mocked fetch
 - `__tests__/service.unit.spec.ts` — 12 interface-shape + unconfigured tests
+- `provider/__tests__/service.unit.spec.ts` — 12 adapter delegation tests
 - `SHIPPOP_API.md` — the curated subset of Shippop API docs we depend on
+
+Related (outside this folder):
+
+- `src/api/webhooks/shippop/[secret]/route.ts` — Shippop tracking webhook ingress; verifies path secret + emits `shippop.tracking.update` / `shippop.delivery.failed` on the event bus
+- `medusa-config.ts` — registers `ShippopFulfillmentService` under `@medusajs/medusa/fulfillment` providers list
 
 ## Required env (Railway)
 
@@ -76,25 +84,14 @@ Critical quirks (verified against the Postman docs):
 
 ## Next steps
 
-1. **Convert to `AbstractFulfillmentProviderService`** (DEV_TRACKER 2.11)
-   so this provider plugs into Medusa's native fulfillment lifecycle:
-   shipping options at checkout, admin "Create Fulfillment" / "Mark as
-   Shipped" buttons, `shipment.created` / `delivery.created` events.
-2. **Webhook API route** at `POST /webhooks/shippop/:path_secret`
-   (urlencoded body) — extract the segment, call
-   `ShippingModuleService.verifyAndParseWebhook`, map to Medusa
-   workflows (`createOrderShipmentWorkflow` /
-   `markOrderFulfillmentAsDeliveredWorkflow`).
-3. **Polling fallback cron** (every ~30 min) — call `getTracking` for any
-   shipment still in `picked_up` / `in_transit` to cover dropped webhooks.
-4. **Apply for Shippop merchant account** — off-platform, gated on Thai
-   company registration. First true end-to-end test requires this.
-5. **R2 label persistence** — stash `getLabelHtml` output so we don't
-   re-hit Shippop on every reprint, and so label URLs survive any
-   Shippop-side TTL.
-6. **Flash pickup wiring** (`/calltopickup/flash/`) — daily pickup
-   orchestration; cleanest delivered alongside the AbstractFulfillmentProviderService
-   conversion.
+1. ~~Convert to `AbstractFulfillmentProviderService`~~ — **done** (this PR). Provider lives in `provider/`.
+2. ~~Webhook API route~~ — **done** (this PR). Route at `src/api/webhooks/shippop/[secret]/route.ts` verifies + emits on event bus.
+3. **Subscriber for the emitted events** (DEV_TRACKER 2.12) — listens for `shippop.tracking.update` / `shippop.delivery.failed`, looks up the Medusa Fulfillment by `data.shippop_tracking_code`, and calls `createOrderShipmentWorkflow` / `markOrderFulfillmentAsDeliveredWorkflow`. Also fires the matching LINE OA template.
+4. **Polling fallback cron** (DEV_TRACKER 2.12, every ~30 min) — call `getTracking` for any shipment still in `picked_up` / `in_transit` to cover dropped webhooks.
+5. **Apply for Shippop merchant account** — off-platform, gated on Thai company registration. First true end-to-end test requires this.
+6. **R2 label persistence** — stash `getLabelHtml` output so we don't re-hit Shippop on every reprint, and so label URLs survive any Shippop-side TTL.
+7. **Flash pickup wiring** (`/calltopickup/flash/`) — daily pickup orchestration cron.
+8. **Per-item parcel dims** — wire the storefront product variant's weight/dims (when available) into `computeParcelFromItems` in `provider/service.ts` instead of the default-stack approximation.
 
 ## Why provider-pattern even with the vendor decided
 
