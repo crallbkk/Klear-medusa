@@ -26,6 +26,39 @@ const klearModules = [
   { resolve: "./src/modules/lms" },
   { resolve: "./src/modules/payment" },
   { resolve: "./src/modules/shipping" },
+  {
+    // Override Medusa's built-in fulfillment module so we can register the
+    // Shippop provider alongside the default manual provider. Manual stays
+    // available so the founder can hand-record a shipment in admin when
+    // testing without hitting Shippop.
+    resolve: "@medusajs/medusa/fulfillment",
+    options: {
+      providers: [
+        { resolve: "@medusajs/medusa/fulfillment-manual", id: "manual" },
+        {
+          resolve: "./src/modules/shipping/provider",
+          id: "shippop",
+          options: {
+            warehouse: {
+              name: process.env.KLEAR_WAREHOUSE_NAME || "Klear HQ",
+              phone: process.env.KLEAR_WAREHOUSE_PHONE || "0800000000",
+              address: process.env.KLEAR_WAREHOUSE_ADDRESS || "1/1 Sukhumvit 55",
+              district: process.env.KLEAR_WAREHOUSE_SUBDISTRICT || "Khlong Tan Nuea",
+              state: process.env.KLEAR_WAREHOUSE_DISTRICT || "Watthana",
+              province: process.env.KLEAR_WAREHOUSE_PROVINCE || "Bangkok",
+              postcode: process.env.KLEAR_WAREHOUSE_POSTCODE || "10110",
+            },
+            default_parcel: {
+              weight_g: 300,
+              length_cm: 18,
+              width_cm: 8,
+              height_cm: 6,
+            },
+          },
+        },
+      ],
+    },
+  },
 ]
 
 module.exports = defineConfig({
