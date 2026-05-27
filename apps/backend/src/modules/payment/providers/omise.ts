@@ -117,22 +117,87 @@ export class OmiseProvider implements IPaymentProvider {
     raw_body: string;
     headers: Record<string, string>;
   }): Promise<PaymentWebhookEvent> {
-    // Omise webhook signature: HMAC-SHA256 of the raw body keyed with
-    // the per-endpoint webhook secret, hex-encoded in X-Omise-Signature.
-    // Reference: https://docs.omise.co/webhooks
-    // TODO(omise-sandbox): confirm header capitalisation when first real
-    // webhook arrives in sandbox.
-    const sig =
-      input.headers["x-omise-signature"] ??
-      input.headers["X-Omise-Signature"];
-    if (!sig) {
-      throw new PaymentError("signature_invalid", "Missing X-Omise-Signature header.");
-    }
-    const expected = createHmac("sha256", this.webhookSecret)
-      .update(input.raw_body, "utf8")
-      .digest("hex");
-    if (!safeHexEqual(expected, sig.trim())) {
-      throw new PaymentError("signature_invalid", "Signature mismatch.");
+    // **Signature verification (per Opn docs, confirmed Klear-medusa-side
+    // 2026-05-27 from Klear/Session C WS6):**
+    //   - Header `Omise-Signature` carries the HMAC-SHA256 signature
+    //     (hex-encoded). During webhook-secret rotation it can hold two
+    //     comma-separated values — the current secret's + the expiring
+    //     secret's — and we accept either.
+    //   - Header `Omise-Signature-Timestamp` carries a unix timestamp in
+    //     seconds. Replay protection: reject if the timestamp is more
+    //     than ±5 minutes off our clock.
+    //   - Signed string is `<timestamp>.<raw_body>` (timestamp + literal
+    //     dot + raw body bytes).
+    //   - HMAC key is `OMISE_WEBHOOK_SECRET` BASE64-DECODED before use.
+    //     The env var holds a base64 string as it appears in the Opn
+    //     dashboard. Using the raw base64 string as the HMAC key (which
+    //     this code did before WS7.3a) is a common bug that produces
+    //     signatures that NEVER match Opn's.
+    //
+    // Reference: https://docs.omise.co/api-webhooks. Source for the
+    // empirical confirmation: Klear storefront repo, Session C WS6
+    // close commit (`3db0c92`) and DECISIONS.md Opn behavioral
+    // findings #15–16.
+    //
+    // **Sandbox-only bypass:** `OMISE_SKIP_WEBHOOK_SIGNATURE=true` skips
+    // all of the above. NEVER set this in production — same rule as the
+    // storefront's CLAUDE.md non-negotiable.
+    const skipVerification = process.env.OMISE_SKIP_WEBHOOK_SIGNATURE === "true";
+
+    if (!skipVerification) {
+      const sigHeader =
+        input.headers["omise-signature"] ??
+        input.headers["Omise-Signature"] ??
+        input.headers["x-omise-signature"] ??
+        input.headers["X-Omise-Signature"];
+      const tsHeader =
+        input.headers["omise-signature-timestamp"] ??
+        input.headers["Omise-Signature-Timestamp"];
+
+      if (!sigHeader) {
+        throw new PaymentError(
+          "signature_invalid",
+          "Missing Omise-Signature header. Set OMISE_SKIP_WEBHOOK_SIGNATURE=true in sandbox to bypass.",
+        );
+      }
+      if (!tsHeader) {
+        throw new PaymentError(
+          "signature_invalid",
+          "Missing Omise-Signature-Timestamp header.",
+        );
+      }
+
+      // Replay protection: ±5 minutes of clock skew.
+      const tsSeconds = Number.parseInt(tsHeader, 10);
+      if (!Number.isFinite(tsSeconds)) {
+        throw new PaymentError(
+          "signature_invalid",
+          `Omise-Signature-Timestamp is not a valid integer: ${tsHeader}`,
+        );
+      }
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      if (Math.abs(nowSeconds - tsSeconds) > 5 * 60) {
+        throw new PaymentError(
+          "signature_invalid",
+          `Webhook timestamp outside ±5 minute window (delta=${nowSeconds - tsSeconds}s). Replay protection.`,
+        );
+      }
+
+      const keyBuf = Buffer.from(this.webhookSecret, "base64");
+      const signedPayload = `${tsSeconds}.${input.raw_body}`;
+      const expected = createHmac("sha256", keyBuf)
+        .update(signedPayload, "utf8")
+        .digest("hex");
+
+      // Comma-separated signatures during rotation grace.
+      const presentedSignatures = sigHeader
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      const matched = presentedSignatures.some((sig) => safeHexEqual(expected, sig));
+      if (!matched) {
+        throw new PaymentError("signature_invalid", "Signature mismatch.");
+      }
     }
 
     let event: OmiseEvent;

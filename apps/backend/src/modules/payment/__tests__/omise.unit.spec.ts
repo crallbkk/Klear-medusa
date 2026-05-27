@@ -8,7 +8,12 @@ import type {
   OmiseRefund,
 } from "../providers/omise-types";
 
-const WEBHOOK_SECRET = "test_webhook_secret_do_not_use_in_prod";
+// Opn issues webhook secrets as base64 strings. Tests use a valid base64
+// value so production's `Buffer.from(secret, "base64")` decode produces
+// the same key bytes both sides of the HMAC compute.
+const WEBHOOK_SECRET = Buffer.from(
+  "test_webhook_secret_do_not_use_in_prod",
+).toString("base64");
 
 function makeProvider() {
   const client: OmiseClient = {
@@ -41,8 +46,31 @@ function buildCharge(overrides: Partial<OmiseCharge> = {}): OmiseCharge {
   };
 }
 
-function sign(body: string, secret = WEBHOOK_SECRET): string {
-  return createHmac("sha256", secret).update(body, "utf8").digest("hex");
+/**
+ * Build the header pair Opn sends per docs.omise.co/api-webhooks:
+ * `Omise-Signature` (hex HMAC-SHA256 over `<timestamp>.<body>` using
+ * base64-decoded secret as key) + `Omise-Signature-Timestamp` (unix
+ * seconds). Defaults to "now" so tests pass the ±5min replay window;
+ * tests that exercise the replay window pass an explicit ts.
+ *
+ * Replaces the old `sign(body)` helper which signed just the body and
+ * returned only a value for the (wrong) `x-omise-signature` header.
+ * Klear-medusa side of Session C WS7.3a — mirrors Klear storefront WS6.
+ */
+function signedHeaders(
+  body: string,
+  options: { secret?: string; ts?: number } = {},
+): Record<string, string> {
+  const secret = options.secret ?? WEBHOOK_SECRET;
+  const ts = options.ts ?? Math.floor(Date.now() / 1000);
+  const keyBuf = Buffer.from(secret, "base64");
+  const sig = createHmac("sha256", keyBuf)
+    .update(`${ts}.${body}`, "utf8")
+    .digest("hex");
+  return {
+    "omise-signature": sig,
+    "omise-signature-timestamp": String(ts),
+  };
 }
 
 describe("OmiseProvider (Klear-medusa) — config", () => {
@@ -111,20 +139,26 @@ describe("OmiseProvider.retrieveIntent + refund", () => {
 });
 
 describe("OmiseProvider.verifyAndParseWebhook", () => {
-  it("rejects without X-Omise-Signature header", async () => {
+  it("rejects without Omise-Signature header", async () => {
     const { provider } = makeProvider();
     await expect(
-      provider.verifyAndParseWebhook({ raw_body: "{}", headers: {} }),
+      provider.verifyAndParseWebhook({
+        raw_body: "{}",
+        headers: {
+          "omise-signature-timestamp": String(Math.floor(Date.now() / 1000)),
+        },
+      }),
     ).rejects.toMatchObject({ code: "signature_invalid" });
   });
 
   it("rejects on signature mismatch", async () => {
     const { provider } = makeProvider();
     const body = '{"object":"event","key":"charge.complete","data":{}}';
+    const wrongSecret = Buffer.from("a-different-secret").toString("base64");
     await expect(
       provider.verifyAndParseWebhook({
         raw_body: body,
-        headers: { "x-omise-signature": sign(body, "wrong_secret") },
+        headers: signedHeaders(body, { secret: wrongSecret }),
       }),
     ).rejects.toMatchObject({ code: "signature_invalid" });
   });
@@ -143,7 +177,7 @@ describe("OmiseProvider.verifyAndParseWebhook", () => {
 
     const result = await provider.verifyAndParseWebhook({
       raw_body: body,
-      headers: { "x-omise-signature": sign(body) },
+      headers: signedHeaders(body),
     });
     expect(result.type).toBe("payment_succeeded");
     if (result.type === "payment_succeeded") {
@@ -169,7 +203,7 @@ describe("OmiseProvider.verifyAndParseWebhook", () => {
     const body = JSON.stringify(event);
     const result = await provider.verifyAndParseWebhook({
       raw_body: body,
-      headers: { "x-omise-signature": sign(body) },
+      headers: signedHeaders(body),
     });
     expect(result.type).toBe("payment_failed");
     if (result.type === "payment_failed") {
@@ -197,7 +231,7 @@ describe("OmiseProvider.verifyAndParseWebhook", () => {
     const body = JSON.stringify(event);
     const result = await provider.verifyAndParseWebhook({
       raw_body: body,
-      headers: { "x-omise-signature": sign(body) },
+      headers: signedHeaders(body),
     });
     expect(result.type).toBe("refund_succeeded");
   });
@@ -216,7 +250,7 @@ describe("OmiseProvider.verifyAndParseWebhook", () => {
     await expect(
       provider.verifyAndParseWebhook({
         raw_body: body,
-        headers: { "x-omise-signature": sign(body) },
+        headers: signedHeaders(body),
       }),
     ).rejects.toMatchObject({ code: "unhandled_event" });
   });
