@@ -97,4 +97,4 @@ Critical quirks (verified against the Postman docs):
 
 If Shippop has an outage, rate hike, or behaviour change we don't like,
 the swap surface is `service.ts` line ~22 (`resolveProvider()`) — not
-every caller in the codebase. Matches the `klear_payment` module shape.
+every caller in the codebase. Matches the `lms` module's provider shape.
