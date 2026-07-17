@@ -1,6 +1,7 @@
 import { MedusaService } from "@medusajs/framework/utils";
 import LabJob from "./models/lab-job";
 import {
+  type BuildPacketResult,
   type ILabProvider,
   type LabJobPacket,
   type LabJobStatusReport,
@@ -10,10 +11,17 @@ import { UnimplementedLabProvider } from "./providers/_unimplemented";
 
 export const LMS_MODULE = "lms";
 
+export type LabJobStatusValue =
+  | "queued"
+  | "submitted"
+  | "failed"
+  | "cancelled"
+  | "pending_rx";
+
 export type LabJobRow = {
   id: string;
   order_id: string;
-  status: "queued" | "submitted" | "failed" | "cancelled";
+  status: LabJobStatusValue;
   packet_snapshot: LabJobPacket;
   provider_job_id: string | null;
   provider_name: string | null;
@@ -28,35 +36,148 @@ export type LabJobRow = {
  * Lab Management System (LMS) service.
  *
  * Two responsibilities:
- *   1. Persist lab_job rows for every order that's gone through
- *      lab-handoff (queued / submitted / failed / cancelled lifecycle).
+ *   1. Persist a `lab_job` row for every order that went through
+ *      lab-handoff — including durable rows for failures and send-later
+ *      waits, so ops always has visibility in /admin/lab-jobs (no silent
+ *      swallow). Lifecycle: queued / submitted / failed / pending_rx /
+ *      cancelled.
  *   2. Wrap the abstract `ILabProvider` for submission + status checks.
- *      The provider is `UnimplementedLabProvider` until a lab partner
- *      is selected (DECISIONS.md #3 + #4) — `submitJob()` throws, and
- *      the job stays in `queued` status. Switching providers is a
- *      single-line change.
+ *      The provider is `UnimplementedLabProvider` until a lab partner is
+ *      selected (DECISIONS.md #3 + #4) — `submitJob()` throws not_implemented
+ *      and the job stays `queued`. Switching providers is a single-line change.
  *
- * **PDPA boundary**: the `packet_snapshot` JSON column carries
- * plaintext Rx data because the lab needs it. Never log this column,
- * never include it in audit payloads, never expose it from the
- * customer-facing Store API.
+ * **PDPA boundary**: the `packet_snapshot` JSON column carries plaintext Rx
+ * data because the lab needs it. Never log this column, never include it in
+ * audit payloads, never expose it from the customer-facing Store API.
  */
 class LmsModuleService extends MedusaService({
   LabJob,
 }) {
   private readonly provider: ILabProvider = new UnimplementedLabProvider();
 
-  /** Create a queued lab_job row. Caller (subscriber) is responsible
-   *  for first composing the packet via buildLabJobPacket. Returns the
-   *  persisted job. */
+  /**
+   * Detects a Postgres unique-constraint violation (SQLSTATE 23505) however
+   * MikroORM/pg wraps it, so concurrent duplicate inserts can be treated as
+   * "already created" rather than crashing the subscriber.
+   */
+  private isUniqueViolation(err: unknown): boolean {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const e = err as any;
+    const code = e?.code ?? e?.cause?.code ?? e?.errno;
+    if (code === "23505") return true;
+    const name = e?.constructor?.name ?? e?.name ?? "";
+    if (typeof name === "string" && /UniqueConstraint/i.test(name)) return true;
+    const msg = err instanceof Error ? err.message : String(err);
+    return /duplicate key value|unique constraint|23505/i.test(msg);
+  }
+
+  /**
+   * Insert a lab_job row, tolerating a concurrent duplicate. If the unique
+   * index on (order_id) rejects the insert, another handler already created
+   * the row — return that existing row instead of throwing.
+   */
+  private async insertJob(data: {
+    order_id: string;
+    status: LabJobStatusValue;
+    packet_snapshot: Record<string, unknown>;
+    last_error?: string | null;
+  }): Promise<LabJobRow> {
+    try {
+      const created = (await this.createLabJobs({
+        order_id: data.order_id,
+        status: data.status,
+        packet_snapshot: data.packet_snapshot,
+        last_error: data.last_error ?? null,
+        attempts: 0,
+      })) as unknown as LabJobRow;
+      return created;
+    } catch (err) {
+      if (this.isUniqueViolation(err)) {
+        const existing = await this.getJobByOrderId(data.order_id);
+        if (existing) return existing;
+      }
+      throw err;
+    }
+  }
+
+  /** Map a build result to the persisted row's status + snapshot + reason. */
+  private rowFieldsFromBuild(
+    result: Exclude<BuildPacketResult, { outcome: "skip" }>,
+  ): {
+    order_id: string;
+    status: LabJobStatusValue;
+    packet_snapshot: Record<string, unknown>;
+    last_error: string | null;
+  } {
+    if (result.outcome === "ok") {
+      return {
+        order_id: result.packet.klear_order_id,
+        status: "queued",
+        packet_snapshot: result.packet as unknown as Record<string, unknown>,
+        last_error: null,
+      };
+    }
+    return {
+      order_id: result.snapshot.klear_order_id,
+      status: result.outcome === "pending_rx" ? "pending_rx" : "failed",
+      packet_snapshot: result.snapshot as unknown as Record<string, unknown>,
+      last_error: result.reason,
+    };
+  }
+
+  /**
+   * Persist a lab_job row from a build result. Returns null for a `skip`
+   * (frame-only order — no lab job needed). For ok/failed/pending_rx the row
+   * is created (deduped against a concurrent insert).
+   */
+  async createFromBuild(result: BuildPacketResult): Promise<LabJobRow | null> {
+    if (result.outcome === "skip") return null;
+    return this.insertJob(this.rowFieldsFromBuild(result));
+  }
+
+  /** Create a queued lab_job row directly from a packet (happy path). */
   async createJob(packet: LabJobPacket): Promise<LabJobRow> {
-    const created = (await this.createLabJobs({
+    return this.insertJob({
       order_id: packet.klear_order_id,
       status: "queued",
       packet_snapshot: packet as unknown as Record<string, unknown>,
-      attempts: 0,
-    })) as unknown as LabJobRow;
-    return created;
+      last_error: null,
+    });
+  }
+
+  /**
+   * Apply a fresh build result onto an EXISTING job (the /retry heal path).
+   * Rewrites packet_snapshot, status and last_error so a fixed prescription
+   * or corrected metadata can move a failed/pending_rx job forward. Does not
+   * submit — the caller submits when the outcome is "ok".
+   */
+  async updateJobFromBuild(
+    jobId: string,
+    result: BuildPacketResult,
+  ): Promise<LabJobRow> {
+    if (result.outcome === "skip") {
+      // The order became frame-only since the row was created (unusual). Leave
+      // the snapshot untouched; just record why nothing was submitted.
+      const updated = (await this.updateLabJobs({
+        selector: { id: jobId },
+        data: { last_error: result.reason },
+      })) as unknown as LabJobRow[];
+      if (!updated[0]) throw new Error(`updateJobFromBuild: job ${jobId} not found`);
+      return updated[0];
+    }
+    const fields = this.rowFieldsFromBuild(result);
+    const updated = (await this.updateLabJobs({
+      selector: { id: jobId },
+      data: {
+        status: fields.status,
+        packet_snapshot: fields.packet_snapshot,
+        last_error: fields.last_error,
+        // A successful rebuild clears any stale provider error.
+        ...(fields.status === "queued" ? { provider_job_id: null } : {}),
+      },
+    })) as unknown as LabJobRow[];
+    if (!updated[0]) throw new Error(`updateJobFromBuild: job ${jobId} not found`);
+    return updated[0];
   }
 
   async getJobByOrderId(orderId: string): Promise<LabJobRow | null> {
@@ -72,7 +193,7 @@ class LmsModuleService extends MedusaService({
   }
 
   async listJobsByStatus(
-    status: LabJobRow["status"],
+    status: LabJobStatusValue,
     limit = 100,
   ): Promise<LabJobRow[]> {
     return (await this.listLabJobs(
@@ -98,6 +219,11 @@ class LmsModuleService extends MedusaService({
     if (job.status === "cancelled") {
       throw new Error(
         `submitJob: job ${jobId} is cancelled — cannot resubmit`,
+      );
+    }
+    if (job.status === "pending_rx") {
+      throw new Error(
+        `submitJob: job ${jobId} is pending_rx — rebuild via retry once the Rx lands before submitting`,
       );
     }
 
@@ -148,8 +274,8 @@ class LmsModuleService extends MedusaService({
     }
   }
 
-  /** Mark a queued / failed / submitted job as cancelled. Called when
-   *  the customer cancels before lab production starts. */
+  /** Mark a queued / failed / pending_rx / submitted job as cancelled.
+   *  Called when the customer cancels before lab production starts. */
   async cancelJob(jobId: string): Promise<LabJobRow> {
     const updated = (await this.updateLabJobs({
       selector: { id: jobId },

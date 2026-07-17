@@ -2,20 +2,48 @@ import { Modules } from "@medusajs/framework/utils";
 import type { MedusaContainer } from "@medusajs/framework/types";
 import { PRESCRIPTION_MODULE } from "../prescription/service";
 import type PrescriptionModuleService from "../prescription/service";
-import { type LabJobPacket, type LensType } from "./types";
+import {
+  LENS_TYPES,
+  lensRequiresPrescription,
+  type BuildPacketResult,
+  type LabJobPacket,
+  type LabJobSnapshot,
+  type LensType,
+} from "./types";
 
 /**
- * Orchestrator: given a Medusa order id, compose the LabJobPacket
- * ready for `lms.submitJob(packet)`.
+ * Orchestrator: given a Medusa order id, compose a lab-job build result.
  *
- * Pulls from three sources:
- *   1. Medusa order (line items, shipping address, customer name + phone)
- *   2. Prescription module (order_id → prescription_id, then decrypt)
- *   3. Klear-side metadata on the order line items (lens config —
- *      lens_type, index, coatings; written at checkout by the storefront).
+ * ── The wire contract ─────────────────────────────────────────────────────
+ * The storefront stamps everything the lab needs onto Medusa metadata at
+ * checkout (Website repo `src/lib/cart/to-medusa.ts`). Metadata is the SINGLE
+ * source of truth — this module never reconstructs the order from anything
+ * else.
+ *
+ *   LINE-ITEM metadata (per Medusa line):
+ *     klear_kind                 "frame" | "lens"  (frame line is authoritative)
+ *     klear_line_id              correlates the frame + lens halves
+ *     klear_sku                  frame SKU (frame line)
+ *     klear_lens_config          { lens_type, index, coating_addons } | null
+ *     klear_prescription_id      string | null   (Rx captured at checkout)
+ *     klear_prescription_status  "active" | "pending"
+ *
+ *   ORDER-LEVEL metadata (send-later flow, Website PR #126):
+ *     klear_prescription_status  "active" | "pending"  (stamped at checkout)
+ *     klear_prescription_id      written by POST /api/order/[id]/prescription
+ *                                when the customer submits their Rx post-order
+ *
+ * Prescription resolution order:
+ *   1. line-item klear_prescription_id, else
+ *   2. order-level klear_prescription_id (send-later Rx submitted post-order), else
+ *   3. if any pending status → "pending_rx" (waiting, NOT broken), else
+ *   4. Rx-requiring lens with no id → "failed".
+ *
+ * Never throws for a business condition — returns a discriminated
+ * BuildPacketResult so the subscriber persists a durable row for ops.
  *
  * Encapsulates the only sanctioned cross-module decrypt call:
- *   prescription.decryptForLabHandoff(order_id)
+ *   prescription.decryptForLabHandoff(prescription_id)
  */
 
 export interface BuildPacketOptions {
@@ -25,36 +53,64 @@ export interface BuildPacketOptions {
 
 /** Klear metadata shape stamped onto each line item at checkout. */
 interface KlearLineMetadata {
+  klear_kind?: "frame" | "lens";
   klear_sku?: string;
   klear_lens_config?: {
     lens_type?: string;
-    index?: number;
+    index?: number | null;
     coating_addons?: string[];
-  };
-  klear_prescription_id?: string;
+  } | null;
+  klear_prescription_id?: string | null;
+  klear_prescription_status?: "active" | "pending";
 }
 
-const ALLOWED_LENS_TYPES: ReadonlySet<LensType> = new Set([
-  "single_vision",
-  "progressive",
-  "reader",
-  "polarised_sport",
-]);
+/** Klear metadata stamped onto the ORDER (cart → order + send-later write). */
+interface KlearOrderMetadata {
+  klear_prescription_id?: string | null;
+  klear_prescription_status?: "active" | "pending";
+}
 
-function pickLensType(raw: unknown): LensType {
-  if (typeof raw === "string" && (ALLOWED_LENS_TYPES as Set<string>).has(raw)) {
-    return raw as LensType;
+const ALLOWED_LENS_TYPES: ReadonlySet<string> = new Set<string>(LENS_TYPES);
+
+function buildCustomer(
+  shipping: Record<string, unknown> | null | undefined,
+): { customer: LabJobPacket["customer"]; error: string | null } {
+  if (!shipping) {
+    return { customer: undefined as never, error: "order has no shipping address" };
   }
-  // Default to single_vision when the storefront's metadata is
-  // malformed or absent. Lab will reject the packet later if this is
-  // wrong; surfacing the choice here gives a single audit point.
-  return "single_vision";
+  const name = [shipping.first_name, shipping.last_name]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+  if (!name) {
+    return { customer: undefined as never, error: "shipping address has no name" };
+  }
+  const phone = (shipping.phone as string | undefined) ?? "";
+  if (!phone) {
+    return { customer: undefined as never, error: "shipping address has no phone" };
+  }
+  return {
+    customer: {
+      name,
+      phone,
+      delivery_address: {
+        line1: (shipping.address_1 as string | undefined) ?? "",
+        line2: (shipping.address_2 as string | undefined) ?? undefined,
+        city: (shipping.city as string | undefined) ?? "",
+        province: (shipping.province as string | undefined) ?? "",
+        postal_code: (shipping.postal_code as string | undefined) ?? "",
+        country_code: "TH",
+      },
+    },
+    error: null,
+  };
 }
 
 export async function buildLabJobPacket(
   opts: BuildPacketOptions,
-): Promise<LabJobPacket> {
+): Promise<BuildPacketResult> {
   const { container, orderId } = opts;
+  const jobRef = `klear-${orderId}`;
 
   // Resolve Medusa's built-in order module from the container.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -63,66 +119,193 @@ export async function buildLabJobPacket(
     relations: ["items", "shipping_address"],
   });
   if (!order) {
-    throw new Error(`buildLabJobPacket: order ${orderId} not found`);
+    return {
+      outcome: "failed",
+      reason: `order ${orderId} not found`,
+      snapshot: { job_ref: jobRef, klear_order_id: orderId },
+    };
   }
   if (!order.items || order.items.length === 0) {
-    throw new Error(`buildLabJobPacket: order ${orderId} has no line items`);
+    return {
+      outcome: "failed",
+      reason: "order has no line items",
+      snapshot: { job_ref: jobRef, klear_order_id: orderId },
+    };
   }
 
-  // First Klear line item carries the Rx + lens config. Multi-line
-  // orders (different Rx per pair) aren't supported at MVP — flagged
-  // for the future when reorder-with-different-Rx lands.
-  const firstLine = order.items[0];
-  const lineMeta = (firstLine.metadata ?? {}) as KlearLineMetadata;
-  const frame_sku = lineMeta.klear_sku ?? firstLine.variant_sku ?? "";
-  const lens_type = pickLensType(lineMeta.klear_lens_config?.lens_type);
-  const lens_index = lineMeta.klear_lens_config?.index ?? null;
-  const coating_addons = lineMeta.klear_lens_config?.coating_addons ?? [];
+  // Select the FRAME lines. The frame line is authoritative — it carries
+  // klear_lens_config + klear_prescription_id (the paired lens line exists
+  // only so the lens upcharge reaches the order total).
+  const frameLines = order.items.filter(
+    (it: { metadata?: KlearLineMetadata | null }) =>
+      (it.metadata ?? {}).klear_kind === "frame",
+  );
 
-  // Decrypt via the prescription module's one sanctioned path.
-  const prescriptionService = container.resolve(
-    PRESCRIPTION_MODULE,
-  ) as PrescriptionModuleService;
-  const prescription = await prescriptionService.decryptForLabHandoff(orderId);
-
-  const shipping = order.shipping_address;
-  if (!shipping) {
-    throw new Error(
-      `buildLabJobPacket: order ${orderId} has no shipping address`,
-    );
+  if (frameLines.length === 0) {
+    return {
+      outcome: "failed",
+      reason:
+        "no frame line found (no line has metadata.klear_kind === 'frame') — " +
+        "order predates the checkout metadata contract or was placed by a non-Klear client",
+      snapshot: { job_ref: jobRef, klear_order_id: orderId },
+    };
   }
-  const name = [shipping.first_name, shipping.last_name]
-    .filter(Boolean)
-    .join(" ")
-    .trim();
-  if (!name) {
-    throw new Error(`buildLabJobPacket: shipping address has no name`);
-  }
-  const phone = shipping.phone ?? "";
-  if (!phone) {
-    throw new Error(`buildLabJobPacket: shipping address has no phone`);
+  if (frameLines.length > 1) {
+    // Do NOT silently process only the first pair (the original bug).
+    return {
+      outcome: "failed",
+      reason: "multi-pair orders not supported at MVP",
+      snapshot: { job_ref: jobRef, klear_order_id: orderId },
+    };
   }
 
-  return {
-    job_ref: `klear-${orderId}`,
+  const frameLine = frameLines[0];
+  const lineMeta = (frameLine.metadata ?? {}) as KlearLineMetadata;
+  const orderMeta = (order.metadata ?? {}) as KlearOrderMetadata;
+
+  const frame_sku = lineMeta.klear_sku ?? frameLine.variant_sku ?? "";
+  const lensConfig = lineMeta.klear_lens_config ?? null;
+  const rawLensType = lensConfig?.lens_type;
+  const lens_index = lensConfig?.index ?? null;
+  const coating_addons = lensConfig?.coating_addons ?? [];
+
+  const prescriptionId =
+    lineMeta.klear_prescription_id ?? orderMeta.klear_prescription_id ?? null;
+  const isPending =
+    lineMeta.klear_prescription_status === "pending" ||
+    orderMeta.klear_prescription_status === "pending";
+
+  // Frame-only order: no lens config anywhere AND no prescription signal.
+  // Legitimately needs no lab job.
+  if (!lensConfig && !prescriptionId && !isPending) {
+    return {
+      outcome: "skip",
+      order_id: orderId,
+      reason: "frame-only order — no lens configuration and no prescription",
+    };
+  }
+
+  // A prescription/pending signal with no lens configuration is contradictory
+  // (there is nothing for the lab to cut). Surface it rather than guess.
+  if (!lensConfig) {
+    return {
+      outcome: "failed",
+      reason:
+        "line carries a prescription/pending status but no lens configuration",
+      snapshot: { job_ref: jobRef, klear_order_id: orderId, frame_sku },
+    };
+  }
+
+  // Validate the lens vocabulary — NO silent defaulting.
+  if (typeof rawLensType !== "string" || !ALLOWED_LENS_TYPES.has(rawLensType)) {
+    return {
+      outcome: "failed",
+      reason: `unknown lens type: ${JSON.stringify(rawLensType ?? null)}`,
+      snapshot: {
+        job_ref: jobRef,
+        klear_order_id: orderId,
+        frame_sku,
+        lens_index,
+        coating_addons,
+      },
+    };
+  }
+  const lens_type = rawLensType as LensType;
+
+  // Validate shipping/customer — missing address/phone is a failure trigger.
+  const { customer, error: customerError } = buildCustomer(
+    order.shipping_address,
+  );
+  if (customerError) {
+    return {
+      outcome: "failed",
+      reason: customerError,
+      snapshot: {
+        job_ref: jobRef,
+        klear_order_id: orderId,
+        frame_sku,
+        lens_type,
+        lens_index,
+        coating_addons,
+      },
+    };
+  }
+
+  const baseSnapshot: LabJobSnapshot = {
+    job_ref: jobRef,
     klear_order_id: orderId,
     frame_sku,
     lens_type,
     lens_index,
     coating_addons,
-    prescription,
-    customer: {
-      name,
-      phone,
-      delivery_address: {
-        line1: shipping.address_1 ?? "",
-        line2: shipping.address_2 ?? undefined,
-        city: shipping.city ?? "",
-        province: shipping.province ?? "",
-        postal_code: shipping.postal_code ?? "",
-        country_code: "TH",
-      },
+    customer,
+  };
+
+  // Resolve the prescription.
+  if (lensRequiresPrescription(lens_type)) {
+    if (!prescriptionId) {
+      if (isPending) {
+        // Customer legitimately paid first and will send their Rx within 7
+        // days (send-later flow). Not broken — waiting.
+        return {
+          outcome: "pending_rx",
+          reason:
+            "awaiting customer prescription (send-later) — retry once the Rx is submitted",
+          snapshot: baseSnapshot,
+        };
+      }
+      return {
+        outcome: "failed",
+        reason: `lens type ${lens_type} requires a prescription but none is linked`,
+        snapshot: baseSnapshot,
+      };
+    }
+
+    // Decrypt via the prescription module's one sanctioned path.
+    const prescriptionService = container.resolve(
+      PRESCRIPTION_MODULE,
+    ) as PrescriptionModuleService;
+    try {
+      const prescription =
+        await prescriptionService.decryptForLabHandoff(prescriptionId);
+      return {
+        outcome: "ok",
+        packet: {
+          job_ref: jobRef,
+          klear_order_id: orderId,
+          frame_sku,
+          lens_type,
+          lens_index,
+          coating_addons,
+          prescription,
+          customer,
+          submitted_at: new Date().toISOString(),
+        },
+      };
+    } catch (err) {
+      return {
+        outcome: "failed",
+        reason: `prescription decrypt failed: ${
+          err instanceof Error ? err.message : "unknown error"
+        }`,
+        snapshot: baseSnapshot,
+      };
+    }
+  }
+
+  // non_prescription (plano): a real lab job with no Rx to cut.
+  return {
+    outcome: "ok",
+    packet: {
+      job_ref: jobRef,
+      klear_order_id: orderId,
+      frame_sku,
+      lens_type,
+      lens_index,
+      coating_addons,
+      prescription: null,
+      customer,
+      submitted_at: new Date().toISOString(),
     },
-    submitted_at: new Date().toISOString(),
   };
 }

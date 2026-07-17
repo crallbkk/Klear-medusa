@@ -6,5 +6,4 @@ export default Module(PRESCRIPTION_MODULE, {
 });
 
 export { PRESCRIPTION_MODULE };
-export type { PrescriptionRefRow } from "./service";
 export type { DecryptedPrescription } from "./supabase-vault";

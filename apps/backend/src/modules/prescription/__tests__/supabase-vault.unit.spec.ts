@@ -97,10 +97,12 @@ describe("decryptPrescription", () => {
     expect(rx.axis_left).toBe(85);
     expect(rx.add_right).toBeNull();
     expect(rx.add_left).toBeNull();
-    expect(rx.pd).toBe(62);
+    // Binocular 62 → halved 50/50 into each eye (monocular for the lab).
+    expect(rx.pd_right).toBe(31);
+    expect(rx.pd_left).toBe(31);
   });
 
-  it("uses pd_right + pd_left when pd_binocular is null", async () => {
+  it("preserves asymmetric monocular PD as-is (no summing) when pd_binocular is null", async () => {
     const row = jsonResponse(200, [
       {
         id: "rx_2",
@@ -123,8 +125,8 @@ describe("decryptPrescription", () => {
       ct_b: "0",
       ct_c: "-1.0",
       ct_d: "0",
-      ct_pdr: "31",
-      ct_pdl: "31",
+      ct_pdr: "33",
+      ct_pdl: "29",
     };
 
     const handlers: Array<(url: string, init?: RequestInit) => Response> = [
@@ -140,7 +142,9 @@ describe("decryptPrescription", () => {
     const rx = await decryptPrescription("rx_2", {
       fetch: fetchMock as unknown as typeof fetch,
     });
-    expect(rx.pd).toBe(62);
+    // Monocular values are kept per-eye, never summed.
+    expect(rx.pd_right).toBe(33);
+    expect(rx.pd_left).toBe(29);
   });
 
   it("throws not_found when Supabase returns no row", async () => {

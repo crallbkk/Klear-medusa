@@ -33,12 +33,23 @@ export async function GET(
       : 100;
 
   const status = req.query.status as string | undefined;
-  const validStatuses = ["queued", "submitted", "failed", "cancelled"];
+  const validStatuses = [
+    "queued",
+    "submitted",
+    "failed",
+    "cancelled",
+    "pending_rx",
+  ];
 
   let jobs;
   if (status && validStatuses.includes(status)) {
     jobs = await lms.listJobsByStatus(
-      status as "queued" | "submitted" | "failed" | "cancelled",
+      status as
+        | "queued"
+        | "submitted"
+        | "failed"
+        | "cancelled"
+        | "pending_rx",
       limit,
     );
   } else {

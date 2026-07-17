@@ -1,5 +1,4 @@
 import { MedusaService } from "@medusajs/framework/utils";
-import PrescriptionRef from "./models/prescription-ref";
 import {
   decryptPrescription,
   type DecryptedPrescription,
@@ -7,90 +6,42 @@ import {
 
 export const PRESCRIPTION_MODULE = "prescription";
 
-export type PrescriptionRefRow = {
-  id: string;
-  order_id: string;
-  prescription_id: string;
-  created_at: Date;
-  updated_at: Date;
-};
-
 /**
- * Prescription reference module.
+ * Prescription module.
  *
- * Stores the (Medusa order_id → Supabase prescription_id) link, and
- * — when called by the LMS workflow at lab-handoff time — fetches +
- * decrypts the actual Rx via the Supabase Vault.
+ * Its single job is to be the **only** sanctioned path through which a
+ * Klear prescription is decrypted on the Medusa side. Given a Supabase
+ * `prescription_id` (resolved from Medusa order/line metadata by the LMS
+ * `buildLabJobPacket` orchestrator), it fetches + decrypts the Rx via the
+ * Supabase Vault RPC.
  *
- * Decryption is intentionally fenced inside this module: nothing
- * outside `decryptForLabHandoff()` should call `decryptPrescription`.
- * That makes the audit boundary single and obvious.
+ * There is no order↔prescription table on the Medusa side: the storefront
+ * stamps `klear_prescription_id` directly onto order/line-item metadata at
+ * checkout (and the send-later flow writes it onto the order post-payment),
+ * so metadata is the wire contract and this module holds no persistent
+ * state. (The former `prescription_ref` table had zero writers and was
+ * dropped — see migration `Migration20260717000000`.)
+ *
+ * Decryption is intentionally fenced inside this module: nothing outside
+ * `decryptForLabHandoff()` should call `decryptPrescription`, which keeps
+ * the PDPA audit boundary single and obvious.
  */
-class PrescriptionModuleService extends MedusaService({
-  PrescriptionRef,
-}) {
-  /** Persist the (order_id, prescription_id) link. Idempotent — repeated
-   *  calls with the same pair are a no-op. */
-  async linkPrescriptionToOrder(
-    orderId: string,
-    prescriptionId: string,
-  ): Promise<PrescriptionRefRow> {
-    if (!orderId) throw new Error("linkPrescriptionToOrder: orderId required");
-    if (!prescriptionId) {
-      throw new Error("linkPrescriptionToOrder: prescriptionId required");
-    }
-
-    const existing = await this.listPrescriptionRefs({
-      order_id: orderId,
-      prescription_id: prescriptionId,
-    });
-    if (existing.length > 0) {
-      return existing[0] as PrescriptionRefRow;
-    }
-
-    const created = await this.createPrescriptionRefs({
-      order_id: orderId,
-      prescription_id: prescriptionId,
-    });
-    return created as PrescriptionRefRow;
-  }
-
-  /** Return all linked prescriptions for an order. */
-  async listForOrder(orderId: string): Promise<PrescriptionRefRow[]> {
-    return (await this.listPrescriptionRefs({
-      order_id: orderId,
-    })) as PrescriptionRefRow[];
-  }
-
-  /** Most-recent prescription for an order, or null. */
-  async getActiveRefForOrder(
-    orderId: string,
-  ): Promise<PrescriptionRefRow | null> {
-    const rows = await this.listForOrder(orderId);
-    if (rows.length === 0) return null;
-    // Most recent by created_at.
-    rows.sort(
-      (a, b) =>
-        new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-    );
-    return rows[0]!;
-  }
-
+class PrescriptionModuleService extends MedusaService({}) {
   /**
-   * Decrypt the prescription linked to this order, ready for lab
-   * handoff. This is the **only** sanctioned decrypt path on the
-   * Medusa side.
+   * Decrypt a prescription by its Supabase id, ready for lab handoff. This
+   * is the **only** sanctioned decrypt path on the Medusa side.
+   *
+   * The caller (LMS `buildLabJobPacket`) is responsible for resolving the
+   * prescription id from order/line metadata; this method does not read
+   * Medusa state.
    */
   async decryptForLabHandoff(
-    orderId: string,
+    prescriptionId: string,
   ): Promise<DecryptedPrescription> {
-    const ref = await this.getActiveRefForOrder(orderId);
-    if (!ref) {
-      throw new Error(
-        `decryptForLabHandoff: no prescription linked to order ${orderId}`,
-      );
+    if (!prescriptionId) {
+      throw new Error("decryptForLabHandoff: prescriptionId required");
     }
-    return decryptPrescription(ref.prescription_id);
+    return decryptPrescription(prescriptionId);
   }
 }
 

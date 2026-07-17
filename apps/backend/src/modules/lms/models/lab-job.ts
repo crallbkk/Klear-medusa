@@ -4,10 +4,15 @@ import { model } from "@medusajs/framework/utils";
  * `lab_job` — one row per lab-handoff attempt for a Medusa order.
  *
  * Lifecycle:
- *   queued    — created locally; not yet submitted to the lab provider
- *   submitted — provider accepted the job; provider_job_id populated
- *   failed    — provider rejected (with last_error); will retry per policy
- *   cancelled — order was cancelled before lab production started
+ *   queued     — packet built OK; not yet submitted to the lab provider
+ *   submitted  — provider accepted the job; provider_job_id populated
+ *   pending_rx — customer paid but their send-later prescription hasn't
+ *                arrived yet; heals via /retry once the Rx is submitted
+ *                (reason carried in last_error). NOT an error state.
+ *   failed     — packet build or provider submission failed; reason in
+ *                last_error. Ops-visible in /admin/lab-jobs; heals via /retry
+ *                once the underlying metadata/prescription is fixed.
+ *   cancelled  — order was cancelled before lab production started
  *
  * `packet_snapshot` captures the exact LabJobPacket sent (or planned)
  * for forensic reproducibility. It includes decrypted Rx, so this
