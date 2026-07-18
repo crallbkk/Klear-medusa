@@ -71,6 +71,12 @@ export async function POST(
     res.json({ outcome: "submitted", job });
     return;
   }
+  if (job.status === "submitting") {
+    // Another worker holds the submission claim right now — rebuilding under
+    // it would race the in-flight provider call. Conflict, not an error.
+    res.status(409).json({ error: "submission claim in flight — retry shortly" });
+    return;
+  }
 
   try {
     // Rebuild from the current order metadata so fixes are picked up

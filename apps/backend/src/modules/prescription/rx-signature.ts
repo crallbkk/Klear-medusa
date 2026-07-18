@@ -22,14 +22,19 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 export const RX_METADATA_SECRET_ENV = "KLEAR_RX_METADATA_SECRET";
 
-/** Compute the signature for a prescription id. */
+/**
+ * Pure: compute the base64url HMAC-SHA256 signature of a prescription id.
+ * The signature exists to prove the id passed our SERVER-side ownership gate
+ * at signing time (only the server holds the secret) — a client cannot mint
+ * one for an id it doesn't own, because the server refuses to sign an id the
+ * caller can't prove ownership of. A single field means no framing/separator
+ * is needed.
+ */
 export function signPrescriptionId(
   prescriptionId: string,
   secret: string,
 ): string {
-  return createHmac("sha256", secret)
-    .update(prescriptionId)
-    .digest("base64url");
+  return createHmac("sha256", secret).update(prescriptionId).digest("base64url");
 }
 
 /**

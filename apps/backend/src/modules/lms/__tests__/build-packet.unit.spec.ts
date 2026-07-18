@@ -8,7 +8,8 @@ import { Modules } from "@medusajs/framework/utils";
 import type { PrescriptionData } from "../types";
 
 const TEST_SECRET = "unit-test-rx-secret";
-/** Genuine signature for an Rx id, as the storefront server would stamp it. */
+/** Genuine signature for an Rx id, as the storefront server would stamp it
+ *  after its ownership gate. */
 const sig = (id: string) => signPrescriptionId(id, TEST_SECRET);
 
 beforeEach(() => {
@@ -85,9 +86,11 @@ function order(opts: {
   items?: unknown[];
   shipping?: unknown;
   metadata?: Record<string, unknown>;
+  customer_id?: string | null;
 } = {}) {
   return {
     id: "order_abc",
+    customer_id: opts.customer_id === undefined ? "cus_1" : opts.customer_id,
     items: opts.items ?? [frameLine()],
     shipping_address: opts.shipping === undefined ? SHIPPING : opts.shipping,
     metadata: opts.metadata ?? {},
@@ -462,7 +465,7 @@ describe("buildLabJobPacket — prescription signature (PDPA gate)", () => {
     expect(decryptForLabHandoff).not.toHaveBeenCalled();
   });
 
-  it("fails on a MISSING signature (not pending_rx) and never decrypts", async () => {
+  it("fails on a MISSING signature with the ops-relink reason (S1 — not the tampering wording) and never decrypts", async () => {
     const line = frameLine({ klear_prescription_sig: null });
     const { container, decryptForLabHandoff } = makeContainer({
       order: order({ items: [line] }),
@@ -475,7 +478,9 @@ describe("buildLabJobPacket — prescription signature (PDPA gate)", () => {
     });
     expect(result.outcome).toBe("failed");
     if (result.outcome !== "failed") return;
-    expect(result.reason).toMatch(/signature invalid/i);
+    expect(result.reason).toMatch(/signature missing/i);
+    expect(result.reason).toMatch(/manual ops relink required/i);
+    expect(result.reason).not.toMatch(/tampering/i);
     expect(decryptForLabHandoff).not.toHaveBeenCalled();
   });
 

@@ -36,20 +36,37 @@ product joins or heuristics.
 
 Line/order metadata is **client-controllable** (the Store API accepts
 metadata with just a publishable key), so a raw `klear_prescription_id` can
-be forged to point at someone else's Rx. The storefront's SERVER-side
-stamping paths therefore sign every id with `KLEAR_RX_METADATA_SECRET`
-(shared, server-only, both runtimes — see `.env.template`), and
-`buildLabJobPacket` verifies the signature (timing-safe,
-`prescription/rx-signature.ts`) **before any decrypt**:
+be forged to point at someone else's Rx. The **real** guard is a
+server-side ownership check on the storefront: `syncCheckoutCart` (and the
+send-later route) prove the caller owns each prescription id — via an
+owner-scoped Supabase lookup keyed on the session user (anonymous guest
+sessions included) — BEFORE signing it. An attacker's session can't pass
+that check for a victim's Rx, so a victim's id is never signed.
+
+The signature (`HMAC-SHA256(prescription_id)` with `KLEAR_RX_METADATA_SECRET`
+— shared, server-only, both runtimes; see `.env.template`) is the backend's
+proof that an id passed that gate: only the server holds the secret.
+`buildLabJobPacket` verifies it (timing-safe, `prescription/rx-signature.ts`)
+**before any decrypt**:
 
 - valid signature → proceed to decrypt
-- missing/invalid signature with a present id → `failed` row, reason
-  "prescription signature invalid — possible tampering" (never `pending_rx`)
+- signature **missing** with a present id → `failed` row, reason
+  "prescription signature missing — order predates metadata signing or
+  storefront stamping failed; manual ops relink required" (legacy orders
+  are an ops task, not a security incident)
+- signature present but **mismatched** (tamper or secret mismatch) →
+  `failed` row, reason "prescription signature invalid — possible
+  tampering" (never `pending_rx`)
 - `KLEAR_RX_METADATA_SECRET` unset on this server → `failed` row (fail
   closed; config fix + retry heals)
 
 The signature is always checked against the SAME metadata source (line vs
-order) that supplied the id.
+order) that supplied the id. The HMAC is over the id ALONE — deliberately
+NOT bound to the customer, because the signing session user (e.g. a guest's
+anonymous id) and the order's Medusa customer legitimately diverge across
+the guest → account → claim flow; the ownership gate already closes the
+oracle, so customer-binding would only break legitimate send-later/claim
+orders.
 
 ### Prescription resolution order
 
@@ -110,7 +127,8 @@ silent single-pair job for a customer who paid for two.
 ## Retry heals
 
 `POST /admin/lab-jobs/[id]/retry` **re-runs** `buildLabJobPacket` against the
-current order metadata before submitting. This is the heal path: a
+current order metadata before submitting. A `submitted` job is an idempotent
+no-op; a `submitting` job (claim in flight) returns 409. This is the heal path: a
 `pending_rx` job whose Rx has since landed (now on the order metadata), or a
 `failed` job whose metadata/prescription was fixed, is rebuilt and — only if
 the rebuild yields a full packet — submitted.

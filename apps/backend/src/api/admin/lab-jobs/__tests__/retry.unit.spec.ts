@@ -101,6 +101,20 @@ describe("POST /admin/lab-jobs/[id]/retry", () => {
     expect(mockBuild).not.toHaveBeenCalled();
   });
 
+  it("409s a job whose submission claim is in flight (submitting)", async () => {
+    const lms = makeLms({
+      retrieveLabJob: jest
+        .fn()
+        .mockResolvedValue({ id: "labjob_1", order_id: "order_1", status: "submitting" }),
+    });
+    const res = makeRes();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await POST(makeReq(lms) as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(mockBuild).not.toHaveBeenCalled();
+    expect(lms.updateJobFromBuild).not.toHaveBeenCalled();
+  });
+
   it("no-ops a submitted job (idempotent, no rebuild)", async () => {
     const lms = makeLms({
       retrieveLabJob: jest

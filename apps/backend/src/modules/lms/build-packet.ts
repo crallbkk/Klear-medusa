@@ -304,9 +304,11 @@ export async function buildLabJobPacket(
     // ── PDPA gate: verify the metadata signature BEFORE any decrypt ──────
     // klear_prescription_id is client-controllable (the Store API accepts
     // line metadata with just a publishable key). Only the storefront's
-    // server-side stamping paths hold KLEAR_RX_METADATA_SECRET, so a valid
-    // HMAC proves the id was stamped by our server, not forged by a client
-    // pointing at someone else's prescription.
+    // server-side stamping paths hold KLEAR_RX_METADATA_SECRET, and they
+    // sign the id ONLY AFTER proving the caller owns it (the server-side
+    // ownership gate in syncCheckoutCart / the send-later route). A valid
+    // HMAC is therefore proof the id passed that gate — a client can't mint
+    // one for an id it doesn't own.
     const secret = process.env[RX_METADATA_SECRET_ENV];
     if (!secret) {
       // Fail closed: without the secret we cannot distinguish a legitimate
@@ -319,9 +321,22 @@ export async function buildLabJobPacket(
         snapshot: baseSnapshot,
       };
     }
+
+    // Missing vs mismatched are DIFFERENT failures: a missing signature is a
+    // legacy order (pre-signing) or a storefront stamping bug — an ops
+    // problem, not a security incident.
+    if (!prescriptionSig) {
+      return {
+        outcome: "failed",
+        reason:
+          "prescription signature missing — order predates metadata signing " +
+          "or storefront stamping failed; manual ops relink required",
+        snapshot: baseSnapshot,
+      };
+    }
     if (!verifyPrescriptionSignature(prescriptionId, prescriptionSig, secret)) {
-      // Deliberately NOT pending_rx: a present id with a bad/missing sig is
-      // tampering or a stamping bug, not a customer we're waiting on.
+      // Deliberately NOT pending_rx: a present id with a mismatched sig is
+      // tampering or a secret mismatch, not a customer we're waiting on.
       return {
         outcome: "failed",
         reason: "prescription signature invalid — possible tampering",
