@@ -2,6 +2,26 @@ import { loadEnv, defineConfig } from '@medusajs/framework/utils'
 
 loadEnv(process.env.NODE_ENV || 'development', process.cwd())
 
+const isProduction = process.env.NODE_ENV === 'production'
+
+// In production, missing auth secrets must fail loudly at boot rather than
+// silently falling back to a well-known value ("supersecret") that would let
+// anyone forge admin sessions. Locally we keep a dev-only fallback so
+// `medusa develop` works without extra setup.
+function requireSecret(name: 'JWT_SECRET' | 'COOKIE_SECRET'): string {
+  const value = process.env[name]
+  if (value) return value
+  if (isProduction) {
+    throw new Error(
+      `${name} is required in production but was not set. Refusing to boot with an insecure default. Set ${name} in the Railway service environment.`
+    )
+  }
+  return 'supersecret'
+}
+
+const jwtSecret = requireSecret('JWT_SECRET')
+const cookieSecret = requireSecret('COOKIE_SECRET')
+
 const redisUrl = process.env.REDIS_URL
 
 const redisModules = redisUrl
@@ -24,7 +44,6 @@ const redisModules = redisUrl
 const klearModules = [
   { resolve: "./src/modules/prescription" },
   { resolve: "./src/modules/lms" },
-  { resolve: "./src/modules/payment" },
   { resolve: "./src/modules/shipping" },
   {
     // Override Medusa's built-in fulfillment module so we can register the
@@ -69,8 +88,8 @@ module.exports = defineConfig({
       storeCors: process.env.STORE_CORS!,
       adminCors: process.env.ADMIN_CORS!,
       authCors: process.env.AUTH_CORS!,
-      jwtSecret: process.env.JWT_SECRET || "supersecret",
-      cookieSecret: process.env.COOKIE_SECRET || "supersecret",
+      jwtSecret,
+      cookieSecret,
     },
   },
   modules: [...redisModules, ...klearModules],
