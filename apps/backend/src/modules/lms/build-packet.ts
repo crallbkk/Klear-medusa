@@ -3,6 +3,10 @@ import type { MedusaContainer } from "@medusajs/framework/types";
 import { PRESCRIPTION_MODULE } from "../prescription/service";
 import type PrescriptionModuleService from "../prescription/service";
 import {
+  RX_METADATA_SECRET_ENV,
+  verifyPrescriptionSignature,
+} from "../prescription/rx-signature";
+import {
   LENS_TYPES,
   lensRequiresPrescription,
   type BuildPacketResult,
@@ -61,12 +65,16 @@ interface KlearLineMetadata {
     coating_addons?: string[];
   } | null;
   klear_prescription_id?: string | null;
+  /** HMAC-SHA256(base64url) of klear_prescription_id, stamped server-side by
+   *  the storefront. MUST verify before any decrypt — see rx-signature.ts. */
+  klear_prescription_sig?: string | null;
   klear_prescription_status?: "active" | "pending";
 }
 
 /** Klear metadata stamped onto the ORDER (cart → order + send-later write). */
 interface KlearOrderMetadata {
   klear_prescription_id?: string | null;
+  klear_prescription_sig?: string | null;
   klear_prescription_status?: "active" | "pending";
 }
 
@@ -160,6 +168,19 @@ export async function buildLabJobPacket(
   }
 
   const frameLine = frameLines[0];
+
+  // A quantity > 1 frame line is a multi-pair order in disguise: the customer
+  // paid for N pairs but a single packet would produce ONE. Same MVP wall as
+  // multiple frame lines — fail durably, never silently under-produce.
+  const frameQuantity = frameLine.quantity ?? 1;
+  if (frameQuantity !== 1) {
+    return {
+      outcome: "failed",
+      reason: `multi-pair orders not supported at MVP — quantity ${frameQuantity} on frame line`,
+      snapshot: { job_ref: jobRef, klear_order_id: orderId },
+    };
+  }
+
   const lineMeta = (frameLine.metadata ?? {}) as KlearLineMetadata;
   const orderMeta = (order.metadata ?? {}) as KlearOrderMetadata;
 
@@ -169,8 +190,17 @@ export async function buildLabJobPacket(
   const lens_index = lensConfig?.index ?? null;
   const coating_addons = lensConfig?.coating_addons ?? [];
 
-  const prescriptionId =
-    lineMeta.klear_prescription_id ?? orderMeta.klear_prescription_id ?? null;
+  // `|| null` (not `??`): normalise empty-string ids to null so a blank
+  // line-level id falls through to the order-level id instead of masking it.
+  const lineRxId = lineMeta.klear_prescription_id || null;
+  const orderRxId = orderMeta.klear_prescription_id || null;
+  const prescriptionId = lineRxId ?? orderRxId;
+  // The signature must come from the SAME source as the id it signs.
+  const prescriptionSig = lineRxId
+    ? (lineMeta.klear_prescription_sig ?? null)
+    : orderRxId
+      ? (orderMeta.klear_prescription_sig ?? null)
+      : null;
   const isPending =
     lineMeta.klear_prescription_status === "pending" ||
     orderMeta.klear_prescription_status === "pending";
@@ -193,6 +223,16 @@ export async function buildLabJobPacket(
       reason:
         "line carries a prescription/pending status but no lens configuration",
       snapshot: { job_ref: jobRef, klear_order_id: orderId, frame_sku },
+    };
+  }
+
+  // The lab cannot cut without knowing WHICH frame. Missing both klear_sku
+  // and variant_sku means the packet would carry an empty SKU — fail loudly.
+  if (!frame_sku) {
+    return {
+      outcome: "failed",
+      reason: "frame line has no SKU (klear_sku and variant_sku both empty)",
+      snapshot: { job_ref: jobRef, klear_order_id: orderId },
     };
   }
 
@@ -261,6 +301,34 @@ export async function buildLabJobPacket(
       };
     }
 
+    // ── PDPA gate: verify the metadata signature BEFORE any decrypt ──────
+    // klear_prescription_id is client-controllable (the Store API accepts
+    // line metadata with just a publishable key). Only the storefront's
+    // server-side stamping paths hold KLEAR_RX_METADATA_SECRET, so a valid
+    // HMAC proves the id was stamped by our server, not forged by a client
+    // pointing at someone else's prescription.
+    const secret = process.env[RX_METADATA_SECRET_ENV];
+    if (!secret) {
+      // Fail closed: without the secret we cannot distinguish a legitimate
+      // id from a forged one, so we never decrypt. Config fix + retry heals.
+      return {
+        outcome: "failed",
+        reason:
+          `prescription signature could not be verified — ${RX_METADATA_SECRET_ENV} ` +
+          "is not configured on the Medusa server",
+        snapshot: baseSnapshot,
+      };
+    }
+    if (!verifyPrescriptionSignature(prescriptionId, prescriptionSig, secret)) {
+      // Deliberately NOT pending_rx: a present id with a bad/missing sig is
+      // tampering or a stamping bug, not a customer we're waiting on.
+      return {
+        outcome: "failed",
+        reason: "prescription signature invalid — possible tampering",
+        snapshot: baseSnapshot,
+      };
+    }
+
     // Decrypt via the prescription module's one sanctioned path.
     const prescriptionService = container.resolve(
       PRESCRIPTION_MODULE,
@@ -293,7 +361,11 @@ export async function buildLabJobPacket(
     }
   }
 
-  // non_prescription (plano): a real lab job with no Rx to cut.
+  // non_prescription (plano): a real lab job with no Rx to cut. Reached even
+  // when a pending/prescription flag is present alongside — DELIBERATE: the
+  // customer chose plano lenses, so any Rx signal on the line is vestigial
+  // (e.g. a send-later flag left over from an earlier configurator pass) and
+  // must not block the plano job.
   return {
     outcome: "ok",
     packet: {

@@ -148,7 +148,16 @@ export async function decryptPrescription(
         `Supabase decrypt RPC failed for ${field} (${res.status})`,
       );
     }
-    const plaintext = (await res.json()) as string;
+    const plaintext = (await res.json()) as string | null;
+    // Guard BEFORE Number(): Number(null) and Number("") are both 0, which
+    // would silently fabricate a 0.00-diopter value when the Vault RPC
+    // returns NULL/empty for a ciphertext that exists. Fail loudly instead.
+    if (plaintext === null || plaintext === "") {
+      throw new SupabaseVaultError(
+        "decrypt",
+        `Decrypted Rx field ${field} came back empty from the Vault RPC`,
+      );
+    }
     const num = Number(plaintext);
     if (!Number.isFinite(num)) {
       throw new SupabaseVaultError(

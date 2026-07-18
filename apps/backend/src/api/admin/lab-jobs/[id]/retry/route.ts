@@ -2,6 +2,7 @@ import type {
   MedusaRequest,
   MedusaResponse,
 } from "@medusajs/framework";
+import { MedusaError } from "@medusajs/framework/utils";
 import { LMS_MODULE } from "../../../../../modules/lms/service";
 import type LmsModuleService from "../../../../../modules/lms/service";
 import { buildLabJobPacket } from "../../../../../modules/lms/build-packet";
@@ -20,8 +21,9 @@ import { buildLabJobPacket } from "../../../../../modules/lms/build-packet";
  *   rebuild → failed     → still broken; reason refreshed, no submit
  *   rebuild → skip       → order became frame-only; reason recorded, no submit
  *
- * Returns the updated job + outcome. When the provider is still
- * unimplemented, a successful rebuild+submit yields `queued_no_provider`.
+ * Errors: unknown job id → 404; cancelled → 400 (operator error); anything
+ * else (DB down, order module failure, …) → 500 — an infra failure is not a
+ * bad request and must not be reported as one.
  */
 export async function POST(
   req: MedusaRequest<unknown>,
@@ -34,22 +36,43 @@ export async function POST(
     return;
   }
 
+  // Resolve the job first so a missing id is a real 404. MedusaService's
+  // retrieve throws MedusaError NOT_FOUND rather than returning null — catch
+  // that specifically; any other retrieve failure is infra (500).
+  let job;
   try {
-    const job = await lms.retrieveLabJob(id);
-    if (!job) {
+    job = await lms.retrieveLabJob(id);
+  } catch (err) {
+    if (
+      err instanceof MedusaError &&
+      err.type === MedusaError.Types.NOT_FOUND
+    ) {
       res.status(404).json({ error: "lab_job not found" });
       return;
     }
-    if (job.status === "cancelled") {
-      res.status(400).json({ error: "cannot retry a cancelled job" });
-      return;
-    }
-    if (job.status === "submitted") {
-      // Already accepted by the provider — nothing to heal. Idempotent no-op.
-      res.json({ outcome: "submitted", job });
-      return;
-    }
+    console.error(
+      `[lab-jobs/retry] retrieve failed for ${id}: ${
+        err instanceof Error ? err.message : "unknown"
+      }`,
+    );
+    res.status(500).json({ error: "internal error retrieving lab_job" });
+    return;
+  }
+  if (!job) {
+    res.status(404).json({ error: "lab_job not found" });
+    return;
+  }
+  if (job.status === "cancelled") {
+    res.status(400).json({ error: "cannot retry a cancelled job" });
+    return;
+  }
+  if (job.status === "submitted") {
+    // Already accepted by the provider — nothing to heal. Idempotent no-op.
+    res.json({ outcome: "submitted", job });
+    return;
+  }
 
+  try {
     // Rebuild from the current order metadata so fixes are picked up
     // (queued / failed / pending_rx).
     const result = await buildLabJobPacket({
@@ -65,9 +88,18 @@ export async function POST(
       return;
     }
 
-    res.json({ outcome: result.outcome, reason: (result as { reason?: string }).reason, job: updated });
+    res.json({
+      outcome: result.outcome,
+      reason: (result as { reason?: string }).reason,
+      job: updated,
+    });
   } catch (err) {
-    res.status(400).json({
+    console.error(
+      `[lab-jobs/retry] retry failed for ${id}: ${
+        err instanceof Error ? err.message : "unknown"
+      }`,
+    );
+    res.status(500).json({
       error: err instanceof Error ? err.message : "Unknown error",
     });
   }

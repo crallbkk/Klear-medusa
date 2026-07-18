@@ -1,7 +1,23 @@
 import { buildLabJobPacket } from "../build-packet";
 import { PRESCRIPTION_MODULE } from "../../prescription/service";
+import {
+  RX_METADATA_SECRET_ENV,
+  signPrescriptionId,
+} from "../../prescription/rx-signature";
 import { Modules } from "@medusajs/framework/utils";
 import type { PrescriptionData } from "../types";
+
+const TEST_SECRET = "unit-test-rx-secret";
+/** Genuine signature for an Rx id, as the storefront server would stamp it. */
+const sig = (id: string) => signPrescriptionId(id, TEST_SECRET);
+
+beforeEach(() => {
+  process.env[RX_METADATA_SECRET_ENV] = TEST_SECRET;
+});
+
+afterEach(() => {
+  delete process.env[RX_METADATA_SECRET_ENV];
+});
 
 /**
  * Unit tests for buildLabJobPacket. Mocks the container so we exercise the
@@ -48,10 +64,12 @@ function frameLine(overrides: Record<string, unknown> = {}) {
   return {
     id: "item_1",
     variant_sku: "F-RD-001",
+    quantity: 1,
     metadata: {
       klear_kind: "frame",
       klear_sku: "KLR-RD-001-BLACK-M",
       klear_prescription_id: "rx_1",
+      klear_prescription_sig: sig("rx_1"),
       klear_prescription_status: "active",
       klear_lens_config: {
         lens_type: "single_vision",
@@ -134,6 +152,7 @@ describe("buildLabJobPacket — happy path", () => {
   it("falls back to the ORDER-level prescription id (send-later, submitted post-order)", async () => {
     const line = frameLine({
       klear_prescription_id: null,
+      klear_prescription_sig: null,
       klear_prescription_status: "pending",
     });
     const { decryptForLabHandoff, container } = makeContainer({
@@ -141,6 +160,7 @@ describe("buildLabJobPacket — happy path", () => {
         items: [line],
         metadata: {
           klear_prescription_id: "rx_ORDER",
+          klear_prescription_sig: sig("rx_ORDER"),
           klear_prescription_status: "active",
         },
       }),
@@ -307,6 +327,43 @@ describe("buildLabJobPacket — failed", () => {
     expect(result.reason).toMatch(/multi-pair/i);
   });
 
+  it("fails (not silently under-produces) a quantity-2 frame line", async () => {
+    const line = { ...frameLine(), quantity: 2 };
+    const { container, decryptForLabHandoff } = makeContainer({
+      order: order({ items: [line] }),
+      decryptedRx: RX,
+    });
+    const result = await buildLabJobPacket({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container: container as any,
+      orderId: "order_abc",
+    });
+    expect(result.outcome).toBe("failed");
+    if (result.outcome !== "failed") return;
+    expect(result.reason).toMatch(/multi-pair/i);
+    expect(result.reason).toMatch(/quantity 2/);
+    expect(decryptForLabHandoff).not.toHaveBeenCalled();
+  });
+
+  it("fails when the frame line has no SKU at all", async () => {
+    const line = {
+      ...frameLine({ klear_sku: undefined }),
+      variant_sku: undefined,
+    };
+    const { container } = makeContainer({
+      order: order({ items: [line] }),
+      decryptedRx: RX,
+    });
+    const result = await buildLabJobPacket({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container: container as any,
+      orderId: "order_abc",
+    });
+    expect(result.outcome).toBe("failed");
+    if (result.outcome !== "failed") return;
+    expect(result.reason).toMatch(/no SKU/i);
+  });
+
   it("fails when a decrypt error is thrown", async () => {
     const { container } = makeContainer({
       order: order(),
@@ -382,5 +439,112 @@ describe("buildLabJobPacket — failed", () => {
     expect(result.outcome).toBe("failed");
     if (result.outcome !== "failed") return;
     expect(result.reason).toMatch(/no line items/i);
+  });
+});
+
+describe("buildLabJobPacket — prescription signature (PDPA gate)", () => {
+  it("fails on a TAMPERED signature and never decrypts", async () => {
+    const line = frameLine({
+      klear_prescription_sig: sig("rx_someone_else"), // sig of a different id
+    });
+    const { container, decryptForLabHandoff } = makeContainer({
+      order: order({ items: [line] }),
+      decryptedRx: RX,
+    });
+    const result = await buildLabJobPacket({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container: container as any,
+      orderId: "order_abc",
+    });
+    expect(result.outcome).toBe("failed");
+    if (result.outcome !== "failed") return;
+    expect(result.reason).toMatch(/signature invalid/i);
+    expect(decryptForLabHandoff).not.toHaveBeenCalled();
+  });
+
+  it("fails on a MISSING signature (not pending_rx) and never decrypts", async () => {
+    const line = frameLine({ klear_prescription_sig: null });
+    const { container, decryptForLabHandoff } = makeContainer({
+      order: order({ items: [line] }),
+      decryptedRx: RX,
+    });
+    const result = await buildLabJobPacket({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container: container as any,
+      orderId: "order_abc",
+    });
+    expect(result.outcome).toBe("failed");
+    if (result.outcome !== "failed") return;
+    expect(result.reason).toMatch(/signature invalid/i);
+    expect(decryptForLabHandoff).not.toHaveBeenCalled();
+  });
+
+  it("fails closed (no decrypt) when the server has no signing secret", async () => {
+    delete process.env[RX_METADATA_SECRET_ENV];
+    const { container, decryptForLabHandoff } = makeContainer({
+      order: order(),
+      decryptedRx: RX,
+    });
+    const result = await buildLabJobPacket({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container: container as any,
+      orderId: "order_abc",
+    });
+    expect(result.outcome).toBe("failed");
+    if (result.outcome !== "failed") return;
+    expect(result.reason).toMatch(/KLEAR_RX_METADATA_SECRET/);
+    expect(decryptForLabHandoff).not.toHaveBeenCalled();
+  });
+
+  it("verifies the ORDER-level signature for an order-level id", async () => {
+    const line = frameLine({
+      klear_prescription_id: null,
+      klear_prescription_sig: null,
+    });
+    const { container, decryptForLabHandoff } = makeContainer({
+      order: order({
+        items: [line],
+        metadata: {
+          klear_prescription_id: "rx_ORDER",
+          klear_prescription_sig: sig("rx_TAMPERED"),
+          klear_prescription_status: "active",
+        },
+      }),
+      decryptedRx: RX,
+    });
+    const result = await buildLabJobPacket({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container: container as any,
+      orderId: "order_abc",
+    });
+    expect(result.outcome).toBe("failed");
+    if (result.outcome !== "failed") return;
+    expect(result.reason).toMatch(/signature invalid/i);
+    expect(decryptForLabHandoff).not.toHaveBeenCalled();
+  });
+
+  it("normalises an empty-string line id to the order-level id (sig checked against order source)", async () => {
+    const line = frameLine({
+      klear_prescription_id: "", // N1: "" must not mask the order-level id
+      klear_prescription_sig: null,
+    });
+    const { container, decryptForLabHandoff } = makeContainer({
+      order: order({
+        items: [line],
+        metadata: {
+          klear_prescription_id: "rx_ORDER",
+          klear_prescription_sig: sig("rx_ORDER"),
+          klear_prescription_status: "active",
+        },
+      }),
+      decryptedRx: RX,
+    });
+    const result = await buildLabJobPacket({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container: container as any,
+      orderId: "order_abc",
+    });
+    expect(result.outcome).toBe("ok");
+    expect(decryptForLabHandoff).toHaveBeenCalledWith("rx_ORDER");
   });
 });

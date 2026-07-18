@@ -1,4 +1,5 @@
 import LmsModuleService, { LMS_MODULE } from "../service";
+import { LabProviderError } from "../types";
 import type { BuildPacketResult, LabJobPacket } from "../types";
 
 describe("LmsModuleService — module key", () => {
@@ -9,11 +10,17 @@ describe("LmsModuleService — module key", () => {
 
 /**
  * In-memory harness: construct the service and shadow the MedusaService CRUD
- * methods with a fake store that enforces the (order_id) unique index, so we
- * can unit-test the durable-row + idempotency + heal logic without a DB.
+ * methods with a fake store that enforces the (order_id) unique index and
+ * FULL selector matching (needed for the status-guarded submit claim), so we
+ * can unit-test the durable-row + idempotency + claim + heal logic without a
+ * DB.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function makeService(): { service: LmsModuleService; rows: any[] } {
+function makeService(provider?: {
+  submitJob: (packet: unknown) => Promise<{ provider_job_id: string }>;
+  name?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+}): { service: LmsModuleService; rows: any[] } {
   // Build an instance WITHOUT running the MedusaService base constructor
   // (which needs a DI container). Prototype methods + our shadowed CRUD
   // mocks are all the logic under test needs.
@@ -23,6 +30,24 @@ function makeService(): { service: LmsModuleService; rows: any[] } {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const rows: any[] = [];
   let idc = 0;
+
+  if (provider) {
+    // Class fields are constructor-assigned, and we skipped the constructor —
+    // inject the provider directly for submit-path tests.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (service as any).provider = {
+      name: provider.name ?? "fake-lab",
+      submitJob: provider.submitJob,
+      getJobStatus: async () => {
+        throw new Error("not used");
+      },
+    };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const matches = (row: any, selector: any) =>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    Object.entries(selector).every(([k, v]) => (row as any)[k] === v);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (service as any).createLabJobs = jest.fn(async (data: any) => {
@@ -50,18 +75,17 @@ function makeService(): { service: LmsModuleService; rows: any[] } {
   });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (service as any).listLabJobs = jest.fn(async (selector: any = {}) =>
-    rows.filter((r) =>
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      Object.entries(selector).every(([k, v]) => (r as any)[k] === v),
-    ),
+    rows.filter((r) => matches(r, selector)),
   );
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (service as any).retrieveLabJob = jest.fn(async (id: string) =>
     rows.find((r) => r.id === id),
   );
+  // Selector-guarded update, like the real thing: only rows matching EVERY
+  // selector key are updated — this is what the submit claim relies on.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (service as any).updateLabJobs = jest.fn(async ({ selector, data }: any) => {
-    const matched = rows.filter((r) => r.id === selector.id);
+    const matched = rows.filter((r) => matches(r, selector));
     matched.forEach((r) => Object.assign(r, data));
     return matched;
   });
@@ -185,5 +209,97 @@ describe("LmsModuleService.updateJobFromBuild — retry heal path", () => {
     });
     expect(again.status).toBe("failed");
     expect(again.last_error).toMatch(/still broken/);
+  });
+
+  it("refuses to rebuild a SUBMITTED row (audit trail protection)", async () => {
+    const { service, rows } = makeService();
+    const job = await service.createFromBuild(okResult);
+    rows.find((r) => r.id === job!.id)!.status = "submitted";
+    await expect(
+      service.updateJobFromBuild(job!.id, okResult),
+    ).rejects.toThrow(/only queued\/failed\/pending_rx/);
+  });
+
+  it("refuses to rebuild a CANCELLED row", async () => {
+    const { service, rows } = makeService();
+    const job = await service.createFromBuild(okResult);
+    rows.find((r) => r.id === job!.id)!.status = "cancelled";
+    await expect(
+      service.updateJobFromBuild(job!.id, okResult),
+    ).rejects.toThrow(/only queued\/failed\/pending_rx/);
+  });
+});
+
+describe("LmsModuleService.submitJob — atomic claim", () => {
+  it("two interleaved submit calls result in exactly ONE provider call", async () => {
+    let providerCalls = 0;
+    const { service } = makeService({
+      submitJob: async () => {
+        providerCalls += 1;
+        // Hold the winner in-flight across a macrotask so the loser fully
+        // runs its read + claim while the provider call is outstanding.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return { provider_job_id: "prov_1" };
+      },
+    });
+    const job = await service.createFromBuild(okResult);
+
+    const [a, b] = await Promise.all([
+      service.submitJob(job!.id),
+      service.submitJob(job!.id),
+    ]);
+
+    expect(providerCalls).toBe(1);
+    const outcomes = [a.outcome, b.outcome].sort();
+    // Exactly one winner submits; the loser backs off without touching the
+    // provider ("already_submitting", or "submitted" if it re-read after the
+    // winner finished).
+    expect(outcomes).toContain("submitted");
+    expect(
+      outcomes.filter((o) => o === "already_submitting" || o === "submitted"),
+    ).toHaveLength(2);
+  });
+
+  it("releases the claim back to queued when no provider is wired", async () => {
+    const { service, rows } = makeService({
+      submitJob: async () => {
+        throw new LabProviderError("not_implemented", "no lab partner yet");
+      },
+      name: "unimplemented",
+    });
+    const job = await service.createFromBuild(okResult);
+    const result = await service.submitJob(job!.id);
+    expect(result.outcome).toBe("queued_no_provider");
+    expect(rows.find((r) => r.id === job!.id)!.status).toBe("queued");
+    expect(rows.find((r) => r.id === job!.id)!.attempts).toBe(1);
+  });
+
+  it("marks the job failed when the provider rejects", async () => {
+    const { service, rows } = makeService({
+      submitJob: async () => {
+        throw new Error("lab rejected: axis out of range");
+      },
+    });
+    const job = await service.createFromBuild(okResult);
+    const result = await service.submitJob(job!.id);
+    expect(result.outcome).toBe("failed");
+    expect(rows.find((r) => r.id === job!.id)!.status).toBe("failed");
+    expect(rows.find((r) => r.id === job!.id)!.last_error).toMatch(
+      /axis out of range/,
+    );
+  });
+
+  it("rejects direct submission of failed / pending_rx rows (heal via retry)", async () => {
+    const { service, rows } = makeService({
+      submitJob: async () => ({ provider_job_id: "prov_x" }),
+    });
+    const job = await service.createFromBuild(okResult);
+    const row = rows.find((r) => r.id === job!.id)!;
+
+    row.status = "failed";
+    await expect(service.submitJob(job!.id)).rejects.toThrow(/heal via retry/);
+
+    row.status = "pending_rx";
+    await expect(service.submitJob(job!.id)).rejects.toThrow(/pending_rx/);
   });
 });

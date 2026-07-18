@@ -41,6 +41,21 @@ const LabJob = model.define("lab_job", {
   last_error: model.text().nullable(),
   // When the lab provider confirmed receipt (status moved to "submitted").
   submitted_at: model.dateTime().nullable(),
-});
+})
+  // ── DO NOT REMOVE ──────────────────────────────────────────────────────
+  // This partial unique index is idempotency-critical: it is what stops two
+  // racing order.placed deliveries from creating two lab jobs for one order
+  // (the service catches the 23505 and adopts the existing row). It is ALSO
+  // declared in Migration20260717000100 and the module snapshot; declaring
+  // it here keeps the model as the source of truth so a future
+  // `medusa db:generate` diffs cleanly instead of emitting a DROP INDEX.
+  .indexes([
+    {
+      name: "UQ_lab_job_order_id_active",
+      on: ["order_id"],
+      unique: true,
+      where: "deleted_at IS NULL",
+    },
+  ]);
 
 export default LabJob;

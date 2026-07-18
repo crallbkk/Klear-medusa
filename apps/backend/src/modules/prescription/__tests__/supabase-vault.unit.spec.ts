@@ -147,6 +147,44 @@ describe("decryptPrescription", () => {
     expect(rx.pd_left).toBe(29);
   });
 
+  it("throws decrypt error when the Vault RPC returns NULL for a present ciphertext (no fabricated 0.00 diopters)", async () => {
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      () => makeRowResponse(),
+    ];
+    // Every decrypt call answers null — Number(null) would be 0, i.e. a
+    // fabricated plano value, if the guard were missing.
+    for (let i = 0; i < 7; i++) {
+      handlers.push(() => jsonResponse(200, null));
+    }
+    const fetchMock = mockFetchSequence(handlers);
+    await expect(
+      decryptPrescription("rx_1", {
+        fetch: fetchMock as unknown as typeof fetch,
+      }),
+    ).rejects.toMatchObject({
+      name: "SupabaseVaultError",
+      code: "decrypt",
+    });
+  });
+
+  it("throws decrypt error when the Vault RPC returns an empty string", async () => {
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      () => makeRowResponse(),
+    ];
+    for (let i = 0; i < 7; i++) {
+      handlers.push(() => jsonResponse(200, ""));
+    }
+    const fetchMock = mockFetchSequence(handlers);
+    await expect(
+      decryptPrescription("rx_1", {
+        fetch: fetchMock as unknown as typeof fetch,
+      }),
+    ).rejects.toMatchObject({
+      name: "SupabaseVaultError",
+      code: "decrypt",
+    });
+  });
+
   it("throws not_found when Supabase returns no row", async () => {
     const fetchMock = mockFetchSequence([() => jsonResponse(200, [])]);
     await expect(

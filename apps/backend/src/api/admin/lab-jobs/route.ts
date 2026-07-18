@@ -35,6 +35,7 @@ export async function GET(
   const status = req.query.status as string | undefined;
   const validStatuses = [
     "queued",
+    "submitting",
     "submitted",
     "failed",
     "cancelled",
@@ -46,6 +47,7 @@ export async function GET(
     jobs = await lms.listJobsByStatus(
       status as
         | "queued"
+        | "submitting"
         | "submitted"
         | "failed"
         | "cancelled"

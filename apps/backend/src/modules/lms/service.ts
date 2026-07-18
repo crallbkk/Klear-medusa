@@ -13,10 +13,18 @@ export const LMS_MODULE = "lms";
 
 export type LabJobStatusValue =
   | "queued"
+  | "submitting" // transient claim state — exactly one worker owns the provider call
   | "submitted"
   | "failed"
   | "cancelled"
   | "pending_rx";
+
+/** Statuses from which a rebuild (retry heal) is allowed to rewrite the row. */
+const REBUILDABLE_STATUSES: ReadonlySet<LabJobStatusValue> = new Set([
+  "queued",
+  "failed",
+  "pending_rx",
+]);
 
 export type LabJobRow = {
   id: string;
@@ -155,6 +163,18 @@ class LmsModuleService extends MedusaService({
     jobId: string,
     result: BuildPacketResult,
   ): Promise<LabJobRow> {
+    // Guard here, not just in the route: rewriting a submitted/cancelled/
+    // in-flight row's snapshot would corrupt the audit trail (and could
+    // resubmit a job the lab already has). Only settled, retryable rows may
+    // be rebuilt.
+    const current = (await this.retrieveLabJob(jobId)) as unknown as LabJobRow;
+    if (!current) throw new Error(`updateJobFromBuild: job ${jobId} not found`);
+    if (!REBUILDABLE_STATUSES.has(current.status)) {
+      throw new Error(
+        `updateJobFromBuild: job ${jobId} is ${current.status} — only queued/failed/pending_rx jobs can be rebuilt`,
+      );
+    }
+
     if (result.outcome === "skip") {
       // The order became frame-only since the row was created (unusual). Leave
       // the snapshot untouched; just record why nothing was submitted.
@@ -204,17 +224,34 @@ class LmsModuleService extends MedusaService({
 
   /**
    * Attempt to submit a queued job to the configured lab provider.
-   * On success → status="submitted", provider_job_id populated.
-   * On provider error → status="failed", last_error populated, attempts++.
-   * Provider not implemented → status stays "queued" (logged via attempts++).
+   *
+   * Concurrency: the caller may be one of two racing order.placed handlers
+   * (the unique index dedupes the ROW, not the submission — the 23505 loser
+   * adopts the winner's row and also reaches here). Before touching the
+   * provider we CLAIM the job with a status-guarded update
+   * (queued → submitting, matched on `status: "queued"` in the selector);
+   * only the caller whose claim affected a row calls the provider. The loser
+   * gets outcome "already_submitting" and does nothing.
+   *
+   * Outcomes:
+   *   submitted          — provider accepted; provider_job_id populated
+   *   queued_no_provider — provider not wired; claim released back to queued
+   *   failed             — provider rejected; last_error populated
+   *   already_submitting — another worker holds the claim (or just submitted)
    */
   async submitJob(
     jobId: string,
-  ): Promise<{ outcome: "submitted" | "failed" | "queued_no_provider"; job: LabJobRow }> {
+  ): Promise<{
+    outcome: "submitted" | "failed" | "queued_no_provider" | "already_submitting";
+    job: LabJobRow;
+  }> {
     const job = (await this.retrieveLabJob(jobId)) as unknown as LabJobRow;
     if (!job) throw new Error(`submitJob: job ${jobId} not found`);
     if (job.status === "submitted") {
       return { outcome: "submitted", job };
+    }
+    if (job.status === "submitting") {
+      return { outcome: "already_submitting", job };
     }
     if (job.status === "cancelled") {
       throw new Error(
@@ -225,6 +262,34 @@ class LmsModuleService extends MedusaService({
       throw new Error(
         `submitJob: job ${jobId} is pending_rx — rebuild via retry once the Rx lands before submitting`,
       );
+    }
+    if (job.status === "failed") {
+      throw new Error(
+        `submitJob: job ${jobId} is failed — heal via retry (rebuild) before submitting`,
+      );
+    }
+
+    // Claim: queued → submitting, guarded on the CURRENT status in the
+    // selector. If another worker claimed between our read and this write,
+    // the selector matches nothing and we back off. (MedusaService resolves
+    // the selector to ids before updating, so a microscopic race window
+    // remains vs a native `UPDATE … WHERE status='queued'`; combined with
+    // the read-check above this reduces double-submission from
+    // seconds-likely to pathological. A native conditional UPDATE would
+    // close it fully if a provider ever proves non-idempotent.)
+    const claimed = (await this.updateLabJobs({
+      selector: { id: jobId, status: "queued" },
+      data: { status: "submitting" },
+    })) as unknown as LabJobRow[];
+    if (claimed.length === 0) {
+      const current = (await this.retrieveLabJob(
+        jobId,
+      )) as unknown as LabJobRow;
+      return {
+        outcome:
+          current?.status === "submitted" ? "submitted" : "already_submitting",
+        job: current ?? job,
+      };
     }
 
     try {
@@ -251,10 +316,12 @@ class LmsModuleService extends MedusaService({
         err instanceof LabProviderError &&
         err.code === "not_implemented"
       ) {
-        // Expected pre-lab-partner state — leave queued, just count attempt.
+        // Expected pre-lab-partner state — release the claim back to
+        // queued, just count the attempt.
         const updated = (await this.updateLabJobs({
           selector: { id: jobId },
           data: {
+            status: "queued",
             attempts: job.attempts + 1,
             last_error: truncated,
           },

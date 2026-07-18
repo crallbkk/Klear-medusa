@@ -18,6 +18,22 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations";
  */
 export class Migration20260717000100 extends Migration {
   override async up(): Promise<void> {
+    // Dedup FIRST: if prod data already has >1 live row for an order (the
+    // pre-index race window), CREATE UNIQUE INDEX would abort the migration.
+    // Soft-delete every live duplicate except the EARLIEST row per order_id
+    // (earliest = the one the original subscriber acted on; id breaks ties
+    // deterministically). Soft-delete, not hard-delete — packet_snapshot is
+    // PDPA-relevant forensic data we never destroy in a migration.
+    this.addSql(
+      `UPDATE "lab_job" SET deleted_at = now()
+       WHERE deleted_at IS NULL
+         AND id NOT IN (
+           SELECT DISTINCT ON (order_id) id
+           FROM "lab_job"
+           WHERE deleted_at IS NULL
+           ORDER BY order_id, created_at ASC, id ASC
+         );`,
+    );
     this.addSql(
       `CREATE UNIQUE INDEX IF NOT EXISTS "UQ_lab_job_order_id_active" ON "lab_job" ("order_id") WHERE deleted_at IS NULL;`,
     );
