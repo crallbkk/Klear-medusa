@@ -212,6 +212,15 @@
           "expression": "CREATE INDEX IF NOT EXISTS \"IDX_lab_job_deleted_at\" ON \"lab_job\" (\"deleted_at\") WHERE deleted_at IS NULL"
         },
         {
+          "keyName": "UQ_lab_job_order_id_active",
+          "columnNames": [],
+          "composite": false,
+          "constraint": false,
+          "primary": false,
+          "unique": true,
+          "expression": "CREATE UNIQUE INDEX IF NOT EXISTS \"UQ_lab_job_order_id_active\" ON \"lab_job\" (\"order_id\") WHERE deleted_at IS NULL"
+        },
+        {
           "keyName": "lab_job_pkey",
           "columnNames": [
             "id"

@@ -30,8 +30,12 @@ export interface DecryptedPrescription {
   // Add — progressives + readers only
   add_right: number | null;
   add_left: number | null;
-  // Pupillary distance, mm. Either pd_binocular OR (pd_right + pd_left).
-  pd: number;
+  // Pupillary distance, mm — ALWAYS monocular (per-eye). KLEAR.md §10: the
+  // lab + edger need per-eye PD, never a summed binocular value. When the
+  // stored Rx only has a binocular PD, it is split 50/50 across both eyes
+  // (mirrors the storefront's `splitPd` in `src/lib/lms/job-creator.ts`).
+  pd_right: number;
+  pd_left: number;
 }
 
 export class SupabaseVaultError extends Error {
@@ -144,7 +148,16 @@ export async function decryptPrescription(
         `Supabase decrypt RPC failed for ${field} (${res.status})`,
       );
     }
-    const plaintext = (await res.json()) as string;
+    const plaintext = (await res.json()) as string | null;
+    // Guard BEFORE Number(): Number(null) and Number("") are both 0, which
+    // would silently fabricate a 0.00-diopter value when the Vault RPC
+    // returns NULL/empty for a ciphertext that exists. Fail loudly instead.
+    if (plaintext === null || plaintext === "") {
+      throw new SupabaseVaultError(
+        "decrypt",
+        `Decrypted Rx field ${field} came back empty from the Vault RPC`,
+      );
+    }
     const num = Number(plaintext);
     if (!Number.isFinite(num)) {
       throw new SupabaseVaultError(
@@ -193,12 +206,18 @@ export async function decryptPrescription(
       `Prescription ${prescription_id} missing cylinder values`,
     );
   }
-  // PD: either binocular present, OR both monocular present.
-  let pd: number;
-  if (pd_binocular !== null) {
-    pd = pd_binocular;
-  } else if (pd_right !== null && pd_left !== null) {
-    pd = pd_right + pd_left;
+  // PD → MONOCULAR (per-eye) for the lab. Monocular values are kept as-is;
+  // a binocular-only Rx is halved 50/50 into each eye. This matches the
+  // storefront `splitPd` semantics (Website `src/lib/lms/job-creator.ts`).
+  let pd_right_out: number;
+  let pd_left_out: number;
+  if (pd_right !== null && pd_left !== null) {
+    pd_right_out = pd_right;
+    pd_left_out = pd_left;
+  } else if (pd_binocular !== null) {
+    const half = pd_binocular / 2;
+    pd_right_out = half;
+    pd_left_out = half;
   } else {
     throw new SupabaseVaultError(
       "incomplete",
@@ -215,6 +234,7 @@ export async function decryptPrescription(
     axis_left,
     add_right,
     add_left,
-    pd,
+    pd_right: pd_right_out,
+    pd_left: pd_left_out,
   };
 }

@@ -2,20 +2,27 @@ import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework";
 import { buildLabJobPacket } from "../modules/lms/build-packet";
 import { LMS_MODULE } from "../modules/lms/service";
 import type LmsModuleService from "../modules/lms/service";
+import type { BuildPacketResult } from "../modules/lms/types";
 
 /**
- * On Medusa `order.placed`, compose a LabJobPacket and persist a
- * `lab_job` row in the LMS module's queue.
+ * On Medusa `order.placed`, compose a lab-job build result and persist a
+ * durable `lab_job` row in the LMS queue.
  *
- * Today the lab provider is `UnimplementedLabProvider`, so the job
- * stays in `queued` status forever — no money or product moves. Once
- * a lab partner is selected, swap the provider and the same
- * subscriber will start submitting jobs immediately on order.placed.
+ * Durable failure visibility: unlike the old handler (which swallowed any
+ * build error and created NO row), a failed/pending build now ALWAYS lands a
+ * row so ops sees it in /admin/lab-jobs:
+ *   - ok         → queued, then submitted if a provider is wired
+ *   - pending_rx → row awaiting the customer's send-later prescription
+ *   - failed     → row with the reason in last_error (heals via /retry)
+ *   - skip       → frame-only order; legitimately no row (console.info only)
  *
- * Failure mode: errors during packet construction are CAPTURED, not
- * thrown. We don't want a malformed-Rx case to break the order-placed
- * pipeline (the customer has already paid). The order goes through;
- * a missing/failed lab_job is visible to ops in /admin/lab-jobs.
+ * The lab provider is `UnimplementedLabProvider` today, so an ok job stays
+ * `queued` forever — no money or product moves. Once a lab partner is
+ * selected, swap the provider and the same subscriber submits on order.placed.
+ *
+ * Idempotency: a read-before-create existence check plus a DB unique index on
+ * order_id (the create tolerates a concurrent duplicate) means a redelivered
+ * order.placed never doubles up a row.
  */
 
 export default async function orderPlacedHandler({
@@ -31,33 +38,51 @@ export default async function orderPlacedHandler({
   const lms = container.resolve(LMS_MODULE) as LmsModuleService;
 
   // Idempotency: if a job already exists for this order, don't create a
-  // duplicate. Medusa's event bus may deliver the same event more than
-  // once on retries.
+  // duplicate. Medusa's event bus may deliver the same event more than once.
   const existing = await lms.getJobByOrderId(orderId);
   if (existing) {
     return;
   }
 
-  let packet;
+  let result: BuildPacketResult;
   try {
-    packet = await buildLabJobPacket({ container, orderId });
+    result = await buildLabJobPacket({ container, orderId });
   } catch (err) {
-    console.error(
-      `[order-placed] buildLabJobPacket failed for ${orderId}: ${
-        err instanceof Error ? err.message : "unknown"
+    // Infra failure (e.g. the order module threw). Still record a durable
+    // failed row so the order isn't silently missing from the lab queue.
+    result = {
+      outcome: "failed",
+      reason: `lab-job build threw: ${
+        err instanceof Error ? err.message : "unknown error"
       }`,
+      snapshot: { job_ref: `klear-${orderId}`, klear_order_id: orderId },
+    };
+  }
+
+  if (result.outcome === "skip") {
+    console.info(
+      `[order-placed] order ${orderId} needs no lab job (${result.reason})`,
     );
     return;
   }
 
-  const job = await lms.createJob(packet);
+  const job = await lms.createFromBuild(result);
+  if (!job) return;
+
+  if (result.outcome !== "ok") {
+    // pending_rx / failed — durable, ops-visible, no submission attempt.
+    console.info(
+      `[order-placed] lab_job ${job.id} recorded as ${result.outcome}: ${result.reason}`,
+    );
+    return;
+  }
 
   // Try to submit immediately. If the provider isn't wired
   // (UnimplementedLabProvider throws not_implemented) the job stays in
   // queued — that's the expected pre-lab-partner state.
   try {
-    const result = await lms.submitJob(job.id);
-    if (result.outcome === "queued_no_provider") {
+    const submitResult = await lms.submitJob(job.id);
+    if (submitResult.outcome === "queued_no_provider") {
       console.info(
         `[order-placed] lab_job ${job.id} queued (no provider wired)`,
       );
