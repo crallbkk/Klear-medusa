@@ -38,6 +38,11 @@ RUN cd apps/backend/.medusa/server && npm install --omit=dev --legacy-peer-deps
 # dev-only deps from stage 1 are dropped.
 FROM node:20-bookworm-slim AS runner
 
+# Explicit NODE_ENV so the medusa-config.ts production boot guard (missing
+# JWT_SECRET / COOKIE_SECRET must throw) never depends on the medusa CLI's
+# undocumented `start` default.
+ENV NODE_ENV=production
+
 WORKDIR /app
 
 # Copy the self-contained server bundle (includes its own node_modules and
