@@ -1,5 +1,8 @@
 import type { MedusaContainer } from "@medusajs/framework/types";
-import { LMS_MODULE } from "../modules/lms/service";
+import {
+  LMS_MODULE,
+  LabJobNotRebuildableError,
+} from "../modules/lms/service";
 import type LmsModuleService from "../modules/lms/service";
 import { rebuildAndSubmitJob } from "../modules/lms/rebuild";
 
@@ -39,6 +42,7 @@ export default async function healPendingRxJob(
 
   let healed = 0;
   let stillWaiting = 0;
+  let advanced = 0;
   let errored = 0;
 
   for (const job of pending) {
@@ -47,7 +51,14 @@ export default async function healPendingRxJob(
       if (r.buildOutcome === "ok") healed++;
       else stillWaiting++;
     } catch (err) {
-      // One malformed order must never abort the sweep of the rest.
+      if (err instanceof LabJobNotRebuildableError) {
+        // Benign, not an error: another path (a manual retry, or this job
+        // healing on a prior pass) advanced it out of a rebuildable state
+        // between our list read and the rebuild. Don't log it as a failure.
+        advanced++;
+        continue;
+      }
+      // A genuine failure on ONE order must never abort the sweep of the rest.
       errored++;
       console.error(
         `[heal-pending-rx] heal failed for job ${job.id} (order ${job.order_id}): ${
@@ -58,14 +69,15 @@ export default async function healPendingRxJob(
   }
 
   console.info(
-    `[heal-pending-rx] swept ${pending.length} pending_rx: ${healed} healed, ${stillWaiting} still waiting, ${errored} errored`,
+    `[heal-pending-rx] swept ${pending.length} pending_rx: ${healed} healed, ${stillWaiting} still waiting, ${advanced} concurrently-advanced, ${errored} errored`,
   );
 }
 
 export const config = {
   name: "heal-pending-rx",
-  // Every 15 minutes. With no lab provider wired this only needs to move healed
-  // jobs out of pending_rx promptly enough for ops visibility; tighten the
-  // cadence (or add a storefront nudge) if instant progression ever matters.
-  schedule: "*/15 * * * *",
+  // Every 30 minutes. With no lab provider wired there's no urgency — this only
+  // needs to move healed jobs out of pending_rx promptly enough for ops
+  // visibility. Tighten the cadence (or add a storefront nudge) if instant
+  // progression ever matters once a provider is live.
+  schedule: "*/30 * * * *",
 };

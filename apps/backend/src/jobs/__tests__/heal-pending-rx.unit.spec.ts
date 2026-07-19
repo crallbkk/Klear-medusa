@@ -1,5 +1,5 @@
 import healPendingRxJob from "../heal-pending-rx";
-import { LMS_MODULE } from "../../modules/lms/service";
+import { LMS_MODULE, LabJobNotRebuildableError } from "../../modules/lms/service";
 import { rebuildAndSubmitJob } from "../../modules/lms/rebuild";
 
 jest.mock("../../modules/lms/rebuild", () => ({
@@ -93,5 +93,31 @@ describe("heal-pending-rx scheduled job", () => {
       "job_ok",
       "order_y",
     );
+  });
+
+  it("treats a concurrently-advanced job (LabJobNotRebuildableError) as benign — no error log", async () => {
+    const lms = makeLms([
+      { id: "job_raced", order_id: "order_r" },
+      { id: "job_ok", order_id: "order_y" },
+    ]);
+    const errorSpy = console.error as jest.Mock;
+    mockRebuild.mockImplementation(async (_c, jobId) => {
+      if (jobId === "job_raced") {
+        throw new LabJobNotRebuildableError(
+          "updateJobFromBuild: job job_raced is submitted — only queued/failed/pending_rx jobs can be rebuilt",
+        );
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return { buildOutcome: "ok", job: {}, submit: {} } as any;
+    });
+
+    await expect(runJob(lms)).resolves.toBeUndefined();
+
+    // Both processed; the benign race did NOT produce an error log.
+    expect(mockRebuild).toHaveBeenCalledTimes(2);
+    const errorCalls = errorSpy.mock.calls.filter((c) =>
+      String(c[0]).includes("heal failed"),
+    );
+    expect(errorCalls).toHaveLength(0);
   });
 });
