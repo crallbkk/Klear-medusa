@@ -5,7 +5,7 @@ import type {
 import { MedusaError } from "@medusajs/framework/utils";
 import { LMS_MODULE } from "../../../../../modules/lms/service";
 import type LmsModuleService from "../../../../../modules/lms/service";
-import { buildLabJobPacket } from "../../../../../modules/lms/build-packet";
+import { rebuildAndSubmitJob } from "../../../../../modules/lms/rebuild";
 
 /**
  * POST /admin/lab-jobs/[id]/retry — heal + re-attempt a lab job. No body.
@@ -80,24 +80,18 @@ export async function POST(
 
   try {
     // Rebuild from the current order metadata so fixes are picked up
-    // (queued / failed / pending_rx).
-    const result = await buildLabJobPacket({
-      container: req.scope,
-      orderId: job.order_id,
-    });
+    // (queued / failed / pending_rx) — shared with the heal-pending-rx job.
+    const r = await rebuildAndSubmitJob(req.scope, id, job.order_id);
 
-    const updated = await lms.updateJobFromBuild(id, result);
-
-    if (result.outcome === "ok") {
-      const submitResult = await lms.submitJob(updated.id);
-      res.json(submitResult);
+    if (r.buildOutcome === "ok") {
+      res.json(r.submit);
       return;
     }
 
     res.json({
-      outcome: result.outcome,
-      reason: (result as { reason?: string }).reason,
-      job: updated,
+      outcome: r.buildOutcome,
+      reason: r.reason,
+      job: r.job,
     });
   } catch (err) {
     console.error(
