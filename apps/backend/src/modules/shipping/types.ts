@@ -22,6 +22,43 @@ export type ThaiCarrier =
   | "SCG"   // SCG Express
   | "BEST"; // Best Express
 
+/**
+ * Human-readable carrier names keyed by Shippop courier_code. Single source of
+ * truth for turning a stored `courier_code` (on the Fulfillment `data`) into a
+ * customer-facing carrier label — consumed by the carrier-status subscriber
+ * (H1) and mirrored by the fulfillment provider's option list.
+ */
+export const THAI_CARRIER_NAMES: Record<ThaiCarrier, string> = {
+  FLE: "Flash Express",
+  EMST: "Thailand Post EMS",
+  KRYS: "Kerry Shop",
+  KRYX: "Kerry Express",
+  JNTE: "J&T Express",
+  DHL: "DHL eCommerce",
+  NJV: "Ninja Van",
+  SCG: "SCG Express",
+  BEST: "Best Express",
+};
+
+/**
+ * Map a (possibly unknown / undefined) courier_code to a display name.
+ * Returns null when the code isn't one we recognise — callers pass null
+ * downstream and the storefront applies its own "Shippop" fallback.
+ */
+export function carrierDisplayName(code: string | null | undefined): string | null {
+  if (!code) return null;
+  return THAI_CARRIER_NAMES[code as ThaiCarrier] ?? null;
+}
+
+/**
+ * Public Shippop tracking page for an `SP...` tracking code. The single place
+ * this URL shape is defined — the fulfillment provider's label URL and the
+ * carrier-status subscriber both route through here so they never drift.
+ */
+export function shippopTrackingUrl(shippop_tracking_code: string): string {
+  return `https://www.shippop.com/tracking/?tracking_code=${encodeURIComponent(shippop_tracking_code)}`;
+}
+
 export interface ParcelDims {
   weight_g: number;
   length_cm: number;
