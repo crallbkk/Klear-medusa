@@ -137,7 +137,7 @@ describe("shippop-tracking subscriber", () => {
     expect(mockWorkflow).not.toHaveBeenCalled();
   });
 
-  it("unresolvable tracking code → warns, no POST, no workflow", async () => {
+  it("unresolvable tracking code → warns with checked count, no POST, no workflow", async () => {
     const { container } = makeContainer([]); // no fulfillment matched
     await run(trackingUpdate("picked_up"), container);
 
@@ -146,6 +146,36 @@ describe("shippop-tracking subscriber", () => {
     expect(console.warn).toHaveBeenCalledWith(
       expect.stringContaining("no Medusa fulfillment matches tracking code SP123"),
     );
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("fulfillments checked: 0"),
+    );
+    // The empty-match path must NOT use the query-failed error wording.
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it("graph query THROW → distinct loud error (misconfiguration wording), no POST, no workflow, no throw", async () => {
+    const graph = jest.fn().mockRejectedValue(new Error("column labels.tracking_number does not exist"));
+    const container = {
+      resolve: jest.fn((key: string) => {
+        if (key === "query") return { graph };
+        throw new Error(`unexpected resolve(${key})`);
+      }),
+    };
+
+    await expect(run(trackingUpdate("picked_up"), container)).resolves.toBeUndefined();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mockWorkflow).not.toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "fulfillment graph query FAILED — resolution may be misconfigured",
+      ),
+    );
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining("column labels.tracking_number does not exist"),
+    );
+    // Distinct paths: the no-match warn must not fire on a query failure.
+    expect(console.warn).not.toHaveBeenCalled();
   });
 
   it("delivered fresh → marks the fulfillment delivered AND POSTs", async () => {

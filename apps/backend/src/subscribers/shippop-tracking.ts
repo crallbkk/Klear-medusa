@@ -79,17 +79,26 @@ export default async function shippopTrackingHandler({
   const spCode = tracking.shipment_id;
   const status = tracking.status;
 
-  const resolved = await resolveFulfillment(container, spCode);
-  if (!resolved) {
+  const resolution = await resolveFulfillment(container, spCode);
+  if (resolution.outcome === "query_failed") {
+    // DISTINCT from the empty-match warn below: the graph query itself threw,
+    // which usually means the query/link wiring is misconfigured (or the DB is
+    // down) — every event will fail identically until it's fixed.
+    console.error(
+      `[carrier-propagation] fulfillment graph query FAILED — resolution may be misconfigured: ${resolution.message} (tracking code ${spCode}, status=${status})`,
+    );
+    return;
+  }
+  if (resolution.outcome === "no_match") {
     // Loud, deliberate: an unresolvable code means the order never got a
     // Shippop shipment through our adapter, or the label wasn't persisted.
     console.warn(
-      `[carrier-propagation] no Medusa fulfillment matches tracking code ${spCode} (status=${status}); dropping event`,
+      `[carrier-propagation] no Medusa fulfillment matches tracking code ${spCode} (status=${status}, fulfillments checked: ${resolution.checked}); dropping event`,
     );
     return;
   }
 
-  const { orderId, fulfillmentId, deliveredAt, carrier, trackingUrl } = resolved;
+  const { orderId, fulfillmentId, deliveredAt, carrier, trackingUrl } = resolution;
 
   // (a) delivered → mark the Medusa fulfillment delivered (idempotent).
   if (status === "delivered") {
@@ -162,13 +171,20 @@ export default async function shippopTrackingHandler({
   }
 }
 
-interface ResolvedFulfillment {
-  orderId: string;
-  fulfillmentId: string;
-  deliveredAt: string | null;
-  carrier: string | null;
-  trackingUrl: string | null;
-}
+type ResolutionResult =
+  | {
+      outcome: "resolved";
+      orderId: string;
+      fulfillmentId: string;
+      deliveredAt: string | null;
+      carrier: string | null;
+      trackingUrl: string | null;
+    }
+  /** The graph query itself threw — wiring/infra problem, not a data miss. */
+  | { outcome: "query_failed"; message: string }
+  /** Query ran fine but no fulfillment (with an order link) matched the code.
+   *  `checked` = rows the query returned before the order-link filter. */
+  | { outcome: "no_match"; checked: number };
 
 /**
  * Resolve the Shippop SP code to a Medusa fulfillment (+ its order) via the
@@ -185,7 +201,7 @@ interface ResolvedFulfillment {
 async function resolveFulfillment(
   container: SubscriberArgs["container"],
   spCode: string,
-): Promise<ResolvedFulfillment | null> {
+): Promise<ResolutionResult> {
   let rows: FulfillmentGraphRow[];
   try {
     const query = container.resolve(ContainerRegistrationKeys.QUERY);
@@ -203,14 +219,13 @@ async function resolveFulfillment(
     });
     rows = (data ?? []) as FulfillmentGraphRow[];
   } catch (err) {
-    console.error(
-      `[carrier-propagation] fulfillment resolution query failed for tracking code ${spCode}: ${errMessage(err)}`,
-    );
-    return null;
+    return { outcome: "query_failed", message: errMessage(err) };
   }
 
   const match = rows.find((r) => r.order?.id);
-  if (!match || !match.order?.id) return null;
+  if (!match || !match.order?.id) {
+    return { outcome: "no_match", checked: rows.length };
+  }
 
   const data = (match.data ?? {}) as Partial<ShippopFulfillmentData>;
   const labelUrl = Array.isArray(match.labels)
@@ -218,6 +233,7 @@ async function resolveFulfillment(
     : undefined;
 
   return {
+    outcome: "resolved",
     orderId: match.order.id,
     fulfillmentId: match.id,
     deliveredAt: match.delivered_at ?? null,
