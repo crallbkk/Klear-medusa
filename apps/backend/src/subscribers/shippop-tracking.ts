@@ -41,6 +41,15 @@ import type { ShippopFulfillmentData } from "../modules/shipping/provider/servic
  * NEVER throws — an unresolved code, a failed mark, or exhausted POST retries
  * all log loudly (`[carrier-propagation]`) and return. (Sentry wiring is the
  * M5 observability backlog item.)
+ *
+ * ACCEPTED TRADE-OFF (pr-rigor F2, 2026-07-19): because containment means the
+ * event bus records success, exhausting the 3 in-band POST attempts DROPS the
+ * event — Medusa can read `delivered` while the storefront order stays
+ * `shipped` and the customer is never told. Recovery today: Shippop webhook
+ * redelivery, or the storefront's desync page on any future event for the
+ * order. A dead-letter row + redrive sweep is the go-live hardening item
+ * (BACKLOG M11) — required before real Shippop volume. See LESSONS.md
+ * Pattern 24 for the general shape.
  */
 
 const STOREFRONT_URL_ENV = "KLEAR_STOREFRONT_URL";
