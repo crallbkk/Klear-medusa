@@ -26,6 +26,22 @@ const REBUILDABLE_STATUSES: ReadonlySet<LabJobStatusValue> = new Set([
   "pending_rx",
 ]);
 
+/**
+ * Thrown by `updateJobFromBuild` when the target job is no longer rebuildable
+ * (submitted / submitting / cancelled). For the operator retry route this is a
+ * real 400/409; for the `heal-pending-rx` sweep it's BENIGN — another path
+ * (a manual retry, or the prior sweep pass) advanced the job between the list
+ * read and the rebuild — so the sweep counts it as concurrently-advanced, not
+ * an error. Typed (not a bare Error) so callers can tell the two apart without
+ * string-matching.
+ */
+export class LabJobNotRebuildableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LabJobNotRebuildableError";
+  }
+}
+
 export type LabJobRow = {
   id: string;
   order_id: string;
@@ -170,7 +186,7 @@ class LmsModuleService extends MedusaService({
     const current = (await this.retrieveLabJob(jobId)) as unknown as LabJobRow;
     if (!current) throw new Error(`updateJobFromBuild: job ${jobId} not found`);
     if (!REBUILDABLE_STATUSES.has(current.status)) {
-      throw new Error(
+      throw new LabJobNotRebuildableError(
         `updateJobFromBuild: job ${jobId} is ${current.status} — only queued/failed/pending_rx jobs can be rebuilt`,
       );
     }
@@ -186,6 +202,18 @@ class LmsModuleService extends MedusaService({
       return updated[0];
     }
     const fields = this.rowFieldsFromBuild(result);
+    // Skip the write when nothing meaningful changed — a still-waiting
+    // (pending_rx) or still-failed job rebuilt with the SAME reason. This
+    // avoids churning `updated_at` (so it stays a real "last progressed"
+    // signal in /admin/lab-jobs) and needless row writes on every sweep pass.
+    // An "ok" rebuild always writes — it transitions the job to `queued`.
+    if (
+      fields.status !== "queued" &&
+      current.status === fields.status &&
+      current.last_error === fields.last_error
+    ) {
+      return current;
+    }
     const updated = (await this.updateLabJobs({
       selector: { id: jobId },
       data: {
@@ -216,9 +244,12 @@ class LmsModuleService extends MedusaService({
     status: LabJobStatusValue,
     limit = 100,
   ): Promise<LabJobRow[]> {
+    // Oldest-first: with a `take` cap, ordering ensures a large backlog of
+    // never-answered pending_rx rows can't repeatedly return the same head set
+    // and starve newer, healable jobs from ever being swept.
     return (await this.listLabJobs(
       { status },
-      { take: limit },
+      { take: limit, order: { created_at: "ASC" } },
     )) as unknown as LabJobRow[];
   }
 

@@ -199,6 +199,23 @@ describe("LmsModuleService.updateJobFromBuild — retry heal path", () => {
     expect(healed.packet_snapshot).toEqual(PACKET);
   });
 
+  it("skips the write when a still-waiting pending_rx job rebuilds unchanged", async () => {
+    const { service } = makeService();
+    const pending = await service.createFromBuild(pendingResult);
+    expect(pending!.status).toBe("pending_rx");
+    const writesBefore = ((service as any).updateLabJobs as jest.Mock).mock.calls
+      .length;
+
+    // Same pending_rx result again — nothing meaningful changed.
+    const again = await service.updateJobFromBuild(pending!.id, pendingResult);
+
+    expect(again.status).toBe("pending_rx");
+    // No write performed — updated_at is not churned on an unchanged sweep pass.
+    expect(((service as any).updateLabJobs as jest.Mock).mock.calls.length).toBe(
+      writesBefore,
+    );
+  });
+
   it("keeps a failed row failed when the rebuild still fails, refreshing the reason", async () => {
     const { service } = makeService();
     const failed = await service.createFromBuild(failedResult);
