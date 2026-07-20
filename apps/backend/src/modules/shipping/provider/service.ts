@@ -23,6 +23,7 @@ import type {
   ThaiAddress,
   ThaiCarrier,
 } from "../types";
+import { shippopTrackingUrl } from "../types";
 
 // Medusa-native fulfillment-provider adapter wrapping ShippopProvider.
 //
@@ -319,5 +320,7 @@ function computeParcelFromItems(
 function trackingUrlFor(shippop_tracking_code: string): string {
   // Customer-friendly tracking page hosted by Shippop. Pasted into the
   // shipped-email + LINE template by the storefront's order surface.
-  return `https://www.shippop.com/tracking/?tracking_code=${encodeURIComponent(shippop_tracking_code)}`;
+  // Shared with the carrier-status subscriber via `shippopTrackingUrl` so
+  // the URL shape never drifts between the two.
+  return shippopTrackingUrl(shippop_tracking_code);
 }
