@@ -1,4 +1,8 @@
-import { decryptPrescription, SupabaseVaultError } from "../supabase-vault";
+import {
+  decryptPrescription,
+  SupabaseVaultError,
+  RX_ENC_COLUMNS,
+} from "../supabase-vault";
 
 const PREV_ENV = { ...process.env };
 
@@ -294,5 +298,110 @@ describe("decryptPrescription", () => {
       name: "SupabaseVaultError",
       code: "incomplete",
     });
+  });
+});
+
+// Regression guard for M6 (Rx-decrypt contract dedup): the select list and
+// the decrypt-column mapping are now BOTH derived from RX_ENC_COLUMNS, so a
+// future edit that adds/renames/removes a column can't leave the PostgREST
+// fetch and the decrypt step silently out of sync with each other.
+describe("RX_ENC_COLUMNS drift guard", () => {
+  it("the PostgREST select query contains every column declared in RX_ENC_COLUMNS", async () => {
+    let selectUrl = "";
+    const plaintexts: Record<string, string> = {
+      ct_od_sph: "-2.5",
+      ct_od_cyl: "-1.0",
+      ct_od_axis: "90",
+      ct_os_sph: "-2.25",
+      ct_os_cyl: "-0.75",
+      ct_os_axis: "85",
+      ct_pd_bin: "62",
+    };
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      (url) => {
+        selectUrl = url;
+        return makeRowResponse();
+      },
+    ];
+    for (let i = 0; i < 7; i++) {
+      handlers.push((_url, init) => {
+        const body = JSON.parse((init?.body as string) ?? "{}");
+        return jsonResponse(200, plaintexts[body.ciphertext]);
+      });
+    }
+    const fetchMock = mockFetchSequence(handlers);
+    await decryptPrescription("rx_1", {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    expect(RX_ENC_COLUMNS.length).toBe(11);
+    for (const col of RX_ENC_COLUMNS) {
+      expect(selectUrl).toContain(col);
+    }
+  });
+
+  it("maps each *_enc column to the correct DecryptedPrescription field (distinct value per field catches mis-mapping)", async () => {
+    // Every column gets its own ciphertext -> its own distinct plaintext,
+    // so if the map-based decrypt ever read the wrong column into the
+    // wrong output field (e.g. os_axis_enc into axis_right), this fails
+    // instead of silently passing because two fields happened to share
+    // a value.
+    const row = jsonResponse(200, [
+      {
+        id: "rx_distinct",
+        status: "active",
+        od_sphere_enc: "ct_od_sphere",
+        od_cylinder_enc: "ct_od_cylinder",
+        od_axis_enc: "ct_od_axis",
+        od_add_enc: "ct_od_add",
+        os_sphere_enc: "ct_os_sphere",
+        os_cylinder_enc: "ct_os_cylinder",
+        os_axis_enc: "ct_os_axis",
+        os_add_enc: "ct_os_add",
+        pd_binocular_enc: null,
+        pd_right_enc: "ct_pd_right",
+        pd_left_enc: "ct_pd_left",
+      },
+    ]);
+    const plaintexts: Record<string, string> = {
+      ct_od_sphere: "-1.25",
+      ct_os_sphere: "-1.75",
+      ct_od_cylinder: "-0.25",
+      ct_os_cylinder: "-0.50",
+      ct_od_axis: "10",
+      ct_os_axis: "170",
+      ct_od_add: "1.50",
+      ct_os_add: "2.00",
+      ct_pd_right: "32",
+      ct_pd_left: "34",
+    };
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      () => row,
+    ];
+    // 10 non-null *_enc fields (pd_binocular_enc is null here, so dec()
+    // short-circuits without a fetch call for it).
+    for (let i = 0; i < 10; i++) {
+      handlers.push((_url, init) => {
+        const body = JSON.parse((init?.body as string) ?? "{}");
+        return jsonResponse(200, plaintexts[body.ciphertext]);
+      });
+    }
+    const fetchMock = mockFetchSequence(handlers);
+    const rx = await decryptPrescription("rx_distinct", {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    expect(rx.sph_right).toBe(-1.25);
+    expect(rx.sph_left).toBe(-1.75);
+    expect(rx.cyl_right).toBe(-0.25);
+    expect(rx.cyl_left).toBe(-0.5);
+    expect(rx.axis_right).toBe(10);
+    expect(rx.axis_left).toBe(170);
+    expect(rx.add_right).toBe(1.5);
+    expect(rx.add_left).toBe(2.0);
+    // pd_right_enc/pd_left_enc were populated (monocular), so they pass
+    // through as-is — no 50/50 binocular split.
+    expect(rx.pd_right).toBe(32);
+    expect(rx.pd_left).toBe(34);
   });
 });

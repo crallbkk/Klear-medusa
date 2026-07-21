@@ -47,6 +47,46 @@ export class SupabaseVaultError extends Error {
   }
 }
 
+/**
+ * The 11 Vault-encrypted prescription columns, in a single ordered
+ * declaration. This is the ONE place the Rx-decrypt contract lives:
+ * both the PostgREST `select=...` list and the per-column Vault decrypt
+ * calls are derived from this array, so adding/removing/renaming a
+ * column can never leave the fetch and the decrypt step out of sync
+ * with each other (the failure mode this module used to have). The order
+ * here matches the pre-refactor `dec()` fan-out order (OD/OS interleaved
+ * per field, then the PD fields) so the decrypt calls still kick off in
+ * the same sequence as before.
+ */
+export const RX_ENC_COLUMNS = [
+  "od_sphere_enc",
+  "os_sphere_enc",
+  "od_cylinder_enc",
+  "os_cylinder_enc",
+  "od_axis_enc",
+  "os_axis_enc",
+  "od_add_enc",
+  "os_add_enc",
+  "pd_binocular_enc",
+  "pd_right_enc",
+  "pd_left_enc",
+] as const;
+
+type RxEncColumn = (typeof RX_ENC_COLUMNS)[number];
+
+/**
+ * Canonical Supabase Vault RPC, defined in the storefront repo's
+ * `supabase/migrations/0002_pgcrypto.sql`: `decrypt_with_vault_key(ciphertext
+ * text, key_alias text)`.
+ */
+const RX_DECRYPT_RPC = "decrypt_with_vault_key";
+
+/**
+ * Vault key alias for prescription data. Must match the storefront's use of
+ * the same data path (see `src/lib/encryption/vault.ts:VAULT_KEYS.PRESCRIPTION`).
+ */
+const RX_VAULT_KEY_ALIAS = "prescription_master_key";
+
 interface SupabaseConfig {
   url: string;
   serviceRoleKey: string;
@@ -87,9 +127,11 @@ export async function decryptPrescription(
   const { url, serviceRoleKey } = readConfig();
   const fetchImpl = opts.fetch ?? fetch;
 
-  // Pull the encrypted row via PostgREST.
+  // Pull the encrypted row via PostgREST. The column list is derived from
+  // RX_ENC_COLUMNS (see above) so this select can never drift from what
+  // dec() below actually decrypts.
   const rowRes = await fetchImpl(
-    `${url}/rest/v1/prescriptions?id=eq.${encodeURIComponent(prescription_id)}&select=id,status,od_sphere_enc,od_cylinder_enc,od_axis_enc,od_add_enc,os_sphere_enc,os_cylinder_enc,os_axis_enc,os_add_enc,pd_binocular_enc,pd_right_enc,pd_left_enc`,
+    `${url}/rest/v1/prescriptions?id=eq.${encodeURIComponent(prescription_id)}&select=id,status,${RX_ENC_COLUMNS.join(",")}`,
     {
       headers: {
         apikey: serviceRoleKey,
@@ -119,17 +161,16 @@ export async function decryptPrescription(
     );
   }
 
-  // Decrypt each field via the canonical Supabase Vault RPC
-  // `decrypt_with_vault_key(ciphertext text, key_alias text)`, defined in
-  // the storefront repo's `supabase/migrations/0002_pgcrypto.sql`. The
-  // `prescription_master_key` alias is what the storefront uses for the
-  // same data path (see `src/lib/encryption/vault.ts:VAULT_KEYS.PRESCRIPTION`).
+  // Decrypt each field via the canonical Supabase Vault RPC (RX_DECRYPT_RPC),
+  // defined in the storefront repo's `supabase/migrations/0002_pgcrypto.sql`.
+  // RX_VAULT_KEY_ALIAS is what the storefront uses for the same data path
+  // (see `src/lib/encryption/vault.ts:VAULT_KEYS.PRESCRIPTION`).
   // Service-role is required — EXECUTE on this function is revoked from
   // authenticated/anon.
-  async function dec(field: string): Promise<number | null> {
+  async function dec(field: RxEncColumn): Promise<number | null> {
     const ciphertext = row[field];
     if (ciphertext === null) return null;
-    const res = await fetchImpl(`${url}/rest/v1/rpc/decrypt_with_vault_key`, {
+    const res = await fetchImpl(`${url}/rest/v1/rpc/${RX_DECRYPT_RPC}`, {
       method: "POST",
       headers: {
         apikey: serviceRoleKey,
@@ -139,7 +180,7 @@ export async function decryptPrescription(
       },
       body: JSON.stringify({
         ciphertext,
-        key_alias: "prescription_master_key",
+        key_alias: RX_VAULT_KEY_ALIAS,
       }),
     });
     if (!res.ok) {
@@ -168,31 +209,32 @@ export async function decryptPrescription(
     return num;
   }
 
-  const [
-    sph_right,
-    sph_left,
-    cyl_right,
-    cyl_left,
-    axis_right,
-    axis_left,
-    add_right,
-    add_left,
-    pd_binocular,
-    pd_right,
-    pd_left,
-  ] = await Promise.all([
-    dec("od_sphere_enc"),
-    dec("os_sphere_enc"),
-    dec("od_cylinder_enc"),
-    dec("os_cylinder_enc"),
-    dec("od_axis_enc"),
-    dec("os_axis_enc"),
-    dec("od_add_enc"),
-    dec("os_add_enc"),
-    dec("pd_binocular_enc"),
-    dec("pd_right_enc"),
-    dec("pd_left_enc"),
-  ]);
+  // Decrypt every column concurrently (still parallel — same fan-out as
+  // before), but keyed by column name rather than positional array index.
+  // The column↔output-field mapping below is now the ONE explicit place
+  // that relationship lives, so it can no longer drift out of sync with
+  // the select list the way a positional array could.
+  const decryptedEntries = await Promise.all(
+    RX_ENC_COLUMNS.map(
+      async (col) => [col, await dec(col)] as [RxEncColumn, number | null],
+    ),
+  );
+  const decrypted = Object.fromEntries(decryptedEntries) as Record<
+    RxEncColumn,
+    number | null
+  >;
+
+  const sph_right = decrypted.od_sphere_enc;
+  const sph_left = decrypted.os_sphere_enc;
+  const cyl_right = decrypted.od_cylinder_enc;
+  const cyl_left = decrypted.os_cylinder_enc;
+  const axis_right = decrypted.od_axis_enc;
+  const axis_left = decrypted.os_axis_enc;
+  const add_right = decrypted.od_add_enc;
+  const add_left = decrypted.os_add_enc;
+  const pd_binocular = decrypted.pd_binocular_enc;
+  const pd_right = decrypted.pd_right_enc;
+  const pd_left = decrypted.pd_left_enc;
 
   if (sph_right === null || sph_left === null) {
     throw new SupabaseVaultError(
