@@ -6,6 +6,7 @@ import { MedusaError } from "@medusajs/framework/utils";
 import { LMS_MODULE } from "../../../../../modules/lms/service";
 import type LmsModuleService from "../../../../../modules/lms/service";
 import { rebuildAndSubmitJob } from "../../../../../modules/lms/rebuild";
+import { captureException } from "../../../../../lib/observability/sentry";
 
 /**
  * POST /admin/lab-jobs/[id]/retry — heal + re-attempt a lab job. No body.
@@ -55,6 +56,10 @@ export async function POST(
         err instanceof Error ? err.message : "unknown"
       }`,
     );
+    captureException(err, {
+      tags: { route: "admin/lab-jobs/retry", reason: "retrieve_failed" },
+      extra: { lab_job_id: id },
+    });
     res.status(500).json({ error: "internal error retrieving lab_job" });
     return;
   }
@@ -99,6 +104,10 @@ export async function POST(
         err instanceof Error ? err.message : "unknown"
       }`,
     );
+    captureException(err, {
+      tags: { route: "admin/lab-jobs/retry", reason: "rebuild_failed" },
+      extra: { lab_job_id: id, order_id: job.order_id },
+    });
     res.status(500).json({
       error: err instanceof Error ? err.message : "Unknown error",
     });

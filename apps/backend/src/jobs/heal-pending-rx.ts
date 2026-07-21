@@ -5,6 +5,7 @@ import {
 } from "../modules/lms/service";
 import type LmsModuleService from "../modules/lms/service";
 import { rebuildAndSubmitJob } from "../modules/lms/rebuild";
+import { captureException } from "../lib/observability/sentry";
 
 /**
  * Scheduled sweep — heal send-later lab jobs (H5).
@@ -65,6 +66,10 @@ export default async function healPendingRxJob(
           err instanceof Error ? err.message : "unknown"
         }`,
       );
+      captureException(err, {
+        tags: { job: "heal-pending-rx", reason: "rebuild_failed" },
+        extra: { lab_job_id: job.id, order_id: job.order_id },
+      });
     }
   }
 
