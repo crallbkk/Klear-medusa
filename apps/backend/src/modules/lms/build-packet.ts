@@ -14,6 +14,7 @@ import {
   type LabJobSnapshot,
   type LensType,
 } from "./types";
+import { captureException } from "../../lib/observability/sentry";
 
 /**
  * Orchestrator: given a Medusa order id, compose a lab-job build result.
@@ -366,6 +367,13 @@ export async function buildLabJobPacket(
         },
       };
     } catch (err) {
+      // NEVER put the packet/prescription/customer objects into `extra` here
+      // — only opaque ids. The decrypted Rx, if any was partially read before
+      // the throw, must not ride along on this event.
+      captureException(err, {
+        tags: { module: "lms", fn: "build-packet", reason: "decrypt_failed" },
+        extra: { order_id: orderId, job_ref: jobRef },
+      });
       return {
         outcome: "failed",
         reason: `prescription decrypt failed: ${

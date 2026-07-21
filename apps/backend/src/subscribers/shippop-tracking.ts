@@ -8,6 +8,7 @@ import {
   type ShippingWebhookEvent,
 } from "../modules/shipping/types";
 import type { ShippopFulfillmentData } from "../modules/shipping/provider/service";
+import { captureException, captureMessage } from "../lib/observability/sentry";
 
 /**
  * H1 — carrier (Shippop) shipped/delivered propagation to the customer.
@@ -39,8 +40,10 @@ import type { ShippopFulfillmentData } from "../modules/shipping/provider/servic
  *
  * Containment: the webhook route already ack'd Shippop 200, so this subscriber
  * NEVER throws — an unresolved code, a failed mark, or exhausted POST retries
- * all log loudly (`[carrier-propagation]`) and return. (Sentry wiring is the
- * M5 observability backlog item.)
+ * all log loudly (`[carrier-propagation]`) and return. Real failures also
+ * report to Sentry (BACKLOG M5) so they're visible without tailing logs —
+ * see the `captureException`/`captureMessage` calls below; only opaque ids
+ * (order/tracking/shipment) go into `extra`, never customer data.
  *
  * ACCEPTED TRADE-OFF (pr-rigor F2, 2026-07-19): because containment means the
  * event bus records success, exhausting the 3 in-band POST attempts DROPS the
@@ -96,6 +99,10 @@ export default async function shippopTrackingHandler({
     console.error(
       `[carrier-propagation] fulfillment graph query FAILED — resolution may be misconfigured: ${resolution.message} (tracking code ${spCode}, status=${status})`,
     );
+    captureException(new Error(resolution.message), {
+      tags: { subscriber: "shippop-tracking", reason: "fulfillment_query_failed" },
+      extra: { shipment_id: spCode, status },
+    });
     return;
   }
   if (resolution.outcome === "no_match") {
@@ -103,6 +110,14 @@ export default async function shippopTrackingHandler({
     // Shippop shipment through our adapter, or the label wasn't persisted.
     console.warn(
       `[carrier-propagation] no Medusa fulfillment matches tracking code ${spCode} (status=${status}, fulfillments checked: ${resolution.checked}); dropping event`,
+    );
+    captureMessage(
+      `[carrier-propagation] no Medusa fulfillment matches tracking code`,
+      {
+        level: "warning",
+        tags: { subscriber: "shippop-tracking", reason: "no_match" },
+        extra: { shipment_id: spCode, status, checked: resolution.checked },
+      },
     );
     return;
   }
@@ -133,6 +148,10 @@ export default async function shippopTrackingHandler({
         console.error(
           `[carrier-propagation] mark-delivered failed for fulfillment ${fulfillmentId} (order ${orderId}): ${errMessage(err)}`,
         );
+        captureException(err, {
+          tags: { subscriber: "shippop-tracking", reason: "mark_delivered_failed" },
+          extra: { order_id: orderId, fulfillment_id: fulfillmentId, status },
+        });
       }
     }
   }
@@ -152,6 +171,13 @@ export default async function shippopTrackingHandler({
       envMissingWarned = true;
       console.error(
         `[carrier-propagation] ${STOREFRONT_URL_ENV} and/or ${WEBHOOK_SECRET_ENV} not set — skipping all storefront POSTs until configured`,
+      );
+      captureMessage(
+        `[carrier-propagation] ${STOREFRONT_URL_ENV} and/or ${WEBHOOK_SECRET_ENV} not set`,
+        {
+          level: "error",
+          tags: { subscriber: "shippop-tracking", reason: "env_missing" },
+        },
       );
     }
     return;
@@ -176,6 +202,20 @@ export default async function shippopTrackingHandler({
   if (!posted) {
     console.error(
       `[carrier-propagation] storefront POST failed after ${POST_BACKOFF_MS.length} attempts for order ${orderId} (status=${status}, tracking=${spCode})`,
+    );
+    // The blind spot this closes: containment means the event bus still
+    // records success, so an exhausted POST here silently drops the
+    // storefront out of sync with Medusa (Medusa=delivered/shipped,
+    // storefront stuck on the prior status, customer never notified — see
+    // the ACCEPTED TRADE-OFF note above / BACKLOG M11). This is the one
+    // capture in this subscriber that most needs real-time alerting.
+    captureMessage(
+      `[carrier-propagation] storefront POST exhausted after ${POST_BACKOFF_MS.length} attempts`,
+      {
+        level: "error",
+        tags: { subscriber: "shippop-tracking", reason: "storefront_post_exhausted" },
+        extra: { order_id: orderId, status, shipment_id: spCode },
+      },
     );
   }
 }
