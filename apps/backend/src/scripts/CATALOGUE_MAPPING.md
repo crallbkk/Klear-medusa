@@ -39,6 +39,7 @@ follow-up.
 | `shape` | `shape` |
 | `material` | `material` |
 | `size` | `size` |
+| `mount_type` | `mount_type` (enum, see below) |
 | `recommended_face_shapes` | `recommended_face_shapes` (JSON array) |
 | `progressives_supported` | `progressives_supported` (bool) |
 | `images.{front,three_quarter,side,on_face}` | `images.*` (R2 keys) |
@@ -46,6 +47,28 @@ follow-up.
 | `spec` (lab dims) | `spec` (JSON object) |
 | `sort_order` | `sort_order` |
 | `status` (storefront enum) | `klear_status` (kept alongside Medusa `status` since Medusa only has published/draft) |
+
+## `mount_type` enum
+
+Values: `"full_rim" | "half_rim" | "rimless" | "drilled"`. Drives the
+storefront's rimless/drilled → 1.67-only lens gate (Klear
+`DECISIONS.md` "Base lens index — 1.56"; Klear `BACKLOG.md` M15). The
+1.56 base lens resin is too brittle for drill mounts / unsupported
+edges, so rimless + drilled frames must fulfil in 1.67 MR-7.
+
+Enforced at two boundaries in the storefront:
+- Presentation: `src/components/flow/lens-select-view.tsx` disables the
+  Basic (1.56) tile on rimless/drilled frames.
+- Money boundary: `assertFrameLensCompatibility` in
+  `src/lib/medusa/checkout.ts` refuses to sync the cart with an
+  incompatible pairing.
+
+Missing / unrecognised value → `"full_rim"` (safe pass) both in the
+migration's `buildMetadata` and in the storefront's `readMountType`.
+Every seed row in `frame-seed.ts` sets it explicitly — an added SKU
+must answer this question before it ships. Rewrite the migration by
+re-running `npx medusa exec ./src/scripts/migrate-catalogue.ts` after
+setting the field on new rows.
 
 ## Why not separate models?
 
