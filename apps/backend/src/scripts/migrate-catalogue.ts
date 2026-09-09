@@ -33,6 +33,11 @@ function buildMetadata(f: FrameSeed): Record<string, unknown> {
     shape: f.shape,
     material: f.material,
     size: f.size,
+    // Storefront reads this via product.metadata.mount_type; an omitted field
+    // degrades to "full_rim" both here and in `readMountType`
+    // (Klear/src/lib/medusa/products.ts). Feeds the rimless/drilled →
+    // 1.67-only gate (Klear BACKLOG M15).
+    mount_type: f.mount_type ?? "full_rim",
     recommended_face_shapes: f.recommended_face_shapes,
     progressives_supported: f.progressives_supported,
     images: f.images,

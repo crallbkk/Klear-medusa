@@ -16,6 +16,19 @@ export type FrameSize = "small" | "medium" | "large";
 export type FrameFaceShape = "round" | "oval" | "square" | "heart" | "diamond";
 export type FrameStatus = "active" | "out_of_stock" | "coming_soon" | "archived";
 
+/**
+ * Frame mount type — drives the storefront's rimless/drilled → 1.67-only
+ * gate (Klear Website DECISIONS.md "Base lens index — 1.56"; the 1.56 resin
+ * is too brittle for drill mounts / unsupported edges). Emitted as
+ * `metadata.mount_type` on each product so the storefront's `FrameView` +
+ * server-side `assertFrameLensCompatibility` guard can read it directly.
+ *
+ * Every stock frame today is `"full_rim"`. Add a rimless/drilled SKU by
+ * setting this to the appropriate value here; the storefront picks it up on
+ * the next `migrate-catalogue.ts` run — no storefront code change needed.
+ */
+export type FrameMountType = "full_rim" | "half_rim" | "rimless" | "drilled";
+
 export interface FrameSeed {
   sku: string;
   handle: string;
@@ -36,6 +49,13 @@ export interface FrameSeed {
   shape: FrameShape;
   material: FrameMaterial;
   size: FrameSize;
+  /** Optional at the type level so an existing SKU can be re-seeded without
+   *  editing every row at once — an omitted value degrades to `"full_rim"`
+   *  both in the migration (`buildMetadata`) and in the storefront's reader
+   *  (`readMountType` in `Klear/src/lib/medusa/products.ts`). But every seed
+   *  row below sets it explicitly — the safe default is opt-out, not opt-in,
+   *  so a NEW SKU always answers the question before it ships. */
+  mount_type?: FrameMountType;
   recommended_face_shapes: FrameFaceShape[];
   progressives_supported: boolean;
   images: {
@@ -78,6 +98,7 @@ export const FRAME_SEED: FrameSeed[] = [
     size: "medium",
     recommended_face_shapes: ["square", "heart", "diamond"],
     progressives_supported: true,
+    mount_type: "full_rim",
     images: {
       front: "frames/KLR-RD-001-BLACK-M/front.webp",
       three_quarter: "frames/KLR-RD-001-BLACK-M/three-quarter.webp",
@@ -116,6 +137,7 @@ export const FRAME_SEED: FrameSeed[] = [
     size: "medium",
     recommended_face_shapes: ["square", "heart", "diamond"],
     progressives_supported: true,
+    mount_type: "full_rim",
     images: {
       front: "frames/KLR-RD-001-TORTOISE-M/front.webp",
       three_quarter: "frames/KLR-RD-001-TORTOISE-M/three-quarter.webp",
@@ -154,6 +176,7 @@ export const FRAME_SEED: FrameSeed[] = [
     size: "medium",
     recommended_face_shapes: ["round", "oval"],
     progressives_supported: true,
+    mount_type: "full_rim",
     images: {
       front: "frames/KLR-SQ-002-BLACK-M/front.webp",
       three_quarter: "frames/KLR-SQ-002-BLACK-M/three-quarter.webp",
@@ -192,6 +215,7 @@ export const FRAME_SEED: FrameSeed[] = [
     size: "large",
     recommended_face_shapes: ["round", "oval", "heart"],
     progressives_supported: true,
+    mount_type: "full_rim",
     images: {
       front: "frames/KLR-RC-003-NAVY-L/front.webp",
       three_quarter: "frames/KLR-RC-003-NAVY-L/three-quarter.webp",
@@ -230,6 +254,7 @@ export const FRAME_SEED: FrameSeed[] = [
     size: "small",
     recommended_face_shapes: ["round", "diamond"],
     progressives_supported: false,
+    mount_type: "full_rim",
     images: {
       front: "frames/KLR-CT-004-CLEAR-S/front.webp",
       three_quarter: "frames/KLR-CT-004-CLEAR-S/three-quarter.webp",
@@ -268,6 +293,7 @@ export const FRAME_SEED: FrameSeed[] = [
     size: "medium",
     recommended_face_shapes: ["square", "oval", "heart"],
     progressives_supported: true,
+    mount_type: "full_rim",
     images: {
       front: "frames/KLR-AV-005-GOLD-M/front.webp",
       three_quarter: "frames/KLR-AV-005-GOLD-M/three-quarter.webp",
@@ -306,6 +332,7 @@ export const FRAME_SEED: FrameSeed[] = [
     size: "medium",
     recommended_face_shapes: ["oval", "round"],
     progressives_supported: true,
+    mount_type: "full_rim",
     images: {
       front: "frames/KLR-GE-006-MATTEBLACK-M/front.webp",
       three_quarter: "frames/KLR-GE-006-MATTEBLACK-M/three-quarter.webp",
@@ -344,6 +371,7 @@ export const FRAME_SEED: FrameSeed[] = [
     size: "small",
     recommended_face_shapes: ["round", "heart", "oval"],
     progressives_supported: true,
+    mount_type: "full_rim",
     images: {
       front: "frames/KLR-RC-007-CRYSTAL-S/front.webp",
       three_quarter: "frames/KLR-RC-007-CRYSTAL-S/three-quarter.webp",
