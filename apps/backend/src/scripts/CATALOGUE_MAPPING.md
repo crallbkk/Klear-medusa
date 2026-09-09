@@ -56,12 +56,21 @@ storefront's rimless/drilled → 1.67-only lens gate (Klear
 1.56 base lens resin is too brittle for drill mounts / unsupported
 edges, so rimless + drilled frames must fulfil in 1.67 MR-7.
 
-Enforced at two boundaries in the storefront:
+Enforced at four boundaries in the storefront (belt + braces — a bypass
+of any one fails-closed at the next):
 - Presentation: `src/components/flow/lens-select-view.tsx` disables the
   Basic (1.56) tile on rimless/drilled frames.
-- Money boundary: `assertFrameLensCompatibility` in
+- Prescription-page fallback: `src/app/[locale]/shop/[handle]/prescription/page.tsx`
+  rewrites `?lens=basic` to `ultra` for mount-restricted frames so a
+  shared/bookmarked URL can't populate an illegal cart.
+- Sync guard: `assertFrameLensCompatibility` in
   `src/lib/medusa/checkout.ts` refuses to sync the cart with an
-  incompatible pairing.
+  incompatible pairing (first money boundary).
+- Payment-boundary guard: `assertMedusaCartCompatibleForPayment` in
+  `src/lib/medusa/checkout.ts`, called from `submitPaymentAction`,
+  reads `klear_lens_config` back from Medusa metadata so a URL-crafted
+  `cart_id` or a cart mutated post-sync still fails-closed at the
+  point money moves.
 
 Missing / unrecognised value → `"full_rim"` (safe pass) both in the
 migration's `buildMetadata` and in the storefront's `readMountType`.
