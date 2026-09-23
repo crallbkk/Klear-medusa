@@ -186,10 +186,47 @@ describe("ShippopFulfillmentService — Medusa fulfillment adapter", () => {
     });
   });
 
+  async function shippopTo(shipping_address: Record<string, unknown>): Promise<ThaiAddress> {
+    const stub = new StubProvider();
+    const svc = makeService(stub);
+    await svc.calculatePrice(
+      { courier_code: "FLE", id: "FLE" } as Record<string, unknown>,
+      {} as Record<string, unknown>,
+      { shipping_address } as unknown as Parameters<typeof svc.calculatePrice>[2]
+    );
+    return (stub.calls[0].args[0] as { to: ThaiAddress }).to;
+  }
+
+  const THAI_META = { subdistrict: "สีลม", district: "บางรัก", province_th: "กรุงเทพมหานคร" };
+
+  it("ignores metadata that carries no postal_code (can't prove it matches this address)", async () => {
+    const to = await shippopTo({
+      address_1: "1", city: "Bang Rak, Si Lom", province: "Bangkok", postal_code: "10500",
+      metadata: THAI_META,
+    });
+    expect(to).toMatchObject({ district: "Si Lom", state: "Bang Rak", province: "Bangkok" });
+  });
+
+  it("matches the postcode guard through stray whitespace on either side", async () => {
+    const to = await shippopTo({
+      address_1: "1", city: "x", province: "x", postal_code: " 10500 ",
+      metadata: { ...THAI_META, postal_code: "10500 " },
+    });
+    expect(to).toMatchObject({ district: "สีลม", state: "บางรัก", province: "กรุงเทพมหานคร", postcode: "10500" });
+  });
+
+  it("fallback splits the storefront's 'amphoe, tambon' city instead of sending it whole as state", async () => {
+    const to = await shippopTo({
+      address_1: "1", city: "บางรัก, มหาพฤฒาราม", province: "กรุงเทพมหานคร", postal_code: "10500",
+    });
+    expect(to).toMatchObject({ district: "มหาพฤฒาราม", state: "บางรัก", province: "กรุงเทพมหานคร" });
+  });
+
   it.each([
     ["+66812345678", "0812345678"],
     ["+6621234567", "021234567"],
     ["+66 81 234 5678", "0812345678"],
+    ["+66 0812345678", "0812345678"],
     ["0812345678", "0812345678"],
     ["+14155550123", "+14155550123"],
   ])("sends Shippop tel %s as %s", async (phone, tel) => {

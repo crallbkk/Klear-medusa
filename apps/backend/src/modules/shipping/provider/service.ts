@@ -289,20 +289,35 @@ function extractAddress(addr: unknown): ThaiAddress | null {
   // the parcel routes; only the label text is stale); and the fallback uses
   // the locale-formatted display fields, which are English on an English-
   // locale order (pre-existing behaviour). Clear the metadata when editing an
-  // address in Admin.
+  // address in Admin. Deploy this backend BEFORE the storefront change: the
+  // previous extractAddress read metadata.subdistrict/district with no
+  // postcode guard.
   const meta = (a.metadata ?? {}) as Record<string, unknown>;
   const postcode = str(a.postal_code) ?? str(a.postcode);
   if (!postcode) return null;
   const thai = str(meta.postal_code) === postcode ? meta : {};
+  // Fallback when the metadata is absent/ignored: the storefront writes
+  // `city` as "amphoe, tambon", so split it rather than sending the whole
+  // string as Shippop's `state`. A free-text city (no comma) is the amphoe.
+  const [cityAmphoe, cityTambon] = splitCity(str(a.city));
   return {
     name: `${a.first_name ?? ""} ${a.last_name ?? ""}`.trim() || "ลูกค้า Klear",
     phone: toDomesticThaiPhone(str(a.phone) ?? ""),
     address: [a.address_1, a.address_2].filter(Boolean).join(" "),
-    district: str(thai.subdistrict) ?? "",
-    state: str(thai.district) ?? str(a.city) ?? "",
-    province: str(thai.province_th) ?? str(a.province) ?? str(a.city) ?? "",
+    district: str(thai.subdistrict) ?? cityTambon ?? "",
+    state: str(thai.district) ?? cityAmphoe ?? "",
+    province: str(thai.province_th) ?? str(a.province) ?? cityAmphoe ?? "",
     postcode,
   };
+}
+
+/** "amphoe, tambon" (the storefront's format) → [amphoe, tambon]; a city
+ *  without a comma → [city, undefined]. */
+function splitCity(city: string | undefined): [string | undefined, string | undefined] {
+  if (!city) return [undefined, undefined];
+  const i = city.indexOf(",");
+  if (i === -1) return [city, undefined];
+  return [str(city.slice(0, i)), str(city.slice(i + 1))];
 }
 
 /** Non-empty trimmed string, else undefined (so `??` falls through on "" too). */
@@ -312,13 +327,14 @@ function str(v: unknown): string | undefined {
 
 /**
  * The storefront stores E.164 (`+66812345678`); Shippop's documented `tel`
- * format is domestic (`0812345678` — SHIPPOP_API.md). Tolerates spaces /
- * hyphens (an Admin-typed "+66 81 234 5678"). Other values pass through
- * unchanged.
+ * format is domestic (`0812345678` — SHIPPOP_API.md, which also shows E.164
+ * accepted; domestic is the documented example). Tolerates spaces / hyphens
+ * and a kept trunk 0 (Admin-typed "+66 81 234 5678", "+66 0812345678").
+ * Other values pass through unchanged.
  */
 function toDomesticThaiPhone(phone: string): string {
-  const compact = phone.replace(/[\s-]/g, "");
-  return /^\+66\d{8,9}$/.test(compact) ? `0${compact.slice(3)}` : phone;
+  const m = /^\+660?(\d{8,9})$/.exec(phone.replace(/[\s-]/g, ""));
+  return m ? `0${m[1]}` : phone;
 }
 
 function estimateDeclaredValueThb(context: CalculateShippingOptionPriceDTO["context"]): number {
