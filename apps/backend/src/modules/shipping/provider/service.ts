@@ -24,6 +24,7 @@ import type {
   ThaiCarrier,
 } from "../types";
 import { shippopTrackingUrl } from "../types";
+import { str, thaiAddressLevels } from "../../../lib/thai-address";
 
 // Medusa-native fulfillment-provider adapter wrapping ShippopProvider.
 //
@@ -293,38 +294,22 @@ function extractAddress(addr: unknown): ThaiAddress | null {
   // address in Admin. Deploy this backend BEFORE the storefront change: the
   // previous extractAddress read metadata.subdistrict/district with no
   // postcode guard.
-  const meta = (a.metadata ?? {}) as Record<string, unknown>;
   const postcode = str(a.postal_code) ?? str(a.postcode);
   if (!postcode) return null;
-  const thai = str(meta.postal_code) === postcode ? meta : {};
-  // Fallback when the metadata is absent/ignored: the storefront writes
-  // `city` as "amphoe, tambon", so split it rather than sending the whole
-  // string as Shippop's `state`. A free-text city (no comma) is the amphoe.
-  const [cityAmphoe, cityTambon] = splitCity(str(a.city));
+  // Guarded metadata read + "amphoe, tambon" city fallback: shared with the
+  // lab packet (src/lib/thai-address.ts) so the two can't drift.
+  const levels = thaiAddressLevels(a);
   return {
     name: `${a.first_name ?? ""} ${a.last_name ?? ""}`.trim() || "ลูกค้า Klear",
     phone: toDomesticThaiPhone(str(a.phone) ?? ""),
     address: [a.address_1, a.address_2].filter(Boolean).join(" "),
-    district: str(thai.subdistrict) ?? cityTambon ?? "",
-    state: str(thai.district) ?? cityAmphoe ?? "",
-    province: str(thai.province_th) ?? str(a.province) ?? cityAmphoe ?? "",
+    district: levels.subdistrict ?? "",
+    state: levels.district ?? "",
+    province: levels.province ?? "",
     postcode,
   };
 }
 
-/** "amphoe, tambon" (the storefront's format) → [amphoe, tambon]; a city
- *  without a comma → [city, undefined]. */
-function splitCity(city: string | undefined): [string | undefined, string | undefined] {
-  if (!city) return [undefined, undefined];
-  const i = city.indexOf(",");
-  if (i === -1) return [city, undefined];
-  return [str(city.slice(0, i)), str(city.slice(i + 1))];
-}
-
-/** Non-empty trimmed string, else undefined (so `??` falls through on "" too). */
-function str(v: unknown): string | undefined {
-  return typeof v === "string" && v.trim() !== "" ? v.trim() : undefined;
-}
 
 /**
  * The storefront stores E.164 (`+66812345678`); Shippop's documented `tel`

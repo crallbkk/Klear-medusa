@@ -220,6 +220,62 @@ describe("buildLabJobPacket — happy path", () => {
   });
 });
 
+describe("buildLabJobPacket — delivery address is Thai for the lab", () => {
+  const THAI_META = {
+    subdistrict: "คลองเตยเหนือ",
+    district: "วัฒนา",
+    province_th: "กรุงเทพมหานคร",
+    postal_code: "10110",
+  };
+  async function addressFor(shipping: unknown) {
+    const { container } = makeContainer({ order: order({ shipping }), decryptedRx: RX });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = await buildLabJobPacket({ container: container as any, orderId: "order_abc" });
+    if (result.outcome !== "ok") throw new Error(`expected ok, got ${result.outcome}`);
+    return result.packet.customer.delivery_address;
+  }
+
+  it("English-locale order: city/province from the Thai metadata, not the English display fields", async () => {
+    const addr = await addressFor({
+      ...SHIPPING,
+      city: "Watthana, Khlong Toei Nuea",
+      province: "Bangkok",
+      metadata: THAI_META,
+    });
+    expect(addr.city).toBe("วัฒนา, คลองเตยเหนือ");
+    expect(addr.province).toBe("กรุงเทพมหานคร");
+    expect(addr.postal_code).toBe("10110");
+  });
+
+  it("metadata for another postcode (Admin-corrected address) is ignored: display fields pass through", async () => {
+    const addr = await addressFor({
+      ...SHIPPING,
+      city: "บางรัก, สีลม",
+      postal_code: "10500",
+      metadata: THAI_META,
+    });
+    expect(addr.city).toBe("บางรัก, สีลม");
+    expect(addr.province).toBe("กรุงเทพมหานคร");
+  });
+
+  it("incomplete metadata never mixes Thai with the English display fields", async () => {
+    const addr = await addressFor({
+      ...SHIPPING,
+      city: "Watthana, Khlong Toei Nuea",
+      province: "Bangkok",
+      metadata: { district: "วัฒนา", province_th: "กรุงเทพมหานคร", postal_code: "10110" },
+    });
+    expect(addr.city).toBe("Watthana, Khlong Toei Nuea");
+    expect(addr.province).toBe("Bangkok");
+  });
+
+  it("older order without metadata: unchanged", async () => {
+    const addr = await addressFor(SHIPPING);
+    expect(addr.city).toBe("วัฒนา");
+    expect(addr.province).toBe("กรุงเทพมหานคร");
+  });
+});
+
 describe("buildLabJobPacket — skip", () => {
   it("skips a frame-only order (no lens config, no prescription)", async () => {
     const line = frameLine({
