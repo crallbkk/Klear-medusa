@@ -15,6 +15,7 @@ import {
   type LensType,
 } from "./types";
 import { captureException } from "../../lib/observability/sentry";
+import { thaiAddressLevels } from "../../lib/thai-address";
 
 /**
  * Orchestrator: given a Medusa order id, compose a lab-job build result.
@@ -98,6 +99,18 @@ function buildCustomer(
   if (!phone) {
     return { customer: undefined as never, error: "shipping address has no phone" };
   }
+  // The lab is a Thai party: give it the Thai area the storefront recorded
+  // (same guarded read as the Shippop mapping), not the display fields, which
+  // are English on an English-locale order. `city` keeps the storefront's
+  // "amphoe, tambon" shape. Without trusted metadata (older / Admin-edited
+  // orders) the display fields pass through unchanged.
+  const levels = thaiAddressLevels(shipping);
+  const city = levels.fromThaiMetadata
+    ? [levels.district, levels.subdistrict].filter(Boolean).join(", ")
+    : ((shipping.city as string | undefined) ?? "");
+  const province = levels.fromThaiMetadata
+    ? (levels.province ?? "")
+    : ((shipping.province as string | undefined) ?? "");
   return {
     customer: {
       name,
@@ -105,8 +118,8 @@ function buildCustomer(
       delivery_address: {
         line1: (shipping.address_1 as string | undefined) ?? "",
         line2: (shipping.address_2 as string | undefined) ?? undefined,
-        city: (shipping.city as string | undefined) ?? "",
-        province: (shipping.province as string | undefined) ?? "",
+        city,
+        province,
         postal_code: (shipping.postal_code as string | undefined) ?? "",
         country_code: "TH",
       },
