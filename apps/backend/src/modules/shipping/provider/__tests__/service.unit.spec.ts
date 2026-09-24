@@ -148,6 +148,188 @@ describe("ShippopFulfillmentService — Medusa fulfillment adapter", () => {
     expect(input.to.postcode).toBe("10500");
   });
 
+  it("calculatePrice maps storefront Thai metadata onto Shippop district/state/province", async () => {
+    const stub = new StubProvider();
+    const svc = makeService(stub);
+    await svc.calculatePrice(
+      { courier_code: "FLE", id: "FLE" } as Record<string, unknown>,
+      {} as Record<string, unknown>,
+      {
+        shipping_address: {
+          address_1: "99/1 Silom",
+          // English-locale checkout: display fields are English…
+          city: "Bang Rak, Si Lom",
+          province: "Bangkok",
+          postal_code: "10500",
+          phone: "+66801112222",
+          first_name: "Customer",
+          last_name: "One",
+          // …but the carrier metadata is always Thai.
+          metadata: {
+            subdistrict: "สีลม",
+            district: "บางรัก",
+            province_th: "กรุงเทพมหานคร",
+            postal_code: "10500",
+          },
+        },
+        subtotal: 3000,
+      } as unknown as Parameters<typeof svc.calculatePrice>[2]
+    );
+    const input = stub.calls[0].args[0] as { to: ThaiAddress };
+    expect(input.to).toMatchObject({
+      district: "สีลม",
+      state: "บางรัก",
+      province: "กรุงเทพมหานคร",
+      postcode: "10500",
+      // E.164 from the storefront → Shippop's documented domestic format.
+      phone: "0801112222",
+    });
+  });
+
+  async function shippopTo(shipping_address: Record<string, unknown>): Promise<ThaiAddress> {
+    const stub = new StubProvider();
+    const svc = makeService(stub);
+    await svc.calculatePrice(
+      { courier_code: "FLE", id: "FLE" } as Record<string, unknown>,
+      {} as Record<string, unknown>,
+      { shipping_address } as unknown as Parameters<typeof svc.calculatePrice>[2]
+    );
+    return (stub.calls[0].args[0] as { to: ThaiAddress }).to;
+  }
+
+  const THAI_META = { subdistrict: "สีลม", district: "บางรัก", province_th: "กรุงเทพมหานคร" };
+
+  it("ignores metadata that carries no postal_code (can't prove it matches this address)", async () => {
+    const to = await shippopTo({
+      address_1: "1", city: "Bang Rak, Si Lom", province: "Bangkok", postal_code: "10500",
+      metadata: THAI_META,
+    });
+    expect(to).toMatchObject({ district: "Si Lom", state: "Bang Rak", province: "Bangkok" });
+  });
+
+  it("matches the postcode guard through stray whitespace on either side", async () => {
+    const to = await shippopTo({
+      address_1: "1", city: "x", province: "x", postal_code: " 10500 ",
+      metadata: { ...THAI_META, postal_code: "10500 " },
+    });
+    expect(to).toMatchObject({ district: "สีลม", state: "บางรัก", province: "กรุงเทพมหานคร", postcode: "10500" });
+  });
+
+  it("fallback splits the storefront's 'amphoe, tambon' city instead of sending it whole as state", async () => {
+    const to = await shippopTo({
+      address_1: "1", city: "บางรัก, มหาพฤฒาราม", province: "กรุงเทพมหานคร", postal_code: "10500",
+    });
+    expect(to).toMatchObject({ district: "มหาพฤฒาราม", state: "บางรัก", province: "กรุงเทพมหานคร" });
+  });
+
+  it.each([
+    ["+66812345678", "0812345678"],
+    ["+6621234567", "021234567"],
+    ["+66 81 234 5678", "0812345678"],
+    ["+66 0812345678", "0812345678"],
+    ["0812345678", "0812345678"],
+    ["+14155550123", "+14155550123"],
+  ])("sends Shippop tel %s as %s", async (phone, tel) => {
+    const stub = new StubProvider();
+    const svc = makeService(stub);
+    await svc.calculatePrice(
+      { courier_code: "FLE", id: "FLE" } as Record<string, unknown>,
+      {} as Record<string, unknown>,
+      {
+        shipping_address: { address_1: "1", city: "Bang Rak", province: "Bangkok", postal_code: "10500", phone },
+      } as unknown as Parameters<typeof svc.calculatePrice>[2]
+    );
+    expect((stub.calls[0].args[0] as { to: ThaiAddress }).to.phone).toBe(tel);
+  });
+
+  it("ignores stale metadata after an admin corrects the postcode (Medusa Admin leaves metadata untouched)", async () => {
+    const stub = new StubProvider();
+    const svc = makeService(stub);
+    await svc.calculatePrice(
+      { courier_code: "FLE", id: "FLE" } as Record<string, unknown>,
+      {} as Record<string, unknown>,
+      {
+        shipping_address: {
+          address_1: "12 Nimman Soi 9",
+          city: "เมืองเชียงใหม่",
+          province: "เชียงใหม่",
+          postal_code: "50200",
+          phone: "+66801112222",
+          // Left over from the original Bangkok address:
+          metadata: {
+            subdistrict: "สีลม",
+            district: "บางรัก",
+            province_th: "กรุงเทพมหานคร",
+            postal_code: "10500",
+          },
+        },
+      } as unknown as Parameters<typeof svc.calculatePrice>[2]
+    );
+    const input = stub.calls[0].args[0] as { to: ThaiAddress };
+    expect(input.to).toMatchObject({
+      district: "",
+      state: "เมืองเชียงใหม่",
+      province: "เชียงใหม่",
+      postcode: "50200",
+    });
+  });
+
+  it("createFulfillment books the shipment from fulfillment.delivery_address metadata", async () => {
+    const stub = new StubProvider();
+    const svc = makeService(stub);
+    await svc.createFulfillment(
+      { courier_code: "FLE" } as Record<string, unknown>,
+      [{ id: "li_1" } as Parameters<typeof svc.createFulfillment>[1][number]],
+      { id: "order_02", metadata: {} } as unknown as Parameters<typeof svc.createFulfillment>[2],
+      {
+        id: "ful_2",
+        delivery_address: {
+          address_1: "99/1 Silom",
+          city: "Bang Rak, Si Lom",
+          province: "Bangkok",
+          postal_code: "10500",
+          phone: "+66812345678",
+          first_name: "Customer",
+          last_name: "Two",
+          metadata: {
+            subdistrict: "สีลม",
+            district: "บางรัก",
+            province_th: "กรุงเทพมหานคร",
+            postal_code: "10500",
+          },
+        },
+      } as unknown as Parameters<typeof svc.createFulfillment>[3]
+    );
+    const createCall = stub.calls.find((c) => c.method === "createShipment");
+    const input = createCall!.args[0] as { to: ThaiAddress };
+    expect(input.to).toMatchObject({
+      district: "สีลม",
+      state: "บางรัก",
+      province: "กรุงเทพมหานคร",
+      postcode: "10500",
+      phone: "0812345678",
+    });
+  });
+
+  it("calculatePrice falls back to city/province for addresses without metadata", async () => {
+    const stub = new StubProvider();
+    const svc = makeService(stub);
+    await svc.calculatePrice(
+      { courier_code: "FLE", id: "FLE" } as Record<string, unknown>,
+      {} as Record<string, unknown>,
+      {
+        shipping_address: {
+          address_1: "99/1 Silom",
+          city: "Bang Rak",
+          province: "Bangkok",
+          postal_code: "10500",
+        },
+      } as unknown as Parameters<typeof svc.calculatePrice>[2]
+    );
+    const input = stub.calls[0].args[0] as { to: ThaiAddress };
+    expect(input.to).toMatchObject({ district: "", state: "Bang Rak", province: "Bangkok" });
+  });
+
   it("calculatePrice throws when the cart has no Thai address", async () => {
     const svc = makeService();
     await expect(
