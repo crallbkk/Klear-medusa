@@ -24,9 +24,6 @@ export interface ThaiAddressLevels {
   subdistrict?: string;
   district?: string;
   province?: string;
-  /** The levels came from the storefront's Thai metadata (not the display
-   *  fields, which may be English). */
-  fromThaiMetadata: boolean;
   /** All three levels, straight from trusted Thai metadata — or null if the
    *  metadata is untrusted or incomplete. For callers that must not mix Thai
    *  levels with (possibly English) display-field fallbacks. */
@@ -34,7 +31,7 @@ export interface ThaiAddressLevels {
 }
 
 export function thaiAddressLevels(addr: unknown): ThaiAddressLevels {
-  if (!addr || typeof addr !== "object") return { fromThaiMetadata: false, thai: null };
+  if (!addr || typeof addr !== "object") return { thai: null };
   const a = addr as Record<string, unknown>;
   const meta = (a.metadata && typeof a.metadata === "object" ? a.metadata : {}) as Record<
     string,
@@ -43,17 +40,13 @@ export function thaiAddressLevels(addr: unknown): ThaiAddressLevels {
   const postcode = str(a.postal_code) ?? str(a.postcode);
   const trusted = postcode !== undefined && str(meta.postal_code) === postcode;
   const [cityAmphoe, cityTambon] = splitCity(str(a.city));
-  const subdistrict = (trusted ? str(meta.subdistrict) : undefined) ?? cityTambon;
-  const district = (trusted ? str(meta.district) : undefined) ?? cityAmphoe;
-  const province = (trusted ? str(meta.province_th) : undefined) ?? str(a.province) ?? cityAmphoe;
   const mSub = trusted ? str(meta.subdistrict) : undefined;
   const mDist = trusted ? str(meta.district) : undefined;
   const mProv = trusted ? str(meta.province_th) : undefined;
   return {
-    subdistrict,
-    district,
-    province,
-    fromThaiMetadata: !!(mSub || mDist || mProv),
+    subdistrict: mSub ?? cityTambon,
+    district: mDist ?? cityAmphoe,
+    province: mProv ?? str(a.province) ?? cityAmphoe,
     thai: mSub && mDist && mProv ? { subdistrict: mSub, district: mDist, province: mProv } : null,
   };
 }
