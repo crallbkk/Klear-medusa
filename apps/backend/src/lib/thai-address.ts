@@ -27,10 +27,14 @@ export interface ThaiAddressLevels {
   /** The levels came from the storefront's Thai metadata (not the display
    *  fields, which may be English). */
   fromThaiMetadata: boolean;
+  /** All three levels, straight from trusted Thai metadata — or null if the
+   *  metadata is untrusted or incomplete. For callers that must not mix Thai
+   *  levels with (possibly English) display-field fallbacks. */
+  thai: { subdistrict: string; district: string; province: string } | null;
 }
 
 export function thaiAddressLevels(addr: unknown): ThaiAddressLevels {
-  if (!addr || typeof addr !== "object") return { fromThaiMetadata: false };
+  if (!addr || typeof addr !== "object") return { fromThaiMetadata: false, thai: null };
   const a = addr as Record<string, unknown>;
   const meta = (a.metadata && typeof a.metadata === "object" ? a.metadata : {}) as Record<
     string,
@@ -42,17 +46,21 @@ export function thaiAddressLevels(addr: unknown): ThaiAddressLevels {
   const subdistrict = (trusted ? str(meta.subdistrict) : undefined) ?? cityTambon;
   const district = (trusted ? str(meta.district) : undefined) ?? cityAmphoe;
   const province = (trusted ? str(meta.province_th) : undefined) ?? str(a.province) ?? cityAmphoe;
+  const mSub = trusted ? str(meta.subdistrict) : undefined;
+  const mDist = trusted ? str(meta.district) : undefined;
+  const mProv = trusted ? str(meta.province_th) : undefined;
   return {
     subdistrict,
     district,
     province,
-    fromThaiMetadata: trusted && !!(str(meta.subdistrict) || str(meta.district) || str(meta.province_th)),
+    fromThaiMetadata: !!(mSub || mDist || mProv),
+    thai: mSub && mDist && mProv ? { subdistrict: mSub, district: mDist, province: mProv } : null,
   };
 }
 
 /** "amphoe, tambon" (the storefront's format) → [amphoe, tambon]; a city
  *  without a comma → [city, undefined]. */
-export function splitCity(city: string | undefined): [string | undefined, string | undefined] {
+function splitCity(city: string | undefined): [string | undefined, string | undefined] {
   if (!city) return [undefined, undefined];
   const i = city.indexOf(",");
   if (i === -1) return [city, undefined];

@@ -258,6 +258,17 @@ describe("buildLabJobPacket — delivery address is Thai for the lab", () => {
     expect(addr.province).toBe("กรุงเทพมหานคร");
   });
 
+  it("incomplete metadata never mixes Thai with the English display fields", async () => {
+    const addr = await addressFor({
+      ...SHIPPING,
+      city: "Watthana, Khlong Toei Nuea",
+      province: "Bangkok",
+      metadata: { district: "วัฒนา", province_th: "กรุงเทพมหานคร", postal_code: "10110" },
+    });
+    expect(addr.city).toBe("Watthana, Khlong Toei Nuea");
+    expect(addr.province).toBe("Bangkok");
+  });
+
   it("older order without metadata: unchanged", async () => {
     const addr = await addressFor(SHIPPING);
     expect(addr.city).toBe("วัฒนา");

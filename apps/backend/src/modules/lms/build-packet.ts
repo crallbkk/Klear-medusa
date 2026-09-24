@@ -102,15 +102,18 @@ function buildCustomer(
   // The lab is a Thai party: give it the Thai area the storefront recorded
   // (same guarded read as the Shippop mapping), not the display fields, which
   // are English on an English-locale order. `city` keeps the storefront's
-  // "amphoe, tambon" shape. Without trusted metadata (older / Admin-edited
-  // orders) the display fields pass through unchanged.
-  const levels = thaiAddressLevels(shipping);
-  const city = levels.fromThaiMetadata
-    ? [levels.district, levels.subdistrict].filter(Boolean).join(", ")
+  // "amphoe, tambon" shape. Only COMPLETE trusted metadata is used (never a
+  // Thai level mixed with an English display fallback); otherwise — older
+  // orders, Admin-edited postcodes, hand-edited metadata — the display fields
+  // pass through as before. Known limit, shared with the Shippop mapping: an
+  // Admin edit that changes the subdistrict but keeps the postcode leaves the
+  // old metadata trusted (clear it when editing an address in Admin); packets
+  // are built at order time, so only a later rebuild could pick that up.
+  const { thai } = thaiAddressLevels(shipping);
+  const city = thai
+    ? `${thai.district}, ${thai.subdistrict}`
     : ((shipping.city as string | undefined) ?? "");
-  const province = levels.fromThaiMetadata
-    ? (levels.province ?? "")
-    : ((shipping.province as string | undefined) ?? "");
+  const province = thai ? thai.province : ((shipping.province as string | undefined) ?? "");
   return {
     customer: {
       name,

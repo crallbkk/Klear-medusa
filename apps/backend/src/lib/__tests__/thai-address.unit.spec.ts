@@ -21,7 +21,19 @@ describe("thaiAddressLevels", () => {
       district: "วัฒนา",
       province: "กรุงเทพมหานคร",
       fromThaiMetadata: true,
+      thai: { subdistrict: "คลองเตยเหนือ", district: "วัฒนา", province: "กรุงเทพมหานคร" },
     });
+  });
+
+  it("incomplete trusted metadata: per-level fallback, but no complete `thai`", () => {
+    const r = thaiAddressLevels({
+      city: "Watthana, Khlong Toei Nuea",
+      province: "Bangkok",
+      postal_code: "10110",
+      metadata: { district: "วัฒนา", province_th: "กรุงเทพมหานคร", postal_code: "10110" },
+    });
+    expect(r).toMatchObject({ subdistrict: "Khlong Toei Nuea", district: "วัฒนา", fromThaiMetadata: true });
+    expect(r.thai).toBeNull();
   });
 
   it("metadata for a different postcode (Admin-corrected address) is ignored", () => {
@@ -37,6 +49,7 @@ describe("thaiAddressLevels", () => {
       district: "บางรัก",
       province: "กรุงเทพมหานคร",
       fromThaiMetadata: false,
+      thai: null,
     });
   });
 
@@ -59,11 +72,11 @@ describe("thaiAddressLevels", () => {
         postal_code: "10110",
         metadata: { postal_code: "10110", subdistrict: " ", district: "", province_th: "" },
       }),
-    ).toEqual({ subdistrict: undefined, district: "Watthana", province: "Bangkok", fromThaiMetadata: false });
+    ).toEqual({ subdistrict: undefined, district: "Watthana", province: "Bangkok", fromThaiMetadata: false, thai: null });
   });
 
   it("no address / no postcode → nothing trusted", () => {
-    expect(thaiAddressLevels(null)).toEqual({ fromThaiMetadata: false });
+    expect(thaiAddressLevels(null)).toEqual({ fromThaiMetadata: false, thai: null });
     expect(thaiAddressLevels({ city: "x", metadata: META })).toMatchObject({ fromThaiMetadata: false, district: "x" });
   });
 });
