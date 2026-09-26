@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
   type IShippingProvider,
   type RateQuoteInput,
@@ -223,7 +224,7 @@ export class ShippopProvider implements IShippingProvider {
     // path secret embedded in the callback URL we registered with them.
     // Caller (Medusa API route) is responsible for extracting the path
     // segment and passing it here.
-    if (!input.path_secret || input.path_secret !== this.config.webhook_path_secret) {
+    if (!pathSecretMatches(input.path_secret, this.config.webhook_path_secret)) {
       throw new ShippingError("webhook_unauthorized", "Webhook path secret missing or invalid.");
     }
 
@@ -427,4 +428,18 @@ interface ShippopTrackingState {
   datetime: string;
   location: string;
   description: string;
+}
+
+/**
+ * Constant-time path-secret check, matching the other webhook verifiers in
+ * both repos (LINE, carrier-status, Opn). Both sides are hashed to a fixed
+ * 32-byte digest first so `timingSafeEqual` never throws on a length mismatch
+ * and the comparison time doesn't leak the secret's length. An unset
+ * configured secret never matches.
+ */
+function pathSecretMatches(provided: string | undefined, expected: string): boolean {
+  if (!provided || !expected) return false;
+  const a = createHash("sha256").update(provided).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
 }

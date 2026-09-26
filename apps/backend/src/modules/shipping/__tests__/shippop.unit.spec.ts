@@ -307,6 +307,30 @@ describe("ShippopProvider", () => {
     ).rejects.toBeInstanceOf(ShippingError);
   });
 
+  it("verifyAndParseWebhook: rejects a wrong path secret of the same or a different length", async () => {
+    const provider = new ShippopProvider(CONFIG, (() => {}) as never);
+    for (const path_secret of ["wh_secret_abd", "wh_secret_abc_extra", "x"]) {
+      await expect(
+        provider.verifyAndParseWebhook({
+          raw_body: "tracking_code=SP1&order_status=POD",
+          headers: {},
+          path_secret,
+        })
+      ).rejects.toBeInstanceOf(ShippingError);
+    }
+  });
+
+  it("verifyAndParseWebhook: rejects every request when no secret is configured", async () => {
+    const provider = new ShippopProvider({ ...CONFIG, webhook_path_secret: "" }, (() => {}) as never);
+    await expect(
+      provider.verifyAndParseWebhook({
+        raw_body: "tracking_code=SP1&order_status=POD",
+        headers: {},
+        path_secret: "",
+      })
+    ).rejects.toBeInstanceOf(ShippingError);
+  });
+
   it("verifyAndParseWebhook: parses urlencoded body when path secret matches", async () => {
     const provider = new ShippopProvider(CONFIG, (() => {}) as never);
     const result = await provider.verifyAndParseWebhook({
