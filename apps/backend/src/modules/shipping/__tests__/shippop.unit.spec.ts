@@ -321,12 +321,14 @@ describe("ShippopProvider", () => {
   });
 
   it("verifyAndParseWebhook: rejects every request when no secret is configured", async () => {
+    // A NON-empty provided secret, so this reaches the configured-secret guard
+    // rather than stopping at the missing-path-secret check.
     const provider = new ShippopProvider({ ...CONFIG, webhook_path_secret: "" }, (() => {}) as never);
     await expect(
       provider.verifyAndParseWebhook({
         raw_body: "tracking_code=SP1&order_status=POD",
         headers: {},
-        path_secret: "",
+        path_secret: "anything",
       })
     ).rejects.toBeInstanceOf(ShippingError);
   });
