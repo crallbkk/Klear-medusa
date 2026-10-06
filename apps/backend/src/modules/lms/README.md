@@ -138,3 +138,33 @@ the rebuild yields a full packet — submitted.
 `packet_snapshot` holds plaintext Rx because the lab needs it. Never log it,
 never put it in audit payloads, never expose it from the Store API. Decrypt
 is fenced inside the `prescription` module's `decryptForLabHandoff()`.
+
+## How long the readable prescription is kept
+
+`lab_job.packet_snapshot` holds the prescription in plain form because the
+lab needs it. The canonical record (Supabase `prescriptions`) is encrypted
+and deleted after two years, so the snapshot must not outlive it.
+
+The scheduled job `src/jobs/redact-lab-job-rx.ts` runs once a day and sets
+`packet_snapshot.prescription` to `null` (stamping `rx_redacted_at`) when the
+job no longer needs it. The rules are one pure function,
+`rx-retention.ts`:
+
+| When | Why |
+| --- | --- |
+| the job is `cancelled` | the order will not be made |
+| the order was delivered 60 days ago (`RX_REDACT_AFTER_DELIVERY_DAYS`) | past the 30-day fit guarantee, with margin |
+| the job is two years old (`RX_REDACT_MAX_AGE_DAYS`) | backstop, whatever state it is in |
+
+Delivery is read from the order's Medusa fulfillments: every live fulfillment
+must have `delivered_at`, and the latest one starts the clock. A job in
+`submitting` is never touched.
+
+Only the prescription is blanked. The rest of the snapshot stays for the
+audit trail. A blanked job cannot be sent to the lab (`submitJob` refuses);
+the retry route rebuilds the packet from the encrypted record, which writes
+the prescription back and clears `rx_redacted_at`. Once the encrypted record
+itself has been deleted, that rebuild fails and the job cannot be remade.
+
+Migration `Migration20261006000100` adds the `rx_redacted_at` column. Rows
+that existed before it are picked up by the job's first run.

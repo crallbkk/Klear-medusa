@@ -52,9 +52,17 @@ export type LabJobRow = {
   attempts: number;
   last_error: string | null;
   submitted_at: Date | null;
+  /** When the readable prescription in `packet_snapshot` was blanked. */
+  rx_redacted_at: Date | null;
   created_at: Date;
   updated_at: Date;
 };
+
+/** The columns the retention sweep needs — deliberately NOT the snapshot. */
+export type LabJobRetentionRow = Pick<
+  LabJobRow,
+  "id" | "order_id" | "status" | "created_at" | "rx_redacted_at"
+>;
 
 /**
  * Lab Management System (LMS) service.
@@ -72,7 +80,9 @@ export type LabJobRow = {
  *
  * **PDPA boundary**: the `packet_snapshot` JSON column carries plaintext Rx
  * data because the lab needs it. Never log this column, never include it in
- * audit payloads, never expose it from the customer-facing Store API.
+ * audit payloads, never expose it from the customer-facing Store API. The
+ * plaintext Rx is blanked once the job no longer needs it (`redactJobRx`,
+ * driven by the `redact-lab-job-rx` scheduled job).
  */
 class LmsModuleService extends MedusaService({
   LabJob,
@@ -220,6 +230,10 @@ class LmsModuleService extends MedusaService({
         status: fields.status,
         packet_snapshot: fields.packet_snapshot,
         last_error: fields.last_error,
+        // A rebuilt snapshot is a fresh packet (it may carry the prescription
+        // again), so it is no longer "blanked"; the retention sweep will
+        // decide on it again.
+        rx_redacted_at: null,
         // A successful rebuild clears any stale provider error.
         ...(fields.status === "queued" ? { provider_job_id: null } : {}),
       },
@@ -299,6 +313,14 @@ class LmsModuleService extends MedusaService({
         `submitJob: job ${jobId} is failed — heal via retry (rebuild) before submitting`,
       );
     }
+    if (job.rx_redacted_at) {
+      // The snapshot no longer holds the prescription. Sending it would give
+      // the lab a job with no Rx; a rebuild restores it from the encrypted
+      // record.
+      throw new Error(
+        `submitJob: job ${jobId} had its prescription blanked (retention) — rebuild via retry before submitting`,
+      );
+    }
 
     // Claim: queued → submitting, guarded on the CURRENT status in the
     // selector. If another worker claimed between our read and this write,
@@ -370,6 +392,64 @@ class LmsModuleService extends MedusaService({
       })) as unknown as LabJobRow[];
       return { outcome: "failed", job: updated[0]! };
     }
+  }
+
+  /**
+   * Every job whose snapshot may still hold a readable prescription
+   * (`rx_redacted_at` is null), oldest first. Returns ids, status and dates
+   * only: the retention sweep decides without ever loading a prescription.
+   */
+  async listJobsHoldingRx(): Promise<LabJobRetentionRow[]> {
+    const PAGE = 500;
+    const out: LabJobRetentionRow[] = [];
+    for (let skip = 0; ; skip += PAGE) {
+      const page = (await this.listLabJobs(
+        { rx_redacted_at: null },
+        {
+          select: ["id", "order_id", "status", "created_at", "rx_redacted_at"],
+          take: PAGE,
+          skip,
+          // id breaks created_at ties so paging never skips or repeats a row.
+          order: { created_at: "ASC", id: "ASC" },
+        },
+      )) as unknown as LabJobRetentionRow[];
+      out.push(...page);
+      if (page.length < PAGE) break;
+    }
+    return out;
+  }
+
+  /**
+   * Blank the readable prescription in a job's snapshot and stamp
+   * `rx_redacted_at`. Everything else in the snapshot is kept.
+   *
+   * Returns false (and writes nothing) when there is nothing to do or the
+   * job moved underneath us: already blanked, mid-submission, or its status
+   * changed between the read and the guarded write. The caller decides WHEN
+   * (see `rx-retention.ts`); this only refuses the one state where blanking
+   * would corrupt a submission in flight.
+   *
+   * Not reversible in place. A job that needs its prescription again gets it
+   * from the encrypted record through the retry (rebuild) path.
+   */
+  async redactJobRx(jobId: string): Promise<boolean> {
+    const job = (await this.retrieveLabJob(jobId)) as unknown as LabJobRow;
+    if (!job) throw new Error(`redactJobRx: job ${jobId} not found`);
+    if (job.rx_redacted_at) return false;
+    if (job.status === "submitting") return false;
+
+    const snapshot = {
+      ...((job.packet_snapshot ?? {}) as unknown as Record<string, unknown>),
+      prescription: null,
+    };
+    // Guarded on the status we read and on still-not-blanked, like the submit
+    // claim: if the job was claimed for submission (or blanked by another
+    // run) in between, the selector matches nothing.
+    const updated = (await this.updateLabJobs({
+      selector: { id: jobId, status: job.status, rx_redacted_at: null },
+      data: { packet_snapshot: snapshot, rx_redacted_at: new Date() },
+    })) as unknown as LabJobRow[];
+    return updated.length > 0;
   }
 
   /** Mark a queued / failed / pending_rx / submitted job as cancelled.
