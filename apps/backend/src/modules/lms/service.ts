@@ -231,9 +231,11 @@ class LmsModuleService extends MedusaService({
         status: fields.status,
         packet_snapshot: fields.packet_snapshot,
         last_error: fields.last_error,
-        // A rebuilt snapshot is a fresh packet (it may carry the prescription
-        // again), so it is no longer "blanked"; the retention sweep will
-        // decide on it again.
+        // A rebuild may write the prescription back, so the row is no longer
+        // "blanked"; the retention sweep will decide on it again. (The write
+        // is MERGED into the stored snapshot, not a replacement: a rebuild
+        // whose result has no `prescription` key, i.e. failed or pending_rx,
+        // leaves whatever prescription the row already held.)
         rx_redacted_at: null,
         // A successful rebuild clears any stale provider error.
         ...(fields.status === "queued" ? { provider_job_id: null } : {}),

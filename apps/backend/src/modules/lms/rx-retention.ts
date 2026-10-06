@@ -4,9 +4,12 @@
  * The snapshot holds the prescription in plain form because the lab needs it
  * to cut the lenses. The canonical copy (Supabase `prescriptions`) is
  * encrypted and deleted after two years; this copy had no end of life at all.
- * It is only needed while the job can still be made or remade, so it is
- * blanked as soon as that is over. A later remake does not need it: the
- * retry path rebuilds the packet from the encrypted record.
+ * It is only needed while the job can still be made, so it is blanked once
+ * that is over. A job that needs it again gets it from the encrypted record
+ * through the retry (rebuild) path, which works for `queued`, `failed` and
+ * `pending_rx` jobs only. A `submitted` job cannot be rebuilt, so blanking
+ * one is final: after it, what was sent to the lab is on record only at the
+ * lab.
  *
  * Pure. No I/O. The `redact-lab-job-rx` scheduled job applies it.
  *
@@ -17,15 +20,18 @@
  * job's snapshot still has up to RX_REDACT_MAX_AGE_DAYS to run.
  */
 
-/** Days after delivery before the prescription is blanked. Covers the 30-day
- *  fit guarantee (a remake inside it reads the snapshot) with room to spare. */
+/** Days after delivery before the prescription is blanked. Longer than the
+ *  30-day fit guarantee, so the record of what was made is there while a
+ *  remake can still be asked for. */
 export const RX_REDACT_AFTER_DELIVERY_DAYS = 60;
 
 /** Backstop: blank the prescription this long after the job was created,
  *  whatever became of the order. Delivery is promised in 5 to 7 days, so a
  *  job this old with no delivery on record is finished, lost in tracking, or
- *  abandoned. If it turns out to be live, the retry path restores the
- *  prescription from the encrypted record. */
+ *  abandoned. The clock runs from CREATION, not delivery, and never resets:
+ *  a send-later order delivered late (say day 170) is blanked on day 180,
+ *  inside its fit-guarantee window, and a still-`queued` job past this age
+ *  is blanked again the night after every retry. */
 export const RX_REDACT_MAX_AGE_DAYS = 180;
 
 /** A job in `submitting` is being read for the lab right now and is left

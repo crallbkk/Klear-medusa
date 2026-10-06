@@ -46,8 +46,7 @@ const LabJob = model.define("lab_job", {
   // When the lab provider confirmed receipt (status moved to "submitted").
   submitted_at: model.dateTime().nullable(),
   // When the readable prescription in packet_snapshot was blanked. Null
-  // while the snapshot may still hold one. A rebuild (retry) writes a fresh
-  // packet and clears this.
+  // while the snapshot may still hold one. A rebuild (retry) clears this.
   rx_redacted_at: model.dateTime().nullable(),
 })
   // ── DO NOT REMOVE ──────────────────────────────────────────────────────

@@ -13,11 +13,18 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations";
  * run decides on them.
  *
  * Soft-deleted rows are blanked HERE, once. The job cannot reach them: every
- * MedusaService list and update skips rows with `deleted_at` set. The only
- * such rows are the duplicates Migration20260717000100 soft-deleted, each
- * still holding a full readable prescription that nothing will ever read
- * again (the surviving row for the order has the same one). Only the
- * `prescription` key is set to null; the rest of the snapshot stays.
+ * MedusaService list and update skips rows with `deleted_at` set. The UPDATE
+ * matches every soft-deleted row; today those are the duplicates
+ * Migration20260717000100 soft-deleted (nothing else soft-deletes a lab job),
+ * each still holding a full readable prescription that nothing will read
+ * again. Only the `prescription` key is set to null; the rest of the
+ * snapshot stays.
+ *
+ * This deliberately reverses that earlier migration's stance ("forensic data
+ * we never destroy in a migration") for the prescription alone: keeping a
+ * readable prescription indefinitely on rows no code can reach is the thing
+ * this change exists to stop. The prescription itself is not lost; the
+ * encrypted record in Supabase is untouched.
  *
  * Hand-written (not `medusa db:generate`): generation needs a live DB, and
  * this is one deterministic column.

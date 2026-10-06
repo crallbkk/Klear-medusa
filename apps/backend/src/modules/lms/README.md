@@ -163,10 +163,11 @@ that it is treated as orphaned by a crash and follows the same rules.
 
 Only the prescription is blanked. The rest of the snapshot, including the
 customer's name, phone and delivery address, stays. A blanked job cannot be
-sent to the lab (`submitJob` refuses); the retry route rebuilds the packet
-from the encrypted record, which writes the prescription back and clears
-`rx_redacted_at`. Once the encrypted record itself has been deleted, that
-rebuild fails and the job cannot be remade.
+sent to the lab (`submitJob` refuses). For a `queued`, `failed` or
+`pending_rx` job the retry route rebuilds the packet from the encrypted
+record, which writes the prescription back and clears `rx_redacted_at`; once
+the encrypted record itself has been deleted, that rebuild fails. A
+`submitted` job cannot be rebuilt, so blanking it is final.
 
 Migration `Migration20261006000100` adds the `rx_redacted_at` column and
 blanks, once, the soft-deleted duplicate rows left by
@@ -175,6 +176,20 @@ MedusaService list or update does), and nothing else soft-deletes a lab job.
 
 ### What this does not cover
 
+- **A customer cancel is invisible here.** The storefront records it in its
+  own `order_state_events`; it does not cancel the Medusa order. So the
+  "order is cancelled" rule fires only for an order cancelled in Medusa
+  itself, and a customer-cancelled order's snapshot waits for the 180-day
+  limit. Closing this needs the storefront cancel to reach the backend.
+- **The 180 days run from job creation and never reset.** A send-later order
+  delivered late is blanked at day 180 even if that is inside its
+  fit-guarantee window. A job still `queued` after 180 days (every job, while
+  no lab provider is wired) is blanked again the night after each retry.
+- **A `submitted` job blanked by the 180-day limit cannot be restored** (for
+  example when the carrier's delivered webhook was missed).
+- **A rebuild merges, it does not replace.** A retry whose result is `failed`
+  or `pending_rx` leaves any prescription the row already held (it stays
+  eligible for blanking). Existing behaviour, not changed here.
 - **The snapshot can outlive the encrypted record.** The clocks run from the
   job and the order, not from the prescription. A prescription saved long
   before the order was placed, or erased at the customer's request, can be
