@@ -64,6 +64,7 @@ function makeService(provider?: {
       provider_job_id: null,
       provider_name: null,
       submitted_at: null,
+      rx_redacted_at: null,
       created_at: new Date(Date.now() + idc),
       updated_at: new Date(),
       attempts: 0,
@@ -86,7 +87,16 @@ function makeService(provider?: {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (service as any).updateLabJobs = jest.fn(async ({ selector, data }: any) => {
     const matched = rows.filter((r) => matches(r, selector));
-    matched.forEach((r) => Object.assign(r, data));
+    // Like the real repository (`manager.assign(..., { mergeObjectProperties:
+    // true })`): a JSON column is MERGED key by key into what the row holds,
+    // not replaced. A null in the patch overwrites; a missing key is kept.
+    matched.forEach((r) => {
+      const { packet_snapshot, ...scalars } = data;
+      Object.assign(r, scalars, { updated_at: new Date() });
+      if (packet_snapshot !== undefined) {
+        r.packet_snapshot = { ...(r.packet_snapshot ?? {}), ...packet_snapshot };
+      }
+    });
     return matched;
   });
 
@@ -318,5 +328,170 @@ describe("LmsModuleService.submitJob — atomic claim", () => {
 
     row.status = "pending_rx";
     await expect(service.submitJob(job!.id)).rejects.toThrow(/pending_rx/);
+  });
+});
+
+describe("LmsModuleService.redactJobRx — blanking the readable prescription", () => {
+  it("blanks ONLY the prescription, keeps the rest of the snapshot, and stamps the time", async () => {
+    const { service, rows } = makeService();
+    const job = await service.createFromBuild(okResult);
+    expect(rows[0].packet_snapshot.prescription).not.toBeNull();
+
+    await expect(service.redactJobRx(job!.id)).resolves.toBe(true);
+
+    expect(rows[0].packet_snapshot.prescription).toBeNull();
+    expect(rows[0].rx_redacted_at).toBeInstanceOf(Date);
+    // Nothing else is lost: the audit trail still says what was ordered and
+    // where it went.
+    const { prescription: _gone, ...restAfter } = rows[0].packet_snapshot;
+    const { prescription: _was, ...restBefore } = PACKET;
+    expect(restAfter).toEqual(restBefore);
+    expect(rows[0].status).toBe("queued");
+    // No dioptre value survives anywhere on the row.
+    expect(JSON.stringify(rows[0])).not.toMatch(/sph_|cyl_|pd_right|pd_left/);
+  });
+
+  it("does not mutate the packet object it was given (the build result is reused by callers)", async () => {
+    const { service } = makeService();
+    const job = await service.createFromBuild(okResult);
+    await service.redactJobRx(job!.id);
+    expect(PACKET.prescription).not.toBeNull();
+  });
+
+  it("is a no-op the second time", async () => {
+    const { service, rows } = makeService();
+    const job = await service.createFromBuild(okResult);
+    await service.redactJobRx(job!.id);
+    const stamped = rows[0].rx_redacted_at;
+    await expect(service.redactJobRx(job!.id)).resolves.toBe(false);
+    expect(rows[0].rx_redacted_at).toBe(stamped);
+  });
+
+  it("patches the JSON column with the prescription key only, so a rebuild landing in between is not overwritten with stale keys", async () => {
+    const { service, rows } = makeService();
+    const job = await service.createFromBuild(okResult);
+    await service.redactJobRx(job!.id);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const write = (service as any).updateLabJobs.mock.calls.at(-1)[0];
+    expect(write.data.packet_snapshot).toEqual({ prescription: null });
+    expect(rows[0].packet_snapshot.frame_sku).toBe("KLR-1");
+  });
+
+  it("blanks a row ORPHANED in submitting by a crash (a day old), which would otherwise keep its prescription for good", async () => {
+    const { service, rows } = makeService();
+    const job = await service.createFromBuild(okResult);
+    rows[0].status = "submitting";
+    rows[0].updated_at = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await expect(service.redactJobRx(job!.id)).resolves.toBe(true);
+    expect(rows[0].packet_snapshot.prescription).toBeNull();
+    expect(rows[0].status).toBe("submitting");
+  });
+
+  it("refuses a job mid-submission and leaves its prescription intact", async () => {
+    const { service, rows } = makeService();
+    const job = await service.createFromBuild(okResult);
+    rows[0].status = "submitting";
+    await expect(service.redactJobRx(job!.id)).resolves.toBe(false);
+    expect(rows[0].packet_snapshot.prescription).toEqual(PACKET.prescription);
+    expect(rows[0].rx_redacted_at).toBeNull();
+  });
+
+  it("writes nothing if the job is claimed for submission between the read and the write", async () => {
+    const { service, rows } = makeService();
+    const job = await service.createFromBuild(okResult);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const realRetrieve = (service as any).retrieveLabJob;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (service as any).retrieveLabJob = jest.fn(async (id: string) => {
+      const row = await realRetrieve(id);
+      const seen = { ...row };
+      row.status = "submitting"; // another worker claims it right after our read
+      return seen;
+    });
+    await expect(service.redactJobRx(job!.id)).resolves.toBe(false);
+    expect(rows[0].packet_snapshot.prescription).toEqual(PACKET.prescription);
+    expect(rows[0].rx_redacted_at).toBeNull();
+  });
+
+  it("stamps a job that has no prescription to blank (pending or failed snapshot), so the sweep stops re-reading it", async () => {
+    const { service, rows } = makeService();
+    const job = await service.createFromBuild(failedResult);
+    await expect(service.redactJobRx(job!.id)).resolves.toBe(true);
+    expect(rows[0].packet_snapshot.prescription).toBeNull();
+    expect(rows[0].packet_snapshot.klear_order_id).toBe("order_1");
+    expect(rows[0].rx_redacted_at).toBeInstanceOf(Date);
+  });
+
+  it("throws for an unknown job", async () => {
+    const { service } = makeService();
+    await expect(service.redactJobRx("labjob_nope")).rejects.toThrow(/not found/);
+  });
+});
+
+describe("LmsModuleService — a blanked job cannot reach the lab without its prescription", () => {
+  it("submitJob refuses a blanked job and never calls the provider", async () => {
+    const submit = jest.fn(async () => ({ provider_job_id: "lab_1" }));
+    const { service, rows } = makeService({ submitJob: submit });
+    const job = await service.createFromBuild(okResult);
+    await service.redactJobRx(job!.id);
+
+    await expect(service.submitJob(job!.id)).rejects.toThrow(/prescription blanked/);
+    expect(submit).not.toHaveBeenCalled();
+    expect(rows[0].status).toBe("queued");
+  });
+
+  it("a rebuild writes the prescription back and clears the stamp, and the job can then be submitted", async () => {
+    const submit = jest.fn(async () => ({ provider_job_id: "lab_1" }));
+    const { service, rows } = makeService({ submitJob: submit });
+    const job = await service.createFromBuild(okResult);
+    await service.redactJobRx(job!.id);
+
+    await service.updateJobFromBuild(job!.id, okResult);
+    expect(rows[0].rx_redacted_at).toBeNull();
+    expect(rows[0].packet_snapshot.prescription).toEqual(PACKET.prescription);
+
+    const r = await service.submitJob(job!.id);
+    expect(r.outcome).toBe("submitted");
+    expect(submit).toHaveBeenCalledWith(
+      expect.objectContaining({ prescription: PACKET.prescription }),
+    );
+  });
+});
+
+describe("LmsModuleService.listJobsHoldingRx", () => {
+  it("returns only jobs not yet blanked, asking for ids and dates and never the snapshot", async () => {
+    const { service, rows } = makeService();
+    const a = await service.createFromBuild(okResult);
+    rows.push({ ...rows[0], id: "labjob_other", order_id: "order_2" });
+    await service.redactJobRx(a!.id);
+
+    const held = await service.listJobsHoldingRx();
+    expect(held.map((j) => j.id)).toEqual(["labjob_other"]);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const [selector, cfg] = (service as any).listLabJobs.mock.calls.at(-1);
+    expect(selector).toEqual({ rx_redacted_at: null });
+    expect(cfg.select).not.toContain("packet_snapshot");
+    expect(cfg.order).toEqual({ created_at: "ASC", id: "ASC" });
+  });
+
+  it("pages through more than one page", async () => {
+    const { service } = makeService();
+    const row = (i: number) => ({
+      id: `j${i}`,
+      order_id: `o${i}`,
+      status: "queued",
+      created_at: new Date(),
+      updated_at: new Date(),
+      rx_redacted_at: null,
+    });
+    const all = Array.from({ length: 1100 }, (_, i) => row(i));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (service as any).listLabJobs = jest.fn(async (_sel: unknown, cfg: any) =>
+      all.slice(cfg.skip, cfg.skip + cfg.take),
+    );
+    const held = await service.listJobsHoldingRx();
+    expect(held).toHaveLength(1100);
+    expect(new Set(held.map((j) => j.id)).size).toBe(1100);
   });
 });

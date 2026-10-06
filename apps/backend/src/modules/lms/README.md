@@ -138,3 +138,65 @@ the rebuild yields a full packet — submitted.
 `packet_snapshot` holds plaintext Rx because the lab needs it. Never log it,
 never put it in audit payloads, never expose it from the Store API. Decrypt
 is fenced inside the `prescription` module's `decryptForLabHandoff()`.
+
+## How long the readable prescription is kept
+
+`lab_job.packet_snapshot` holds the prescription in plain form because the
+lab needs it. The canonical record (Supabase `prescriptions`) is encrypted
+and deleted after two years; the snapshot had no end of life.
+
+The scheduled job `src/jobs/redact-lab-job-rx.ts` runs once a day and sets
+`packet_snapshot.prescription` to `null` (stamping `rx_redacted_at`) when the
+job no longer needs it. The rules are one pure function,
+`rx-retention.ts`:
+
+| When | Why |
+| --- | --- |
+| the Medusa order is cancelled (`order.canceled_at`), or the lab job is `cancelled` | it will not be made |
+| the order was delivered 60 days ago (`RX_REDACT_AFTER_DELIVERY_DAYS`) | past the 30-day fit guarantee, with margin |
+| the job is 180 days old (`RX_REDACT_MAX_AGE_DAYS`) | backstop for an order with no delivery on record |
+
+Delivery is read from the order's Medusa fulfillments: every live fulfillment
+must have `delivered_at`, and the latest one starts the clock. A job in
+`submitting` is left alone for 24 hours (`RX_SUBMITTING_GRACE_HOURS`); after
+that it is treated as orphaned by a crash and follows the same rules.
+
+Only the prescription is blanked. The rest of the snapshot, including the
+customer's name, phone and delivery address, stays. A blanked job cannot be
+sent to the lab (`submitJob` refuses). For a `queued`, `failed` or
+`pending_rx` job the retry route rebuilds the packet from the encrypted
+record, which writes the prescription back and clears `rx_redacted_at`; once
+the encrypted record itself has been deleted, that rebuild fails. A
+`submitted` job cannot be rebuilt, so blanking it is final.
+
+Migration `Migration20261006000100` adds the `rx_redacted_at` column and
+blanks, once, the soft-deleted duplicate rows left by
+`Migration20260717000100`. The job cannot see soft-deleted rows (no
+MedusaService list or update does), and nothing else soft-deletes a lab job.
+
+### What this does not cover
+
+- **A customer cancel is invisible here.** The storefront records it in its
+  own `order_state_events`; it does not cancel the Medusa order. So the
+  "order is cancelled" rule fires only for an order cancelled in Medusa
+  itself, and a customer-cancelled order's snapshot waits for the 180-day
+  limit. Closing this needs the storefront cancel to reach the backend.
+- **The 180 days run from job creation and never reset.** A send-later order
+  delivered late is blanked at day 180 even if that is inside its
+  fit-guarantee window. A job still `queued` after 180 days (every job, while
+  no lab provider is wired) is blanked again the night after each retry.
+- **A `submitted` job blanked by the 180-day limit cannot be restored** (for
+  example when the carrier's delivered webhook was missed).
+- **A rebuild merges, it does not replace.** A retry whose result is `failed`
+  or `pending_rx` leaves any prescription the row already held (it stays
+  eligible for blanking). Existing behaviour, not changed here.
+- **The snapshot can outlive the encrypted record.** The clocks run from the
+  job and the order, not from the prescription. A prescription saved long
+  before the order was placed, or erased at the customer's request, can be
+  gone from Supabase while an undelivered job's snapshot still has up to 180
+  days to run. Closing this needs the prescription's expiry stored on the
+  job, or the erasure path calling into this module.
+- **Name, phone and address in the snapshot have no end of life.** The same
+  details live on the Medusa order.
+- **Orders shipped in parts.** Delivery is judged from the fulfillments that
+  exist. An order is one pair in one parcel today.

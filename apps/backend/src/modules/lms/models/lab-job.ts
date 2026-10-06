@@ -18,6 +18,10 @@ import { model } from "@medusajs/framework/utils";
  * for forensic reproducibility. It includes decrypted Rx, so this
  * column is treated as PDPA-sensitive — never logged, never exported
  * outside the lab-handoff path.
+ *
+ * The decrypted Rx does not stay there for good: the `redact-lab-job-rx`
+ * scheduled job blanks `packet_snapshot.prescription` once the job no
+ * longer needs it and stamps `rx_redacted_at` (rules in `rx-retention.ts`).
  */
 const LabJob = model.define("lab_job", {
   id: model.id({ prefix: "labjob" }).primaryKey(),
@@ -41,6 +45,9 @@ const LabJob = model.define("lab_job", {
   last_error: model.text().nullable(),
   // When the lab provider confirmed receipt (status moved to "submitted").
   submitted_at: model.dateTime().nullable(),
+  // When the readable prescription in packet_snapshot was blanked. Null
+  // while the snapshot may still hold one. A rebuild (retry) clears this.
+  rx_redacted_at: model.dateTime().nullable(),
 })
   // ── DO NOT REMOVE ──────────────────────────────────────────────────────
   // This partial unique index is idempotency-critical: it is what stops two
