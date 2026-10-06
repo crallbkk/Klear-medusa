@@ -3,10 +3,12 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
 import { LMS_MODULE } from "../modules/lms/service";
 import type LmsModuleService from "../modules/lms/service";
 import {
-  orderDeliveredAt,
+  NO_ORDER_FACTS,
+  orderRetentionFacts,
   rxRedactionReason,
-  type FulfillmentDeliveryRow,
+  type OrderRetentionRow,
   type RxRedactionReason,
+  type RxRetentionOrderFacts,
 } from "../modules/lms/rx-retention";
 import { captureException } from "../lib/observability/sentry";
 
@@ -18,8 +20,8 @@ import { captureException } from "../lib/observability/sentry";
  * Supabase is encrypted and deleted after two years. This job blanks the
  * snapshot's `prescription` (and stamps `rx_redacted_at`) once the job no
  * longer needs it: the order was cancelled, it was delivered
- * RX_REDACT_AFTER_DELIVERY_DAYS ago, or the job is two years old. The rules
- * are in `modules/lms/rx-retention.ts`.
+ * RX_REDACT_AFTER_DELIVERY_DAYS ago, or the job is RX_REDACT_MAX_AGE_DAYS
+ * old. The rules are in `modules/lms/rx-retention.ts`.
  *
  * Only the prescription is blanked. The rest of the snapshot (frame, lens,
  * delivery address) stays for the audit trail; the same customer details
@@ -31,20 +33,19 @@ import { captureException } from "../lib/observability/sentry";
  * Idempotent. One order's failure never stops the rest.
  */
 
-interface OrderGraphRow {
+interface OrderGraphRow extends OrderRetentionRow {
   id: string;
-  fulfillments?: FulfillmentDeliveryRow[] | null;
 }
 
 const ORDER_BATCH = 100;
 
-/** Delivery date per order id. An order missing from the map has no known
- *  delivery (not delivered yet, or the lookup failed for its batch). */
-async function loadDeliveredAt(
+/** What each order says (delivered? cancelled?). An order missing from the
+ *  map is unknown: it no longer exists, or the lookup failed for its batch. */
+async function loadOrderFacts(
   container: MedusaContainer,
   orderIds: string[],
-): Promise<{ deliveredAt: Map<string, Date>; failedBatches: number }> {
-  const deliveredAt = new Map<string, Date>();
+): Promise<{ facts: Map<string, RxRetentionOrderFacts>; failedBatches: number }> {
+  const facts = new Map<string, RxRetentionOrderFacts>();
   let failedBatches = 0;
   const query = container.resolve(ContainerRegistrationKeys.QUERY);
 
@@ -53,17 +54,20 @@ async function loadDeliveredAt(
     try {
       const { data } = await query.graph({
         entity: "order",
-        fields: ["id", "fulfillments.delivered_at", "fulfillments.canceled_at"],
+        fields: [
+          "id",
+          "canceled_at",
+          "fulfillments.delivered_at",
+          "fulfillments.canceled_at",
+        ],
         filters: { id: batch },
       });
       for (const row of (data ?? []) as OrderGraphRow[]) {
-        const at = orderDeliveredAt(row.fulfillments);
-        if (at) deliveredAt.set(row.id, at);
+        facts.set(row.id, orderRetentionFacts(row));
       }
     } catch (err) {
-      // Without delivery dates this batch falls back to the cancelled and
-      // two-year rules only. Nothing is blanked early; it is retried on the
-      // next run.
+      // Without the order this batch falls back to the job's own status and
+      // age. Nothing is blanked early; it is retried on the next run.
       failedBatches++;
       console.error(
         `[redact-lab-job-rx] order delivery lookup failed for a batch of ${batch.length}: ${
@@ -76,7 +80,7 @@ async function loadDeliveredAt(
       });
     }
   }
-  return { deliveredAt, failedBatches };
+  return { facts, failedBatches };
 }
 
 export default async function redactLabJobRxJob(
@@ -88,7 +92,7 @@ export default async function redactLabJobRxJob(
   if (candidates.length === 0) return;
 
   const orderIds = Array.from(new Set(candidates.map((j) => j.order_id)));
-  const { deliveredAt, failedBatches } = await loadDeliveredAt(container, orderIds);
+  const { facts, failedBatches } = await loadOrderFacts(container, orderIds);
 
   const now = new Date();
   const counts: Record<RxRedactionReason, number> = {
@@ -101,7 +105,7 @@ export default async function redactLabJobRxJob(
   let errored = 0;
 
   for (const job of candidates) {
-    const reason = rxRedactionReason(job, deliveredAt.get(job.order_id) ?? null, now);
+    const reason = rxRedactionReason(job, facts.get(job.order_id) ?? NO_ORDER_FACTS, now);
     if (!reason) {
       kept++;
       continue;
@@ -125,7 +129,7 @@ export default async function redactLabJobRxJob(
   }
 
   console.info(
-    `[redact-lab-job-rx] checked ${candidates.length}: blanked ${counts.cancelled} cancelled, ${counts.delivered} delivered, ${counts.max_age} past two years; ${kept} kept, ${raced} changed underneath, ${errored} errored, ${failedBatches} delivery lookups failed`,
+    `[redact-lab-job-rx] checked ${candidates.length}: blanked ${counts.cancelled} cancelled, ${counts.delivered} delivered, ${counts.max_age} past the age limit; ${kept} kept, ${raced} changed underneath, ${errored} errored, ${failedBatches} order lookups failed`,
   );
 }
 

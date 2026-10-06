@@ -87,7 +87,16 @@ function makeService(provider?: {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (service as any).updateLabJobs = jest.fn(async ({ selector, data }: any) => {
     const matched = rows.filter((r) => matches(r, selector));
-    matched.forEach((r) => Object.assign(r, data));
+    // Like the real repository (`manager.assign(..., { mergeObjectProperties:
+    // true })`): a JSON column is MERGED key by key into what the row holds,
+    // not replaced. A null in the patch overwrites; a missing key is kept.
+    matched.forEach((r) => {
+      const { packet_snapshot, ...scalars } = data;
+      Object.assign(r, scalars, { updated_at: new Date() });
+      if (packet_snapshot !== undefined) {
+        r.packet_snapshot = { ...(r.packet_snapshot ?? {}), ...packet_snapshot };
+      }
+    });
     return matched;
   });
 
@@ -358,6 +367,26 @@ describe("LmsModuleService.redactJobRx — blanking the readable prescription", 
     expect(rows[0].rx_redacted_at).toBe(stamped);
   });
 
+  it("patches the JSON column with the prescription key only, so a rebuild landing in between is not overwritten with stale keys", async () => {
+    const { service, rows } = makeService();
+    const job = await service.createFromBuild(okResult);
+    await service.redactJobRx(job!.id);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const write = (service as any).updateLabJobs.mock.calls.at(-1)[0];
+    expect(write.data.packet_snapshot).toEqual({ prescription: null });
+    expect(rows[0].packet_snapshot.frame_sku).toBe("KLR-1");
+  });
+
+  it("blanks a row ORPHANED in submitting by a crash (a day old), which would otherwise keep its prescription for good", async () => {
+    const { service, rows } = makeService();
+    const job = await service.createFromBuild(okResult);
+    rows[0].status = "submitting";
+    rows[0].updated_at = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await expect(service.redactJobRx(job!.id)).resolves.toBe(true);
+    expect(rows[0].packet_snapshot.prescription).toBeNull();
+    expect(rows[0].status).toBe("submitting");
+  });
+
   it("refuses a job mid-submission and leaves its prescription intact", async () => {
     const { service, rows } = makeService();
     const job = await service.createFromBuild(okResult);
@@ -448,7 +477,14 @@ describe("LmsModuleService.listJobsHoldingRx", () => {
 
   it("pages through more than one page", async () => {
     const { service } = makeService();
-    const row = (i: number) => ({ id: `j${i}`, order_id: `o${i}`, status: "queued", created_at: new Date(), rx_redacted_at: null });
+    const row = (i: number) => ({
+      id: `j${i}`,
+      order_id: `o${i}`,
+      status: "queued",
+      created_at: new Date(),
+      updated_at: new Date(),
+      rx_redacted_at: null,
+    });
     const all = Array.from({ length: 1100 }, (_, i) => row(i));
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (service as any).listLabJobs = jest.fn(async (_sel: unknown, cfg: any) =>

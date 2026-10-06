@@ -19,6 +19,7 @@ type Candidate = {
   order_id: string;
   status: string;
   created_at: Date;
+  updated_at: Date;
   rx_redacted_at: null;
 };
 
@@ -27,12 +28,14 @@ const cand = (id: string, over: Partial<Candidate> = {}): Candidate => ({
   order_id: `order_${id}`,
   status: "queued",
   created_at: daysAgo(5),
+  updated_at: daysAgo(5),
   rx_redacted_at: null,
   ...over,
 });
 
 type OrderRow = {
   id: string;
+  canceled_at?: Date | null;
   fulfillments: Array<{ delivered_at: Date | null; canceled_at?: Date | null }>;
 };
 
@@ -86,17 +89,22 @@ describe("redact-lab-job-rx scheduled job", () => {
     const { lms, run } = setup(
       [
         cand("cancelled", { status: "cancelled" }),
+        cand("order_cancelled"),
         cand("delivered_long_ago"),
         cand("delivered_recently"),
         cand("in_transit"),
         cand("no_fulfillment"),
-        cand("two_years_old", { created_at: daysAgo(RX_REDACT_MAX_AGE_DAYS + 1) }),
+        cand("order_gone"),
+        cand("too_old", { created_at: daysAgo(RX_REDACT_MAX_AGE_DAYS + 1) }),
         cand("mid_submission", {
           status: "submitting",
           created_at: daysAgo(RX_REDACT_MAX_AGE_DAYS + 1),
+          updated_at: new Date(),
         }),
       ],
       [
+        // The lab job is still `queued`; only the Medusa order knows.
+        { id: "order_order_cancelled", canceled_at: daysAgo(1), fulfillments: [] },
         {
           id: "order_delivered_long_ago",
           fulfillments: [{ delivered_at: daysAgo(RX_REDACT_AFTER_DELIVERY_DAYS + 1) }],
@@ -111,7 +119,12 @@ describe("redact-lab-job-rx scheduled job", () => {
     );
     await run();
     const blanked = lms.redactJobRx.mock.calls.map((c) => c[0]).sort();
-    expect(blanked).toEqual(["cancelled", "delivered_long_ago", "two_years_old"]);
+    expect(blanked).toEqual([
+      "cancelled",
+      "delivered_long_ago",
+      "order_cancelled",
+      "too_old",
+    ]);
   });
 
   it("reads delivery from the order's fulfillments, and nothing about the prescription", async () => {
@@ -119,24 +132,59 @@ describe("redact-lab-job-rx scheduled job", () => {
     await run();
     expect(graph).toHaveBeenCalledWith({
       entity: "order",
-      fields: ["id", "fulfillments.delivered_at", "fulfillments.canceled_at"],
+      fields: [
+        "id",
+        "canceled_at",
+        "fulfillments.delivered_at",
+        "fulfillments.canceled_at",
+      ],
       filters: { id: ["order_a"] },
     });
   });
 
-  it("when the order lookup fails, blanks nothing on delivery but still applies the cancelled and two-year rules", async () => {
+  it("when the order lookup fails, nothing is blanked on the order's say-so; the job's own status and age still apply", async () => {
     const { lms, run } = setup(
       [
         cand("delivered_long_ago"),
         cand("cancelled", { status: "cancelled" }),
-        cand("two_years_old", { created_at: daysAgo(RX_REDACT_MAX_AGE_DAYS + 1) }),
+        cand("too_old", { created_at: daysAgo(RX_REDACT_MAX_AGE_DAYS + 1) }),
       ],
       new Error("graph down"),
     );
     await run();
     const blanked = lms.redactJobRx.mock.calls.map((c) => c[0]).sort();
-    expect(blanked).toEqual(["cancelled", "two_years_old"]);
+    expect(blanked).toEqual(["cancelled", "too_old"]);
     expect(captureException).toHaveBeenCalledTimes(1);
+  });
+
+  it("one failed batch of orders does not stop the other batches", async () => {
+    const many = Array.from({ length: 150 }, (_, i) => cand(`j${i}`));
+    const { lms, graph, run } = setup(
+      many,
+      many.map((c) => ({
+        id: c.order_id,
+        fulfillments: [{ delivered_at: daysAgo(RX_REDACT_AFTER_DELIVERY_DAYS + 5) }],
+      })),
+    );
+    graph.mockImplementationOnce(async () => {
+      throw new Error("first batch failed");
+    });
+    await run();
+    // The first 100 orders are unknown and kept; the last 50 are blanked.
+    expect(lms.redactJobRx).toHaveBeenCalledTimes(50);
+    expect(lms.redactJobRx.mock.calls[0][0]).toBe("j100");
+  });
+
+  it("counts a job that changed underneath (redactJobRx answered false) apart from the blanked ones", async () => {
+    const { lms, run } = setup(
+      [cand("a", { status: "cancelled" }), cand("b", { status: "cancelled" })],
+      [],
+    );
+    lms.redactJobRx.mockImplementation(async (id: string) => id !== "b");
+    await run();
+    const line = infoSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(line).toMatch(/blanked 1 cancelled/);
+    expect(line).toMatch(/1 changed underneath/);
   });
 
   it("one job's failure does not stop the rest", async () => {
@@ -164,7 +212,7 @@ describe("redact-lab-job-rx scheduled job", () => {
 
   it("looks orders up in batches of 100, each order once", async () => {
     const many = Array.from({ length: 230 }, (_, i) => cand(`j${i}`));
-    // Two jobs on one order (a soft-deleted duplicate) must not double the id.
+    // Two candidate rows naming one order must not double the id.
     many.push(cand("dup", { order_id: "order_j0" }));
     const { graph, run } = setup(many, []);
     await run();

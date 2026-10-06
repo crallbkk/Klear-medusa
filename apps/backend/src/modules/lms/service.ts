@@ -8,6 +8,7 @@ import {
   LabProviderError,
 } from "./types";
 import { UnimplementedLabProvider } from "./providers/_unimplemented";
+import { isSubmissionInFlight } from "./rx-retention";
 
 export const LMS_MODULE = "lms";
 
@@ -61,7 +62,7 @@ export type LabJobRow = {
 /** The columns the retention sweep needs — deliberately NOT the snapshot. */
 export type LabJobRetentionRow = Pick<
   LabJobRow,
-  "id" | "order_id" | "status" | "created_at" | "rx_redacted_at"
+  "id" | "order_id" | "status" | "created_at" | "updated_at" | "rx_redacted_at"
 >;
 
 /**
@@ -398,6 +399,12 @@ class LmsModuleService extends MedusaService({
    * Every job whose snapshot may still hold a readable prescription
    * (`rx_redacted_at` is null), oldest first. Returns ids, status and dates
    * only: the retention sweep decides without ever loading a prescription.
+   *
+   * Live rows only. Like every MedusaService list, this skips soft-deleted
+   * rows (and `updateLabJobs` cannot write to them). The only soft-deleted
+   * lab jobs are the duplicates removed by Migration20260717000100;
+   * Migration20261006000100 blanks those once. Nothing else soft-deletes a
+   * lab job; if that ever changes, blank the prescription at the same time.
    */
   async listJobsHoldingRx(): Promise<LabJobRetentionRow[]> {
     const PAGE = 500;
@@ -406,7 +413,14 @@ class LmsModuleService extends MedusaService({
       const page = (await this.listLabJobs(
         { rx_redacted_at: null },
         {
-          select: ["id", "order_id", "status", "created_at", "rx_redacted_at"],
+          select: [
+            "id",
+            "order_id",
+            "status",
+            "created_at",
+            "updated_at",
+            "rx_redacted_at",
+          ],
           take: PAGE,
           skip,
           // id breaks created_at ties so paging never skips or repeats a row.
@@ -427,7 +441,16 @@ class LmsModuleService extends MedusaService({
    * job moved underneath us: already blanked, mid-submission, or its status
    * changed between the read and the guarded write. The caller decides WHEN
    * (see `rx-retention.ts`); this only refuses the one state where blanking
-   * would corrupt a submission in flight.
+   * would corrupt a submission in flight. A row orphaned in `submitting`
+   * (past the grace period) is not in flight and is blanked like any other.
+   *
+   * Known narrow race: MedusaService resolves a selector to ids, then
+   * updates (see the claim in `submitJob`). A rebuild landing in the few
+   * milliseconds between this method's read and write can leave a fresh
+   * prescription under a set stamp. `submitJob` then refuses the job until
+   * the next rebuild, which also clears the stamp. The daily sweep (20:15
+   * UTC) and the half-hourly heal job (:00, :30) never overlap, so only a
+   * manual retry at that minute can hit it.
    *
    * Not reversible in place. A job that needs its prescription again gets it
    * from the encrypted record through the retry (rebuild) path.
@@ -436,18 +459,20 @@ class LmsModuleService extends MedusaService({
     const job = (await this.retrieveLabJob(jobId)) as unknown as LabJobRow;
     if (!job) throw new Error(`redactJobRx: job ${jobId} not found`);
     if (job.rx_redacted_at) return false;
-    if (job.status === "submitting") return false;
+    if (isSubmissionInFlight(job, new Date())) return false;
 
-    const snapshot = {
-      ...((job.packet_snapshot ?? {}) as unknown as Record<string, unknown>),
-      prescription: null,
-    };
     // Guarded on the status we read and on still-not-blanked, like the submit
     // claim: if the job was claimed for submission (or blanked by another
     // run) in between, the selector matches nothing.
+    //
+    // `packet_snapshot` here is a PATCH, not a replacement: Medusa's
+    // repository assigns JSON columns with `mergeObjectProperties`, so only
+    // the `prescription` key is overwritten and every other key keeps the
+    // value in the row. Writing back a full copy of what we read would put
+    // stale keys over a rebuild that landed in between.
     const updated = (await this.updateLabJobs({
       selector: { id: jobId, status: job.status, rx_redacted_at: null },
-      data: { packet_snapshot: snapshot, rx_redacted_at: new Date() },
+      data: { packet_snapshot: { prescription: null }, rx_redacted_at: new Date() },
     })) as unknown as LabJobRow[];
     return updated.length > 0;
   }

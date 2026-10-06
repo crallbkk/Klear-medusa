@@ -143,7 +143,7 @@ is fenced inside the `prescription` module's `decryptForLabHandoff()`.
 
 `lab_job.packet_snapshot` holds the prescription in plain form because the
 lab needs it. The canonical record (Supabase `prescriptions`) is encrypted
-and deleted after two years, so the snapshot must not outlive it.
+and deleted after two years; the snapshot had no end of life.
 
 The scheduled job `src/jobs/redact-lab-job-rx.ts` runs once a day and sets
 `packet_snapshot.prescription` to `null` (stamping `rx_redacted_at`) when the
@@ -152,19 +152,36 @@ job no longer needs it. The rules are one pure function,
 
 | When | Why |
 | --- | --- |
-| the job is `cancelled` | the order will not be made |
+| the Medusa order is cancelled (`order.canceled_at`), or the lab job is `cancelled` | it will not be made |
 | the order was delivered 60 days ago (`RX_REDACT_AFTER_DELIVERY_DAYS`) | past the 30-day fit guarantee, with margin |
-| the job is two years old (`RX_REDACT_MAX_AGE_DAYS`) | backstop, whatever state it is in |
+| the job is 180 days old (`RX_REDACT_MAX_AGE_DAYS`) | backstop for an order with no delivery on record |
 
 Delivery is read from the order's Medusa fulfillments: every live fulfillment
 must have `delivered_at`, and the latest one starts the clock. A job in
-`submitting` is never touched.
+`submitting` is left alone for 24 hours (`RX_SUBMITTING_GRACE_HOURS`); after
+that it is treated as orphaned by a crash and follows the same rules.
 
-Only the prescription is blanked. The rest of the snapshot stays for the
-audit trail. A blanked job cannot be sent to the lab (`submitJob` refuses);
-the retry route rebuilds the packet from the encrypted record, which writes
-the prescription back and clears `rx_redacted_at`. Once the encrypted record
-itself has been deleted, that rebuild fails and the job cannot be remade.
+Only the prescription is blanked. The rest of the snapshot, including the
+customer's name, phone and delivery address, stays. A blanked job cannot be
+sent to the lab (`submitJob` refuses); the retry route rebuilds the packet
+from the encrypted record, which writes the prescription back and clears
+`rx_redacted_at`. Once the encrypted record itself has been deleted, that
+rebuild fails and the job cannot be remade.
 
-Migration `Migration20261006000100` adds the `rx_redacted_at` column. Rows
-that existed before it are picked up by the job's first run.
+Migration `Migration20261006000100` adds the `rx_redacted_at` column and
+blanks, once, the soft-deleted duplicate rows left by
+`Migration20260717000100`. The job cannot see soft-deleted rows (no
+MedusaService list or update does), and nothing else soft-deletes a lab job.
+
+### What this does not cover
+
+- **The snapshot can outlive the encrypted record.** The clocks run from the
+  job and the order, not from the prescription. A prescription saved long
+  before the order was placed, or erased at the customer's request, can be
+  gone from Supabase while an undelivered job's snapshot still has up to 180
+  days to run. Closing this needs the prescription's expiry stored on the
+  job, or the erasure path calling into this module.
+- **Name, phone and address in the snapshot have no end of life.** The same
+  details live on the Medusa order.
+- **Orders shipped in parts.** Delivery is judged from the fulfillments that
+  exist. An order is one pair in one parcel today.
