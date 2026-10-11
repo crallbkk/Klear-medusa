@@ -66,7 +66,14 @@ export default async function initial_data_seed({
         stores: [
           {
             name: "Klear",
-            supported_currencies: [{ currency_code: "thb", is_default: true }],
+            // Tax-inclusive: the entered price is what the customer pays.
+            // Production had this set by hand on 2026-06-14; without it a
+            // fresh database is tax-additive and the storefront's parity
+            // guard (charge === cart.total) refuses payment once the tax
+            // rate is non-zero.
+            supported_currencies: [
+              { currency_code: "thb", is_default: true, is_tax_inclusive: true },
+            ],
             default_sales_channel_id: salesChannel.id,
           },
         ],
@@ -118,7 +125,7 @@ export default async function initial_data_seed({
       }
     });
 
-  // 4. Thailand region with THB + 7% inclusive VAT
+  // 4. Thailand region with THB, tax-inclusive prices, tax rate 0 for now
   const regions = await regionModule.listRegions({ name: "Thailand" });
   let region = regions[0];
   if (!region) {
@@ -129,6 +136,9 @@ export default async function initial_data_seed({
             name: "Thailand",
             currency_code: "thb",
             countries: ["th"],
+            // Region-ruled prices follow the region's own preference, which
+            // otherwise defaults to tax-additive.
+            is_tax_inclusive: true,
             automatic_taxes: true,
             payment_providers: ["pp_system_default"],
           },
@@ -148,15 +158,23 @@ export default async function initial_data_seed({
         {
           country_code: "th",
           provider_id: "tp_system",
+          // Rate 0 while Klear is not VAT-registered: it charges no VAT, so
+          // an order must not carry a tax amount. Production was changed
+          // from 7 to 0 through the admin API on 2026-10-11. Orders still
+          // get a "Thailand VAT" tax line, at rate 0 and amount 0.
+          // On registration, set the rate to 7 in Medusa Admin. With THB
+          // tax-inclusive (see the store above) item and shipping totals do
+          // not move; a fixed-amount promotion not flagged tax-inclusive
+          // would.
           default_tax_rate: {
             name: "Thailand VAT",
             code: "TH-VAT",
-            rate: 7,
+            rate: 0,
           },
         },
       ],
     });
-    logger.info(`Created TH tax region (7% inclusive VAT)`);
+    logger.info(`Created TH tax region (rate 0, not VAT-registered)`);
   } else {
     logger.info(`TH tax region exists`);
   }
