@@ -405,3 +405,180 @@ describe("RX_ENC_COLUMNS drift guard", () => {
     expect(rx.pd_left).toBe(34);
   });
 });
+
+// Supabase's new API keys (sb_secret_...) are not JWTs and must go in the
+// `apikey` header only; the legacy JWT service_role key keeps apikey + Bearer
+// so the deploy is safe before SUPABASE_SERVICE_ROLE_KEY is switched.
+describe("Supabase auth headers by key shape", () => {
+  const LEGACY_KEY = "eyJhbGciOiJIUzI1NiJ9.test-legacy.sig";
+  const SECRET_KEY = "sb_secret_test-only";
+
+  /** Runs a full decrypt (row fetch + 7 RPC calls) and returns the
+   *  normalised headers of every request, in call order. */
+  async function captureHeaders(): Promise<Headers[]> {
+    const seen: Headers[] = [];
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      (_url, init) => {
+        seen.push(new Headers(init?.headers));
+        return makeRowResponse();
+      },
+    ];
+    for (let i = 0; i < 7; i++) {
+      handlers.push((_url, init) => {
+        seen.push(new Headers(init?.headers));
+        return jsonResponse(200, "1");
+      });
+    }
+    const fetchMock = mockFetchSequence(handlers);
+    await decryptPrescription("rx_1", {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(8);
+    return seen;
+  }
+
+  it("sends a secret key as apikey only, with no Authorization header, on the row fetch and every decrypt RPC", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = SECRET_KEY;
+    const seen = await captureHeaders();
+    for (const h of seen) {
+      expect(h.get("apikey")).toBe(SECRET_KEY);
+      expect(h.has("authorization")).toBe(false);
+    }
+  });
+
+  it("keeps apikey + Bearer for the legacy JWT service_role key", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = LEGACY_KEY;
+    const seen = await captureHeaders();
+    for (const h of seen) {
+      expect(h.get("apikey")).toBe(LEGACY_KEY);
+      expect(h.get("authorization")).toBe(`Bearer ${LEGACY_KEY}`);
+    }
+  });
+
+  it("keeps the non-auth headers alongside the key", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = SECRET_KEY;
+    const [rowFetch, ...rpcCalls] = await captureHeaders();
+    expect(rowFetch.get("accept")).toBe("application/json");
+    for (const h of rpcCalls) {
+      expect(h.get("content-type")).toBe("application/json");
+      expect(h.get("accept")).toBe("application/json");
+    }
+  });
+
+  it("trims whitespace pasted around the key before choosing the header shape", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = `  ${SECRET_KEY}\n`;
+    const seen = await captureHeaders();
+    for (const h of seen) {
+      expect(h.get("apikey")).toBe(SECRET_KEY);
+      expect(h.has("authorization")).toBe(false);
+    }
+  });
+
+  it("throws config error when SUPABASE_SERVICE_ROLE_KEY is only whitespace", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "  \n";
+    const fetchMock = jest.fn();
+    await expect(
+      decryptPrescription("rx_1", {
+        fetch: fetchMock as unknown as typeof fetch,
+      }),
+    ).rejects.toMatchObject({
+      name: "SupabaseVaultError",
+      code: "config",
+      message: expect.stringContaining("is not set"),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // Config errors reach Sentry and lab_job.last_error, so none may echo the
+  // key. Each case must fail before any request goes out.
+  // [label, env value, a fragment of the key that must not leak]
+  it.each([
+    ["a publishable key", "sb_publishable_test-only", "test-only"],
+    ["an unknown sb_ key type", "sb_other_test-only", "test-only"],
+    ["a key with a line break inside (wrapped paste)", "sb_secret_wrap\nped", "sb_secret_wrap"],
+    ["a key with a CRLF inside", "eyJhbGciOiJIUzI1NiJ9.legacy\r\nwrap.sig", "eyJhbGciOiJIUzI1NiJ9"],
+    ["a quoted key", '"sb_secret_test-only"', "test-only"],
+  ])(
+    "refuses %s with a config error that does not echo the key",
+    async (_label, key, fragment) => {
+      process.env.SUPABASE_SERVICE_ROLE_KEY = key;
+      const fetchMock = jest.fn();
+      const err = await decryptPrescription("rx_1", {
+        fetch: fetchMock as unknown as typeof fetch,
+      }).catch((e: unknown) => e);
+      expect(err).toMatchObject({ name: "SupabaseVaultError", code: "config" });
+      expect((err as Error).message).not.toContain(fragment);
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("replaces a thrown fetch error that quotes the key with an rpc error that does not", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = SECRET_KEY;
+    const fetchMock = jest.fn(async () => {
+      // Shape of undici's rejection of an invalid header value.
+      throw new TypeError(
+        `Headers.append: "${SECRET_KEY}" is an invalid header value.`,
+      );
+    });
+    const err = await decryptPrescription("rx_1", {
+      fetch: fetchMock as unknown as typeof fetch,
+    }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: "SupabaseVaultError", code: "rpc" });
+    expect((err as Error).message).not.toContain(SECRET_KEY);
+    expect((err as Error).message).toContain("network error");
+  });
+
+  it("keeps a network error's code (and only the code) on a failed decrypt RPC", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = LEGACY_KEY;
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      () => makeRowResponse(),
+    ];
+    for (let i = 0; i < 7; i++) {
+      handlers.push(() => {
+        throw Object.assign(new TypeError(`fetch failed for ${LEGACY_KEY}`), {
+          cause: { code: "ECONNRESET" },
+        });
+      });
+    }
+    const err = await decryptPrescription("rx_1", {
+      fetch: mockFetchSequence(handlers) as unknown as typeof fetch,
+    }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: "SupabaseVaultError", code: "rpc" });
+    expect((err as Error).message).toContain("ECONNRESET");
+    expect((err as Error).message).not.toContain(LEGACY_KEY);
+  });
+
+  it("drops a network error code that is not a plain code (it could carry the key)", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = LEGACY_KEY;
+    const fetchMock = jest.fn(async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: { code: `bad ${LEGACY_KEY}` },
+      });
+    });
+    const err = await decryptPrescription("rx_1", {
+      fetch: fetchMock as unknown as typeof fetch,
+    }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: "SupabaseVaultError", code: "rpc" });
+    expect((err as Error).message).toContain("network error");
+    expect((err as Error).message).not.toContain(LEGACY_KEY);
+  });
+
+  it("trims whitespace around SUPABASE_URL too", async () => {
+    process.env.SUPABASE_URL = " https://supa.test\n";
+    process.env.SUPABASE_SERVICE_ROLE_KEY = SECRET_KEY;
+    let rowUrl = "";
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      (url) => {
+        rowUrl = url;
+        return makeRowResponse();
+      },
+    ];
+    for (let i = 0; i < 7; i++) handlers.push(() => jsonResponse(200, "1"));
+    await decryptPrescription("rx_1", {
+      fetch: mockFetchSequence(handlers) as unknown as typeof fetch,
+    });
+    expect(rowUrl.startsWith("https://supa.test/rest/v1/prescriptions?")).toBe(
+      true,
+    );
+  });
+});

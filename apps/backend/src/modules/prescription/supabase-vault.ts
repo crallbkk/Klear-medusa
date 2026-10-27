@@ -14,7 +14,9 @@
  * Auth: this code runs server-side in Medusa with a Supabase
  * service-role key (SUPABASE_SERVICE_ROLE_KEY). Service-role bypasses
  * RLS, which is appropriate because Medusa workflows are trusted
- * server code, not customer-facing.
+ * server code, not customer-facing. The env var holds either a secret
+ * key (`sb_secret_...`) or the legacy JWT `service_role` key; see
+ * supabaseAuthHeaders() for how each is sent.
  */
 
 export interface DecryptedPrescription {
@@ -92,9 +94,15 @@ interface SupabaseConfig {
   serviceRoleKey: string;
 }
 
+const SECRET_KEY_PREFIX = "sb_secret_";
+
+// None of the config errors below may echo the key: these errors reach
+// Sentry and lab_job.last_error.
 function readConfig(): SupabaseConfig {
-  const url = process.env.SUPABASE_URL;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  // Trimmed: a value pasted into the Railway dashboard often carries a stray
+  // space or newline at either end.
+  const url = process.env.SUPABASE_URL?.trim();
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
   if (!url) {
     throw new SupabaseVaultError(
       "config",
@@ -107,7 +115,74 @@ function readConfig(): SupabaseConfig {
       "SUPABASE_SERVICE_ROLE_KEY is not set on the Medusa server",
     );
   }
+  // Both key formats are base64url/base62 (plus `.` in a legacy JWT). A line
+  // break inside a wrapped paste is rejected here because Node's fetch would
+  // otherwise throw an error quoting the whole header value, i.e. the key.
+  // Quotes copied from a .env file would only earn an opaque 401, so they are
+  // rejected too, with a clearer message.
+  if (!/^[A-Za-z0-9._-]+$/.test(serviceRoleKey)) {
+    throw new SupabaseVaultError(
+      "config",
+      "SUPABASE_SERVICE_ROLE_KEY contains characters a Supabase key never has (a line break or quotes?)",
+    );
+  }
+  // Of the new-style keys only a secret key works here. A publishable key
+  // runs as `anon`: RLS would hide the row (surfacing as a misleading
+  // `not_found`) and the decrypt RPC is revoked from anon anyway.
+  if (
+    serviceRoleKey.startsWith("sb_") &&
+    !serviceRoleKey.startsWith(SECRET_KEY_PREFIX)
+  ) {
+    throw new SupabaseVaultError(
+      "config",
+      "SUPABASE_SERVICE_ROLE_KEY holds a Supabase key that is not a secret key; it needs sb_secret_...",
+    );
+  }
   return { url, serviceRoleKey };
+}
+
+/**
+ * Auth headers for Supabase's REST API, chosen by key shape.
+ *
+ * Secret keys (`sb_secret_...`) are opaque strings, not JWTs, and go in the
+ * `apikey` header only; the gateway attaches the service_role JWT itself.
+ * See https://supabase.com/docs/guides/getting-started/migrating-to-new-api-keys
+ *
+ * The legacy JWT `service_role` key (`eyJ...`) keeps the original
+ * apikey + Bearer pair, so this code deploys safely before the env var is
+ * switched to a secret key.
+ */
+function supabaseAuthHeaders(key: string): Record<string, string> {
+  if (key.startsWith(SECRET_KEY_PREFIX)) {
+    return { apikey: key };
+  }
+  return { apikey: key, Authorization: `Bearer ${key}` };
+}
+
+/**
+ * `fetchImpl`, with any thrown error (network failure, rejected header)
+ * replaced by a SupabaseVaultError carrying only a short error code. The
+ * original message can quote request headers, i.e. the key.
+ */
+async function supabaseFetch(
+  fetchImpl: typeof fetch,
+  input: string,
+  init: RequestInit,
+  what: string,
+): Promise<Response> {
+  try {
+    return await fetchImpl(input, init);
+  } catch (err) {
+    const code = (err as { cause?: { code?: unknown } } | null)?.cause?.code;
+    const safeCode =
+      typeof code === "string" && /^[A-Z0-9_]{1,40}$/.test(code)
+        ? code
+        : "network error";
+    throw new SupabaseVaultError(
+      "rpc",
+      `Supabase ${what} request failed (${safeCode})`,
+    );
+  }
 }
 
 /**
@@ -117,8 +192,9 @@ function readConfig(): SupabaseConfig {
  * Throws `SupabaseVaultError("not_found")` if the prescription id
  * doesn't exist, `SupabaseVaultError("status_invalid")` if the row
  * isn't in the `active` status (we never decrypt deleted/expired
- * rows), and propagates network or RPC errors as
- * `SupabaseVaultError("rpc")`.
+ * rows), and turns a failed request (network error, rejected header) or a
+ * non-2xx response into `SupabaseVaultError("rpc")`. An error while reading
+ * a response body is not wrapped; PostgREST always answers in JSON.
  */
 export async function decryptPrescription(
   prescription_id: string,
@@ -126,19 +202,21 @@ export async function decryptPrescription(
 ): Promise<DecryptedPrescription> {
   const { url, serviceRoleKey } = readConfig();
   const fetchImpl = opts.fetch ?? fetch;
+  const authHeaders = supabaseAuthHeaders(serviceRoleKey);
 
   // Pull the encrypted row via PostgREST. The column list is derived from
   // RX_ENC_COLUMNS (see above) so this select can never drift from what
   // dec() below actually decrypts.
-  const rowRes = await fetchImpl(
+  const rowRes = await supabaseFetch(
+    fetchImpl,
     `${url}/rest/v1/prescriptions?id=eq.${encodeURIComponent(prescription_id)}&select=id,status,${RX_ENC_COLUMNS.join(",")}`,
     {
       headers: {
-        apikey: serviceRoleKey,
-        Authorization: `Bearer ${serviceRoleKey}`,
+        ...authHeaders,
         Accept: "application/json",
       },
     },
+    "prescription fetch",
   );
   if (!rowRes.ok) {
     throw new SupabaseVaultError(
@@ -170,19 +248,23 @@ export async function decryptPrescription(
   async function dec(field: RxEncColumn): Promise<number | null> {
     const ciphertext = row[field];
     if (ciphertext === null) return null;
-    const res = await fetchImpl(`${url}/rest/v1/rpc/${RX_DECRYPT_RPC}`, {
-      method: "POST",
-      headers: {
-        apikey: serviceRoleKey,
-        Authorization: `Bearer ${serviceRoleKey}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
+    const res = await supabaseFetch(
+      fetchImpl,
+      `${url}/rest/v1/rpc/${RX_DECRYPT_RPC}`,
+      {
+        method: "POST",
+        headers: {
+          ...authHeaders,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          ciphertext,
+          key_alias: RX_VAULT_KEY_ALIAS,
+        }),
       },
-      body: JSON.stringify({
-        ciphertext,
-        key_alias: RX_VAULT_KEY_ALIAS,
-      }),
-    });
+      `decrypt RPC for ${field}`,
+    );
     if (!res.ok) {
       throw new SupabaseVaultError(
         "rpc",
