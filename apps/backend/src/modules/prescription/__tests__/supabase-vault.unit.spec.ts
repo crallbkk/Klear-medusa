@@ -2,6 +2,7 @@ import {
   decryptPrescription,
   SupabaseVaultError,
   RX_ENC_COLUMNS,
+  supabaseAuthHeaders,
 } from "../supabase-vault";
 
 const PREV_ENV = { ...process.env };
@@ -403,5 +404,110 @@ describe("RX_ENC_COLUMNS drift guard", () => {
     // through as-is — no 50/50 binocular split.
     expect(rx.pd_right).toBe(32);
     expect(rx.pd_left).toBe(34);
+  });
+});
+
+// Supabase's new API keys (sb_secret_...) are not JWTs and must go in the
+// `apikey` header only; the legacy JWT service_role key keeps apikey + Bearer
+// so the deploy is safe before SUPABASE_SERVICE_ROLE_KEY is switched.
+describe("Supabase auth headers by key shape", () => {
+  const LEGACY_KEY = "eyJhbGciOiJIUzI1NiJ9.test-legacy.sig";
+  const SECRET_KEY = "sb_secret_test-only";
+
+  /** Runs a full decrypt (row fetch + 7 RPC calls) and returns the
+   *  normalised headers of every request, in call order. */
+  async function captureHeaders(): Promise<Headers[]> {
+    const seen: Headers[] = [];
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      (_url, init) => {
+        seen.push(new Headers(init?.headers));
+        return makeRowResponse();
+      },
+    ];
+    for (let i = 0; i < 7; i++) {
+      handlers.push((_url, init) => {
+        seen.push(new Headers(init?.headers));
+        return jsonResponse(200, "1");
+      });
+    }
+    const fetchMock = mockFetchSequence(handlers);
+    await decryptPrescription("rx_1", {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(8);
+    return seen;
+  }
+
+  it("sends a secret key as apikey only, with no Authorization header, on the row fetch and every decrypt RPC", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = SECRET_KEY;
+    const seen = await captureHeaders();
+    for (const h of seen) {
+      expect(h.get("apikey")).toBe(SECRET_KEY);
+      expect(h.has("authorization")).toBe(false);
+    }
+  });
+
+  it("keeps apikey + Bearer for the legacy JWT service_role key", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = LEGACY_KEY;
+    const seen = await captureHeaders();
+    for (const h of seen) {
+      expect(h.get("apikey")).toBe(LEGACY_KEY);
+      expect(h.get("authorization")).toBe(`Bearer ${LEGACY_KEY}`);
+    }
+  });
+
+  it("keeps the non-auth headers alongside the key", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = SECRET_KEY;
+    const [rowFetch, ...rpcCalls] = await captureHeaders();
+    expect(rowFetch.get("accept")).toBe("application/json");
+    for (const h of rpcCalls) {
+      expect(h.get("content-type")).toBe("application/json");
+      expect(h.get("accept")).toBe("application/json");
+    }
+  });
+
+  it("trims whitespace pasted around the key before choosing the header shape", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = `  ${SECRET_KEY}\n`;
+    const seen = await captureHeaders();
+    for (const h of seen) {
+      expect(h.get("apikey")).toBe(SECRET_KEY);
+      expect(h.has("authorization")).toBe(false);
+    }
+  });
+
+  it("throws config error when SUPABASE_SERVICE_ROLE_KEY is only whitespace", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "  \n";
+    const fetchMock = jest.fn();
+    await expect(
+      decryptPrescription("rx_1", {
+        fetch: fetchMock as unknown as typeof fetch,
+      }),
+    ).rejects.toMatchObject({
+      name: "SupabaseVaultError",
+      code: "config",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a publishable key with a config error instead of a misleading not_found", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "sb_publishable_test-only";
+    const fetchMock = jest.fn();
+    await expect(
+      decryptPrescription("rx_1", {
+        fetch: fetchMock as unknown as typeof fetch,
+      }),
+    ).rejects.toMatchObject({
+      name: "SupabaseVaultError",
+      code: "config",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("supabaseAuthHeaders picks the shape from the key prefix", () => {
+    expect(supabaseAuthHeaders(SECRET_KEY)).toEqual({ apikey: SECRET_KEY });
+    expect(supabaseAuthHeaders(LEGACY_KEY)).toEqual({
+      apikey: LEGACY_KEY,
+      Authorization: `Bearer ${LEGACY_KEY}`,
+    });
   });
 });

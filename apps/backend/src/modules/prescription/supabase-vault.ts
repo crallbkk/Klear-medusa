@@ -14,7 +14,9 @@
  * Auth: this code runs server-side in Medusa with a Supabase
  * service-role key (SUPABASE_SERVICE_ROLE_KEY). Service-role bypasses
  * RLS, which is appropriate because Medusa workflows are trusted
- * server code, not customer-facing.
+ * server code, not customer-facing. The env var holds either a secret
+ * key (`sb_secret_...`) or the legacy JWT `service_role` key; see
+ * supabaseAuthHeaders() for how each is sent.
  */
 
 export interface DecryptedPrescription {
@@ -94,7 +96,9 @@ interface SupabaseConfig {
 
 function readConfig(): SupabaseConfig {
   const url = process.env.SUPABASE_URL;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  // Trimmed so a key pasted into the Railway dashboard with a stray space or
+  // newline still matches its `sb_` prefix in supabaseAuthHeaders() below.
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
   if (!url) {
     throw new SupabaseVaultError(
       "config",
@@ -107,7 +111,34 @@ function readConfig(): SupabaseConfig {
       "SUPABASE_SERVICE_ROLE_KEY is not set on the Medusa server",
     );
   }
+  // A publishable key runs as `anon`: RLS would hide the row (surfacing as a
+  // misleading `not_found`) and the decrypt RPC is revoked from anon anyway.
+  if (serviceRoleKey.startsWith("sb_publishable_")) {
+    throw new SupabaseVaultError(
+      "config",
+      "SUPABASE_SERVICE_ROLE_KEY holds a publishable key; it needs a secret key (sb_secret_...)",
+    );
+  }
   return { url, serviceRoleKey };
+}
+
+/**
+ * Auth headers for Supabase's REST API, chosen by key shape.
+ *
+ * New-style keys (`sb_secret_...`) are opaque strings, not JWTs, and go in
+ * the `apikey` header only — the gateway attaches the service_role JWT
+ * itself. See
+ * https://supabase.com/docs/guides/getting-started/migrating-to-new-api-keys
+ *
+ * The legacy JWT `service_role` key (`eyJ...`) keeps the original
+ * apikey + Bearer pair, so this code deploys safely before the env var is
+ * switched to a secret key.
+ */
+export function supabaseAuthHeaders(key: string): Record<string, string> {
+  if (key.startsWith("sb_")) {
+    return { apikey: key };
+  }
+  return { apikey: key, Authorization: `Bearer ${key}` };
 }
 
 /**
@@ -134,8 +165,7 @@ export async function decryptPrescription(
     `${url}/rest/v1/prescriptions?id=eq.${encodeURIComponent(prescription_id)}&select=id,status,${RX_ENC_COLUMNS.join(",")}`,
     {
       headers: {
-        apikey: serviceRoleKey,
-        Authorization: `Bearer ${serviceRoleKey}`,
+        ...supabaseAuthHeaders(serviceRoleKey),
         Accept: "application/json",
       },
     },
@@ -173,8 +203,7 @@ export async function decryptPrescription(
     const res = await fetchImpl(`${url}/rest/v1/rpc/${RX_DECRYPT_RPC}`, {
       method: "POST",
       headers: {
-        apikey: serviceRoleKey,
-        Authorization: `Bearer ${serviceRoleKey}`,
+        ...supabaseAuthHeaders(serviceRoleKey),
         "Content-Type": "application/json",
         Accept: "application/json",
       },
