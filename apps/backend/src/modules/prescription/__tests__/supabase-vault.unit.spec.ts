@@ -582,3 +582,218 @@ describe("Supabase auth headers by key shape", () => {
     );
   });
 });
+
+// The storefront treats a missing cylinder as "no astigmatism" and stores no
+// ciphertext for it (Website `src/lib/prescription/schema.ts`). Medusa used to
+// reject such a prescription as `incomplete`, failing the lab job of every
+// customer without astigmatism (seen on a production test order, 27 Oct).
+describe("optional cylinder (no astigmatism)", () => {
+  function rowWith(overrides: Record<string, string | null>): Response {
+    return jsonResponse(200, [
+      {
+        id: "rx_cyl",
+        status: "active",
+        od_sphere_enc: null,
+        od_cylinder_enc: null,
+        od_axis_enc: null,
+        od_add_enc: null,
+        os_sphere_enc: null,
+        os_cylinder_enc: null,
+        os_axis_enc: null,
+        os_add_enc: null,
+        pd_binocular_enc: null,
+        pd_right_enc: null,
+        pd_left_enc: null,
+        ...overrides,
+      },
+    ]);
+  }
+
+  /** Decrypts `row`, answering each RPC call from `plaintexts`. Expects
+   *  exactly one RPC call per non-null ciphertext in the row. */
+  async function decryptWith(
+    row: Response,
+    plaintexts: Record<string, string>,
+  ) {
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      () => row,
+    ];
+    for (let i = 0; i < Object.keys(plaintexts).length; i++) {
+      handlers.push((_url, init) => {
+        const body = JSON.parse((init?.body as string) ?? "{}");
+        return jsonResponse(200, plaintexts[body.ciphertext]);
+      });
+    }
+    const fetchMock = mockFetchSequence(handlers);
+    return decryptPrescription("rx_cyl", {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+  }
+
+  it("decrypts a sphere-only prescription (no cylinder stored) with cylinder 0 on both eyes", async () => {
+    // The exact shape of the 27 Oct production test order's row.
+    const rx = await decryptWith(
+      rowWith({
+        od_sphere_enc: "ct_od_sph",
+        os_sphere_enc: "ct_os_sph",
+        pd_binocular_enc: "ct_pd",
+      }),
+      { ct_od_sph: "-1.75", ct_os_sph: "-2.00", ct_pd: "63" },
+    );
+    expect(rx).toEqual({
+      sph_right: -1.75,
+      sph_left: -2,
+      cyl_right: 0,
+      cyl_left: 0,
+      axis_right: null,
+      axis_left: null,
+      add_right: null,
+      add_left: null,
+      pd_right: 31.5,
+      pd_left: 31.5,
+    });
+  });
+
+  it("fills in 0 only for the eye that has no cylinder", async () => {
+    const rx = await decryptWith(
+      rowWith({
+        od_sphere_enc: "ct_od_sph",
+        os_sphere_enc: "ct_os_sph",
+        od_cylinder_enc: "ct_od_cyl",
+        od_axis_enc: "ct_od_axis",
+        pd_binocular_enc: "ct_pd",
+      }),
+      {
+        ct_od_sph: "-1.00",
+        ct_os_sph: "-1.25",
+        ct_od_cyl: "-0.75",
+        ct_od_axis: "90",
+        ct_pd: "62",
+      },
+    );
+    expect(rx.cyl_right).toBe(-0.75);
+    expect(rx.axis_right).toBe(90);
+    expect(rx.cyl_left).toBe(0);
+    expect(rx.axis_left).toBeNull();
+  });
+
+  it.each([
+    ["right", { os_sphere_enc: "ct_os_sph" }],
+    ["left", { od_sphere_enc: "ct_od_sph" }],
+  ])(
+    "still refuses a prescription without a %s sphere value",
+    async (_eye, sphere) => {
+      const plaintexts: Record<string, string> = { ct_pd: "62" };
+      for (const ct of Object.values(sphere)) plaintexts[ct] = "-1.25";
+      await expect(
+        decryptWith(rowWith({ ...sphere, pd_binocular_enc: "ct_pd" }), plaintexts),
+      ).rejects.toMatchObject({
+        name: "SupabaseVaultError",
+        code: "incomplete",
+        message: expect.stringContaining("missing sphere values"),
+      });
+    },
+  );
+
+  // The storefront never stores an axis without a cylinder, so one means a
+  // cylinder was lost on the way in: fail loudly instead of sending the lab
+  // a sphere-only lens for an astigmatic eye.
+  it.each([
+    ["no cylinder stored (left eye)", { os_axis_enc: "ct_os_axis" }, { ct_os_axis: "90" }],
+    ["no cylinder stored (right eye)", { od_axis_enc: "ct_od_axis" }, { ct_od_axis: "90" }],
+    [
+      "a cylinder of 0 (left eye)",
+      { os_cylinder_enc: "ct_os_cyl", os_axis_enc: "ct_os_axis" },
+      { ct_os_cyl: "0.00", ct_os_axis: "90" },
+    ],
+    [
+      "a cylinder of 0 (right eye)",
+      { od_cylinder_enc: "ct_od_cyl", od_axis_enc: "ct_od_axis" },
+      { ct_od_cyl: "0.00", ct_od_axis: "90" },
+    ],
+    [
+      "a cylinder of -0.00",
+      { os_cylinder_enc: "ct_os_cyl", os_axis_enc: "ct_os_axis" },
+      { ct_os_cyl: "-0.00", ct_os_axis: "90" },
+    ],
+    // 0 is a valid stored axis (AXIS_MIN = 0): a truthy check would miss it.
+    ["no cylinder stored, axis 0", { os_axis_enc: "ct_os_axis" }, { ct_os_axis: "0" }],
+  ])(
+    "refuses an axis with %s, without echoing any value",
+    async (_label, extraCols, extraPlain) => {
+      const err = await decryptWith(
+        rowWith({
+          od_sphere_enc: "ct_od_sph",
+          os_sphere_enc: "ct_os_sph",
+          pd_binocular_enc: "ct_pd",
+          ...extraCols,
+        }),
+        {
+          ct_od_sph: "-1.75",
+          ct_os_sph: "-2.00",
+          ct_pd: "63",
+          ...extraPlain,
+        },
+      ).catch((e: unknown) => e);
+      expect(err).toMatchObject({
+        name: "SupabaseVaultError",
+        code: "incomplete",
+        message: expect.stringContaining("has an axis without a cylinder"),
+      });
+      expect((err as Error).message).not.toMatch(/90|1\.75|2\.00|63/);
+    },
+  );
+});
+
+// The mirror case: a non-zero cylinder needs an axis for the lab to cut it
+// ("AXIS is required when CYL is non-zero" on the storefront). Send-later rows
+// skip that validation, so Medusa checks it too.
+describe("cylinder without an axis", () => {
+  it.each([
+    ["right", "od"],
+    ["left", "os"],
+  ])("refuses a %s-eye cylinder with no axis, without echoing any value", async (_eye, side) => {
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      () =>
+        jsonResponse(200, [
+          {
+            id: "rx_noaxis",
+            status: "active",
+            od_sphere_enc: "ct_od_sph",
+            os_sphere_enc: "ct_os_sph",
+            od_cylinder_enc: null,
+            os_cylinder_enc: null,
+            od_axis_enc: null,
+            os_axis_enc: null,
+            od_add_enc: null,
+            os_add_enc: null,
+            pd_binocular_enc: "ct_pd",
+            pd_right_enc: null,
+            pd_left_enc: null,
+            [`${side}_cylinder_enc`]: "ct_cyl",
+          },
+        ]),
+    ];
+    const plaintexts: Record<string, string> = {
+      ct_od_sph: "-1.75",
+      ct_os_sph: "-2.00",
+      ct_pd: "63",
+      ct_cyl: "-0.75",
+    };
+    for (let i = 0; i < 4; i++) {
+      handlers.push((_url, init) => {
+        const body = JSON.parse((init?.body as string) ?? "{}");
+        return jsonResponse(200, plaintexts[body.ciphertext]);
+      });
+    }
+    const err = await decryptPrescription("rx_noaxis", {
+      fetch: mockFetchSequence(handlers) as unknown as typeof fetch,
+    }).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      name: "SupabaseVaultError",
+      code: "incomplete",
+      message: expect.stringContaining("has a cylinder without an axis"),
+    });
+    expect((err as Error).message).not.toMatch(/0\.75|1\.75|2\.00|63/);
+  });
+});
