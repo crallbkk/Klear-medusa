@@ -2,7 +2,6 @@ import {
   decryptPrescription,
   SupabaseVaultError,
   RX_ENC_COLUMNS,
-  supabaseAuthHeaders,
 } from "../supabase-vault";
 
 const PREV_ENV = { ...process.env };
@@ -489,25 +488,81 @@ describe("Supabase auth headers by key shape", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("refuses a publishable key with a config error instead of a misleading not_found", async () => {
-    process.env.SUPABASE_SERVICE_ROLE_KEY = "sb_publishable_test-only";
-    const fetchMock = jest.fn();
-    await expect(
-      decryptPrescription("rx_1", {
+  // Config errors reach Sentry and lab_job.last_error, so none may echo the
+  // key. Each case must fail before any request goes out.
+  // [label, env value, a fragment of the key that must not leak]
+  it.each([
+    ["a publishable key", "sb_publishable_test-only", "test-only"],
+    ["an unknown sb_ key type", "sb_other_test-only", "test-only"],
+    ["a key with a line break inside (wrapped paste)", "sb_secret_wrap\nped", "sb_secret_wrap"],
+    ["a key with a CRLF inside", "eyJhbGciOiJIUzI1NiJ9.legacy\r\nwrap.sig", "eyJhbGciOiJIUzI1NiJ9"],
+    ["a quoted key", '"sb_secret_test-only"', "test-only"],
+  ])(
+    "refuses %s with a config error that does not echo the key",
+    async (_label, key, fragment) => {
+      process.env.SUPABASE_SERVICE_ROLE_KEY = key;
+      const fetchMock = jest.fn();
+      const err = await decryptPrescription("rx_1", {
         fetch: fetchMock as unknown as typeof fetch,
-      }),
-    ).rejects.toMatchObject({
-      name: "SupabaseVaultError",
-      code: "config",
+      }).catch((e: unknown) => e);
+      expect(err).toMatchObject({ name: "SupabaseVaultError", code: "config" });
+      expect((err as Error).message).not.toContain(fragment);
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("replaces a thrown fetch error that quotes the key with an rpc error that does not", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = SECRET_KEY;
+    const fetchMock = jest.fn(async () => {
+      // Shape of undici's rejection of an invalid header value.
+      throw new TypeError(
+        `Headers.append: "${SECRET_KEY}" is an invalid header value.`,
+      );
     });
-    expect(fetchMock).not.toHaveBeenCalled();
+    const err = await decryptPrescription("rx_1", {
+      fetch: fetchMock as unknown as typeof fetch,
+    }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: "SupabaseVaultError", code: "rpc" });
+    expect((err as Error).message).not.toContain(SECRET_KEY);
+    expect((err as Error).message).toContain("network error");
   });
 
-  it("supabaseAuthHeaders picks the shape from the key prefix", () => {
-    expect(supabaseAuthHeaders(SECRET_KEY)).toEqual({ apikey: SECRET_KEY });
-    expect(supabaseAuthHeaders(LEGACY_KEY)).toEqual({
-      apikey: LEGACY_KEY,
-      Authorization: `Bearer ${LEGACY_KEY}`,
+  it("keeps a network error's code (and only the code) on a failed decrypt RPC", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = LEGACY_KEY;
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      () => makeRowResponse(),
+    ];
+    for (let i = 0; i < 7; i++) {
+      handlers.push(() => {
+        throw Object.assign(new TypeError(`fetch failed for ${LEGACY_KEY}`), {
+          cause: { code: "ECONNRESET" },
+        });
+      });
+    }
+    const err = await decryptPrescription("rx_1", {
+      fetch: mockFetchSequence(handlers) as unknown as typeof fetch,
+    }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: "SupabaseVaultError", code: "rpc" });
+    expect((err as Error).message).toContain("ECONNRESET");
+    expect((err as Error).message).not.toContain(LEGACY_KEY);
+  });
+
+  it("trims whitespace around SUPABASE_URL too", async () => {
+    process.env.SUPABASE_URL = " https://supa.test\n";
+    process.env.SUPABASE_SERVICE_ROLE_KEY = SECRET_KEY;
+    let rowUrl = "";
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      (url) => {
+        rowUrl = url;
+        return makeRowResponse();
+      },
+    ];
+    for (let i = 0; i < 7; i++) handlers.push(() => jsonResponse(200, "1"));
+    await decryptPrescription("rx_1", {
+      fetch: mockFetchSequence(handlers) as unknown as typeof fetch,
     });
+    expect(rowUrl.startsWith("https://supa.test/rest/v1/prescriptions?")).toBe(
+      true,
+    );
   });
 });
