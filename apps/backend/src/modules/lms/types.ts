@@ -45,7 +45,8 @@ export interface PrescriptionData {
   // Sphere (THB convention — diopter, half-step from −20.0 to +20.0).
   sph_right: number;
   sph_left: number;
-  // Cylinder (0 to −6.0, half-step).
+  // Cylinder (0 to −6.0, half-step). 0 = no astigmatism (sphere-only lens),
+  // which is also what a prescription stored without a cylinder decrypts to.
   cyl_right: number;
   cyl_left: number;
   // Axis (0–180 integer; required when cyl ≠ 0).

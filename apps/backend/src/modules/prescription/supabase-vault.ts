@@ -23,7 +23,8 @@ export interface DecryptedPrescription {
   // Sphere — diopter, half-step from −20.0 to +20.0
   sph_right: number;
   sph_left: number;
-  // Cylinder — 0 to −6.0, half-step
+  // Cylinder — 0 to −6.0, half-step; 0 when the stored Rx has none (no
+  // astigmatism, a sphere-only lens)
   cyl_right: number;
   cyl_left: number;
   // Axis — 0–180 integer, required when cyl ≠ 0
@@ -308,8 +309,12 @@ export async function decryptPrescription(
 
   const sph_right = decrypted.od_sphere_enc;
   const sph_left = decrypted.os_sphere_enc;
-  const cyl_right = decrypted.od_cylinder_enc;
-  const cyl_left = decrypted.os_cylinder_enc;
+  // Cylinder is optional. The storefront stores none when the customer has
+  // no astigmatism (Website `src/lib/prescription/schema.ts`: "null treated
+  // as no astigmatism correction"); for the lab that is a cylinder of 0, a
+  // sphere-only lens. `??`, not `||`: a decrypted 0 is a real value.
+  const cyl_right = decrypted.od_cylinder_enc ?? 0;
+  const cyl_left = decrypted.os_cylinder_enc ?? 0;
   const axis_right = decrypted.od_axis_enc;
   const axis_left = decrypted.os_axis_enc;
   const add_right = decrypted.od_add_enc;
@@ -322,12 +327,6 @@ export async function decryptPrescription(
     throw new SupabaseVaultError(
       "incomplete",
       `Prescription ${prescription_id} missing sphere values`,
-    );
-  }
-  if (cyl_right === null || cyl_left === null) {
-    throw new SupabaseVaultError(
-      "incomplete",
-      `Prescription ${prescription_id} missing cylinder values`,
     );
   }
   // PD → MONOCULAR (per-eye) for the lab. Monocular values are kept as-is;
