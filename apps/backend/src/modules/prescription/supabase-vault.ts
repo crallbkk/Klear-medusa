@@ -20,7 +20,7 @@
  */
 
 export interface DecryptedPrescription {
-  // Sphere — diopter, half-step from −20.0 to +20.0
+  // Sphere — diopter, 0.25 steps
   sph_right: number;
   sph_left: number;
   // Cylinder — diopter, 0.25 steps, minus or plus notation as written on the
@@ -28,6 +28,7 @@ export interface DecryptedPrescription {
   cyl_right: number;
   cyl_left: number;
   // Axis — 0–180 integer, required when cyl ≠ 0 and never set when cyl is 0
+  // (decryptPrescription refuses either mismatch)
   axis_right: number | null;
   axis_left: number | null;
   // Add — progressives + readers only
@@ -328,9 +329,10 @@ export async function decryptPrescription(
       `Prescription ${prescription_id} missing sphere values`,
     );
   }
-  // An axis without a cylinder is never valid (the storefront rejects it:
-  // "AXIS should not be set when CYL is 0"). It means a cylinder was lost on
-  // the way in, so fail rather than send the lab a sphere-only lens.
+  // Cylinder and axis come as a pair. The storefront enforces both
+  // directions ("AXIS is required when CYL is non-zero", "AXIS should not be
+  // set when CYL is 0"), so one without the other means a value was lost on
+  // the way in: fail rather than send the lab a lens it would cut wrong.
   if (
     (cyl_right === 0 && axis_right !== null) ||
     (cyl_left === 0 && axis_left !== null)
@@ -338,6 +340,15 @@ export async function decryptPrescription(
     throw new SupabaseVaultError(
       "incomplete",
       `Prescription ${prescription_id} has an axis without a cylinder`,
+    );
+  }
+  if (
+    (cyl_right !== 0 && axis_right === null) ||
+    (cyl_left !== 0 && axis_left === null)
+  ) {
+    throw new SupabaseVaultError(
+      "incomplete",
+      `Prescription ${prescription_id} has a cylinder without an axis`,
     );
   }
   // PD → MONOCULAR (per-eye) for the lab. Monocular values are kept as-is;

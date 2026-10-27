@@ -706,6 +706,18 @@ describe("optional cylinder (no astigmatism)", () => {
       { os_cylinder_enc: "ct_os_cyl", os_axis_enc: "ct_os_axis" },
       { ct_os_cyl: "0.00", ct_os_axis: "90" },
     ],
+    [
+      "a cylinder of 0 (right eye)",
+      { od_cylinder_enc: "ct_od_cyl", od_axis_enc: "ct_od_axis" },
+      { ct_od_cyl: "0.00", ct_od_axis: "90" },
+    ],
+    [
+      "a cylinder of -0.00",
+      { os_cylinder_enc: "ct_os_cyl", os_axis_enc: "ct_os_axis" },
+      { ct_os_cyl: "-0.00", ct_os_axis: "90" },
+    ],
+    // 0 is a valid stored axis (AXIS_MIN = 0): a truthy check would miss it.
+    ["no cylinder stored, axis 0", { os_axis_enc: "ct_os_axis" }, { ct_os_axis: "0" }],
   ])(
     "refuses an axis with %s, without echoing any value",
     async (_label, extraCols, extraPlain) => {
@@ -731,4 +743,57 @@ describe("optional cylinder (no astigmatism)", () => {
       expect((err as Error).message).not.toMatch(/90|1\.75|2\.00|63/);
     },
   );
+});
+
+// The mirror case: a non-zero cylinder needs an axis for the lab to cut it
+// ("AXIS is required when CYL is non-zero" on the storefront). Send-later rows
+// skip that validation, so Medusa checks it too.
+describe("cylinder without an axis", () => {
+  it.each([
+    ["right", "od"],
+    ["left", "os"],
+  ])("refuses a %s-eye cylinder with no axis, without echoing any value", async (_eye, side) => {
+    const handlers: Array<(url: string, init?: RequestInit) => Response> = [
+      () =>
+        jsonResponse(200, [
+          {
+            id: "rx_noaxis",
+            status: "active",
+            od_sphere_enc: "ct_od_sph",
+            os_sphere_enc: "ct_os_sph",
+            od_cylinder_enc: null,
+            os_cylinder_enc: null,
+            od_axis_enc: null,
+            os_axis_enc: null,
+            od_add_enc: null,
+            os_add_enc: null,
+            pd_binocular_enc: "ct_pd",
+            pd_right_enc: null,
+            pd_left_enc: null,
+            [`${side}_cylinder_enc`]: "ct_cyl",
+          },
+        ]),
+    ];
+    const plaintexts: Record<string, string> = {
+      ct_od_sph: "-1.75",
+      ct_os_sph: "-2.00",
+      ct_pd: "63",
+      ct_cyl: "-0.75",
+    };
+    for (let i = 0; i < 4; i++) {
+      handlers.push((_url, init) => {
+        const body = JSON.parse((init?.body as string) ?? "{}");
+        return jsonResponse(200, plaintexts[body.ciphertext]);
+      });
+    }
+    const err = await decryptPrescription("rx_noaxis", {
+      fetch: mockFetchSequence(handlers) as unknown as typeof fetch,
+    }).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      name: "SupabaseVaultError",
+      code: "incomplete",
+      message: expect.stringContaining("has a cylinder without an axis"),
+    });
+    expect((err as Error).message).not.toMatch(/0\.75|1\.75|2\.00|63/);
+  });
 });

@@ -42,7 +42,7 @@ export function lensRequiresPrescription(lensType: LensType): boolean {
 }
 
 export interface PrescriptionData {
-  // Sphere (THB convention — diopter, half-step from −20.0 to +20.0).
+  // Sphere (diopter, 0.25 steps).
   sph_right: number;
   sph_left: number;
   // Cylinder (0.25 steps, minus or plus notation as written). 0 = no
@@ -50,7 +50,8 @@ export interface PrescriptionData {
   // without a cylinder decrypts to.
   cyl_right: number;
   cyl_left: number;
-  // Axis (0–180 integer; required when cyl ≠ 0, never set when cyl is 0).
+  // Axis (0–180 integer; required when cyl ≠ 0, never set when cyl is 0 —
+  // the prescription module's decrypt refuses either mismatch).
   axis_right: number | null;
   axis_left: number | null;
   // Add (progressives + readers only).
