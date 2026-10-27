@@ -23,11 +23,11 @@ export interface DecryptedPrescription {
   // Sphere — diopter, half-step from −20.0 to +20.0
   sph_right: number;
   sph_left: number;
-  // Cylinder — 0 to −6.0, half-step; 0 when the stored Rx has none (no
-  // astigmatism, a sphere-only lens)
+  // Cylinder — diopter, 0.25 steps, minus or plus notation as written on the
+  // Rx; 0 when the stored Rx has none (no astigmatism, a sphere-only lens)
   cyl_right: number;
   cyl_left: number;
-  // Axis — 0–180 integer, required when cyl ≠ 0
+  // Axis — 0–180 integer, required when cyl ≠ 0 and never set when cyl is 0
   axis_right: number | null;
   axis_left: number | null;
   // Add — progressives + readers only
@@ -35,8 +35,7 @@ export interface DecryptedPrescription {
   add_left: number | null;
   // Pupillary distance, mm — ALWAYS monocular (per-eye). KLEAR.md §10: the
   // lab + edger need per-eye PD, never a summed binocular value. When the
-  // stored Rx only has a binocular PD, it is split 50/50 across both eyes
-  // (mirrors the storefront's `splitPd` in `src/lib/lms/job-creator.ts`).
+  // stored Rx only has a binocular PD, it is split 50/50 across both eyes.
   pd_right: number;
   pd_left: number;
 }
@@ -312,7 +311,7 @@ export async function decryptPrescription(
   // Cylinder is optional. The storefront stores none when the customer has
   // no astigmatism (Website `src/lib/prescription/schema.ts`: "null treated
   // as no astigmatism correction"); for the lab that is a cylinder of 0, a
-  // sphere-only lens. `??`, not `||`: a decrypted 0 is a real value.
+  // sphere-only lens.
   const cyl_right = decrypted.od_cylinder_enc ?? 0;
   const cyl_left = decrypted.os_cylinder_enc ?? 0;
   const axis_right = decrypted.od_axis_enc;
@@ -329,9 +328,20 @@ export async function decryptPrescription(
       `Prescription ${prescription_id} missing sphere values`,
     );
   }
+  // An axis without a cylinder is never valid (the storefront rejects it:
+  // "AXIS should not be set when CYL is 0"). It means a cylinder was lost on
+  // the way in, so fail rather than send the lab a sphere-only lens.
+  if (
+    (cyl_right === 0 && axis_right !== null) ||
+    (cyl_left === 0 && axis_left !== null)
+  ) {
+    throw new SupabaseVaultError(
+      "incomplete",
+      `Prescription ${prescription_id} has an axis without a cylinder`,
+    );
+  }
   // PD → MONOCULAR (per-eye) for the lab. Monocular values are kept as-is;
-  // a binocular-only Rx is halved 50/50 into each eye. This matches the
-  // storefront `splitPd` semantics (Website `src/lib/lms/job-creator.ts`).
+  // a binocular-only Rx is halved 50/50 into each eye.
   let pd_right_out: number;
   let pd_left_out: number;
   if (pd_right !== null && pd_left !== null) {

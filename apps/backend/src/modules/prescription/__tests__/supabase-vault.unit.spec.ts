@@ -677,16 +677,58 @@ describe("optional cylinder (no astigmatism)", () => {
     expect(rx.axis_left).toBeNull();
   });
 
-  it("still refuses a prescription without a sphere value", async () => {
-    await expect(
-      decryptWith(
-        rowWith({ os_sphere_enc: "ct_os_sph", pd_binocular_enc: "ct_pd" }),
-        { ct_os_sph: "-1.25", ct_pd: "62" },
-      ),
-    ).rejects.toMatchObject({
-      name: "SupabaseVaultError",
-      code: "incomplete",
-      message: expect.stringContaining("missing sphere values"),
-    });
-  });
+  it.each([
+    ["right", { os_sphere_enc: "ct_os_sph" }],
+    ["left", { od_sphere_enc: "ct_od_sph" }],
+  ])(
+    "still refuses a prescription without a %s sphere value",
+    async (_eye, sphere) => {
+      const plaintexts: Record<string, string> = { ct_pd: "62" };
+      for (const ct of Object.values(sphere)) plaintexts[ct] = "-1.25";
+      await expect(
+        decryptWith(rowWith({ ...sphere, pd_binocular_enc: "ct_pd" }), plaintexts),
+      ).rejects.toMatchObject({
+        name: "SupabaseVaultError",
+        code: "incomplete",
+        message: expect.stringContaining("missing sphere values"),
+      });
+    },
+  );
+
+  // The storefront never stores an axis without a cylinder, so one means a
+  // cylinder was lost on the way in: fail loudly instead of sending the lab
+  // a sphere-only lens for an astigmatic eye.
+  it.each([
+    ["no cylinder stored (left eye)", { os_axis_enc: "ct_os_axis" }, { ct_os_axis: "90" }],
+    ["no cylinder stored (right eye)", { od_axis_enc: "ct_od_axis" }, { ct_od_axis: "90" }],
+    [
+      "a cylinder of 0 (left eye)",
+      { os_cylinder_enc: "ct_os_cyl", os_axis_enc: "ct_os_axis" },
+      { ct_os_cyl: "0.00", ct_os_axis: "90" },
+    ],
+  ])(
+    "refuses an axis with %s, without echoing any value",
+    async (_label, extraCols, extraPlain) => {
+      const err = await decryptWith(
+        rowWith({
+          od_sphere_enc: "ct_od_sph",
+          os_sphere_enc: "ct_os_sph",
+          pd_binocular_enc: "ct_pd",
+          ...extraCols,
+        }),
+        {
+          ct_od_sph: "-1.75",
+          ct_os_sph: "-2.00",
+          ct_pd: "63",
+          ...extraPlain,
+        },
+      ).catch((e: unknown) => e);
+      expect(err).toMatchObject({
+        name: "SupabaseVaultError",
+        code: "incomplete",
+        message: expect.stringContaining("has an axis without a cylinder"),
+      });
+      expect((err as Error).message).not.toMatch(/90|1\.75|2\.00|63/);
+    },
+  );
 });
