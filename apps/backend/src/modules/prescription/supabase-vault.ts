@@ -116,9 +116,10 @@ function readConfig(): SupabaseConfig {
     );
   }
   // Both key formats are base64url/base62 (plus `.` in a legacy JWT). A line
-  // break inside a wrapped paste, or surrounding quotes, is rejected here:
-  // Node's fetch would otherwise throw an error quoting the whole header
-  // value, i.e. the key.
+  // break inside a wrapped paste is rejected here because Node's fetch would
+  // otherwise throw an error quoting the whole header value, i.e. the key.
+  // Quotes copied from a .env file would only earn an opaque 401, so they are
+  // rejected too, with a clearer message.
   if (!/^[A-Za-z0-9._-]+$/.test(serviceRoleKey)) {
     throw new SupabaseVaultError(
       "config",
@@ -191,8 +192,9 @@ async function supabaseFetch(
  * Throws `SupabaseVaultError("not_found")` if the prescription id
  * doesn't exist, `SupabaseVaultError("status_invalid")` if the row
  * isn't in the `active` status (we never decrypt deleted/expired
- * rows), and propagates network or RPC errors as
- * `SupabaseVaultError("rpc")`.
+ * rows), and turns a failed request (network error, rejected header) or a
+ * non-2xx response into `SupabaseVaultError("rpc")`. An error while reading
+ * a response body is not wrapped; PostgREST always answers in JSON.
  */
 export async function decryptPrescription(
   prescription_id: string,

@@ -484,6 +484,7 @@ describe("Supabase auth headers by key shape", () => {
     ).rejects.toMatchObject({
       name: "SupabaseVaultError",
       code: "config",
+      message: expect.stringContaining("is not set"),
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -544,6 +545,21 @@ describe("Supabase auth headers by key shape", () => {
     }).catch((e: unknown) => e);
     expect(err).toMatchObject({ name: "SupabaseVaultError", code: "rpc" });
     expect((err as Error).message).toContain("ECONNRESET");
+    expect((err as Error).message).not.toContain(LEGACY_KEY);
+  });
+
+  it("drops a network error code that is not a plain code (it could carry the key)", async () => {
+    process.env.SUPABASE_SERVICE_ROLE_KEY = LEGACY_KEY;
+    const fetchMock = jest.fn(async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: { code: `bad ${LEGACY_KEY}` },
+      });
+    });
+    const err = await decryptPrescription("rx_1", {
+      fetch: fetchMock as unknown as typeof fetch,
+    }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: "SupabaseVaultError", code: "rpc" });
+    expect((err as Error).message).toContain("network error");
     expect((err as Error).message).not.toContain(LEGACY_KEY);
   });
 
