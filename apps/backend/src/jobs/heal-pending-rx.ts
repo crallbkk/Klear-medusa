@@ -38,7 +38,9 @@ export default async function healPendingRxJob(
 ): Promise<void> {
   const lms = container.resolve(LMS_MODULE) as LmsModuleService;
 
-  const pending = await lms.listJobsByStatus("pending_rx");
+  // All of them, not a capped page: a capped oldest-first page would return
+  // the same never-answered jobs every run and never reach newer ones.
+  const pending = await lms.listAllJobIdsByStatus("pending_rx");
   if (pending.length === 0) return;
 
   let healed = 0;

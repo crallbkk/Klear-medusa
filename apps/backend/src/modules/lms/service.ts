@@ -261,13 +261,41 @@ class LmsModuleService extends MedusaService({
     status: LabJobStatusValue,
     limit = 100,
   ): Promise<LabJobRow[]> {
-    // Oldest-first: with a `take` cap, ordering ensures a large backlog of
-    // never-answered pending_rx rows can't repeatedly return the same head set
-    // and starve newer, healable jobs from ever being swept.
+    // Oldest-first and capped: a page for the admin queue. NOT for sweeps:
+    // a capped oldest-first page returns the same head set every time, so a
+    // backlog of never-answered rows would hide every newer one. Sweeps use
+    // `listAllJobIdsByStatus`.
     return (await this.listLabJobs(
       { status },
       { take: limit, order: { created_at: "ASC" } },
     )) as unknown as LabJobRow[];
+  }
+
+  /**
+   * EVERY job in a status, oldest first, paged so none is skipped. Ids and
+   * order ids only: the sweep that uses it rebuilds each job from the order,
+   * so it never needs (or loads) the snapshot and its prescription.
+   */
+  async listAllJobIdsByStatus(
+    status: LabJobStatusValue,
+  ): Promise<Array<Pick<LabJobRow, "id" | "order_id" | "status">>> {
+    const PAGE = 500;
+    const out: Array<Pick<LabJobRow, "id" | "order_id" | "status">> = [];
+    for (let skip = 0; ; skip += PAGE) {
+      const page = (await this.listLabJobs(
+        { status },
+        {
+          select: ["id", "order_id", "status"],
+          take: PAGE,
+          skip,
+          // id breaks created_at ties so paging never skips or repeats a row.
+          order: { created_at: "ASC", id: "ASC" },
+        },
+      )) as unknown as Array<Pick<LabJobRow, "id" | "order_id" | "status">>;
+      out.push(...page);
+      if (page.length < PAGE) break;
+    }
+    return out;
   }
 
   /**

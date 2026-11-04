@@ -165,6 +165,11 @@ function supabaseAuthHeaders(key: string): Record<string, string> {
  * replaced by a SupabaseVaultError carrying only a short error code. The
  * original message can quote request headers, i.e. the key.
  */
+/** Per-request limit. A hung Supabase must not hold the order.placed
+ *  subscriber (or an admin retry) open forever; a timeout fails the build
+ *  into a durable `failed` lab job that a retry heals. */
+export const SUPABASE_REQUEST_TIMEOUT_MS = 15_000;
+
 async function supabaseFetch(
   fetchImpl: typeof fetch,
   input: string,
@@ -172,8 +177,17 @@ async function supabaseFetch(
   what: string,
 ): Promise<Response> {
   try {
-    return await fetchImpl(input, init);
+    return await fetchImpl(input, {
+      ...init,
+      signal: AbortSignal.timeout(SUPABASE_REQUEST_TIMEOUT_MS),
+    });
   } catch (err) {
+    if ((err as { name?: unknown } | null)?.name === "TimeoutError") {
+      throw new SupabaseVaultError(
+        "rpc",
+        `Supabase ${what} request timed out after ${SUPABASE_REQUEST_TIMEOUT_MS / 1000}s`,
+      );
+    }
     const code = (err as { cause?: { code?: unknown } } | null)?.cause?.code;
     const safeCode =
       typeof code === "string" && /^[A-Z0-9_]{1,40}$/.test(code)

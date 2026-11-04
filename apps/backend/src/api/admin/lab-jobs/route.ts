@@ -10,7 +10,8 @@ import type LmsModuleService from "../../../modules/lms/service";
  * Requires admin auth (Medusa Admin's standard auth gate; the route
  * lives under /admin and is gated by the dashboard cookie).
  *
- * Status filter: ?status=queued|submitted|failed|cancelled
+ * Status filter: ?status=queued|submitting|submitted|failed|cancelled|pending_rx
+ *   (oldest first: the work queue). Without a status: newest first.
  * Limit: ?limit=N (default 100, max 500)
  *
  * Response shape mirrors the LabJobRow type from lms/service.ts.
@@ -55,7 +56,12 @@ export async function GET(
       limit,
     );
   } else {
-    jobs = await lms.listLabJobs({}, { take: limit });
+    // Newest first. Without an order Postgres returns rows in no defined
+    // order, so the capped list could leave out the jobs ops is looking for.
+    jobs = await lms.listLabJobs(
+      {},
+      { take: limit, order: { created_at: "DESC", id: "DESC" } },
+    );
   }
 
   res.json({ jobs, count: jobs.length });

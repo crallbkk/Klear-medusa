@@ -378,6 +378,85 @@ describe("ShippopFulfillmentService — Medusa fulfillment adapter", () => {
     expect(input.reference.ref_no_2).toBe("KLR-ABCDEF");
   });
 
+  describe("one pair = frame line + lens line", () => {
+    const ADDRESS = {
+      address_1: "99/1",
+      city: "Bang Rak",
+      province: "Bangkok",
+      postal_code: "10500",
+      phone: "0800000001",
+      first_name: "Customer",
+      last_name: "One",
+    };
+    type Items = Parameters<ShippopFulfillmentService["createFulfillment"]>[1];
+    type Order = Parameters<ShippopFulfillmentService["createFulfillment"]>[2];
+    type Ful = Parameters<ShippopFulfillmentService["createFulfillment"]>[3];
+
+    async function book(items: Items, order: Record<string, unknown>) {
+      const stub = new StubProvider();
+      const svc = makeService(stub);
+      await svc.createFulfillment(
+        { courier_code: "FLE" },
+        items,
+        { id: "order_01", shipping_address: ADDRESS, ...order } as unknown as Order,
+        { id: "ful_1" } as unknown as Ful,
+      );
+      return stub.calls.find((c) => c.method === "createShipment")!.args[0] as {
+        parcel: { weight_g: number };
+        declared_value_thb: number;
+      };
+    }
+
+    const PAIR: Items = [
+      { id: "fi_1", line_item_id: "li_frame", sku: "KLR-RD-001-BLACK-M", quantity: 1 },
+      { id: "fi_2", line_item_id: "li_lens", sku: "KLR-LENS-SV167", quantity: 1 },
+    ];
+
+    it("weighs one pair as one case, not two", async () => {
+      const input = await book(PAIR, {});
+      expect(input.parcel.weight_g).toBe(300);
+    });
+
+    it("declares the price actually paid for frame + lens", async () => {
+      const input = await book(PAIR, {
+        items: [
+          { id: "li_frame", unit_price: 600, quantity: 1 },
+          { id: "li_lens", unit_price: 1890, quantity: 1 },
+        ],
+      });
+      expect(input.declared_value_thb).toBe(2490);
+    });
+
+    it("falls back to 1,500 THB per pair (not per line) without order prices", async () => {
+      const input = await book(PAIR, {});
+      expect(input.declared_value_thb).toBe(1500);
+    });
+
+    it("counts frame quantity", async () => {
+      const input = await book(
+        [{ id: "fi_1", line_item_id: "li_frame", sku: "KLR-SQ-002", quantity: 2 }],
+        {},
+      );
+      expect(input.parcel.weight_g).toBe(600);
+      expect(input.declared_value_thb).toBe(3000);
+    });
+  });
+
+  it("calculatePrice never quotes another carrier's rate for the chosen one", async () => {
+    const stub = new StubProvider();
+    stub.ratesResult = [
+      { carrier: "KRYX", carrier_name: "Kerry Express", price_thb: 25, estimate_time: "", available: true },
+    ];
+    const svc = makeService(stub);
+    await expect(
+      svc.calculatePrice(
+        { courier_code: "FLE" } as never,
+        {} as never,
+        { shipping_address: { postal_code: "10500", city: "Bang Rak", province: "Bangkok" } } as never,
+      ),
+    ).rejects.toThrow(/No rate returned by Shippop for carrier FLE/);
+  });
+
   it("cancelFulfillment calls cancelShipment with the courier AWB from fulfillment data", async () => {
     const stub = new StubProvider();
     const svc = makeService(stub);

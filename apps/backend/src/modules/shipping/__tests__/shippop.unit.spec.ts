@@ -391,3 +391,36 @@ describe("mapShippopTrackingStatus", () => {
     expect(mapShippopTrackingStatus("")).toBe("in_transit");
   });
 });
+
+describe("ShippopProvider — request timeout and network errors", () => {
+  const CONFIG = { api_key: "secret-key", api_base_url: "https://shippop.test", webhook_path_secret: "p" };
+
+  it("sends every request with an abort signal", async () => {
+    let signal: unknown;
+    const provider = new ShippopProvider(CONFIG, async (_u, init) => {
+      signal = init?.signal;
+      return { ok: true, status: 200, text: async () => JSON.stringify({ status: true }) };
+    });
+    await provider.cancelShipment("TH1");
+    expect(signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("reports a timeout as ShippingError('timeout')", async () => {
+    const provider = new ShippopProvider(CONFIG, async () => {
+      const err = new Error("aborted");
+      err.name = "TimeoutError";
+      throw err;
+    });
+    await expect(provider.cancelShipment("TH1")).rejects.toMatchObject({ code: "timeout" });
+  });
+
+  it("never echoes the request (api_key) in a network error", async () => {
+    const provider = new ShippopProvider(CONFIG, async () => {
+      throw new TypeError("fetch failed for body api_key=secret-key");
+    });
+    const p = provider.cancelShipment("TH1");
+    await expect(p).rejects.toBeInstanceOf(ShippingError);
+    await expect(p).rejects.toMatchObject({ code: "network_error" });
+    await expect(provider.cancelShipment("TH1")).rejects.not.toThrow(/secret-key/);
+  });
+});

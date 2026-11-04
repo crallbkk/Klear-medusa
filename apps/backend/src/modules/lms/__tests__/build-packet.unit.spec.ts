@@ -4,7 +4,7 @@ import {
   RX_METADATA_SECRET_ENV,
   signPrescriptionId,
 } from "../../prescription/rx-signature";
-import { Modules } from "@medusajs/framework/utils";
+import { MedusaError, Modules } from "@medusajs/framework/utils";
 import type { PrescriptionData } from "../types";
 
 const TEST_SECRET = "unit-test-rx-secret";
@@ -607,5 +607,31 @@ describe("buildLabJobPacket — prescription signature (PDPA gate)", () => {
     });
     expect(result.outcome).toBe("ok");
     expect(decryptForLabHandoff).toHaveBeenCalledWith("rx_ORDER");
+  });
+});
+
+describe("buildLabJobPacket — the order is gone", () => {
+  function containerThrowing(err: unknown) {
+    return {
+      resolve: jest.fn((key: string) => {
+        if (key === Modules.ORDER) return { retrieveOrder: jest.fn().mockRejectedValue(err) };
+        throw new Error(`unexpected resolve(${key})`);
+      }),
+    };
+  }
+
+  it("a NOT_FOUND order is a durable failure, not a throw", async () => {
+    const container = containerThrowing(
+      new MedusaError(MedusaError.Types.NOT_FOUND, "Order with id: order_x was not found"),
+    );
+    const r = await buildLabJobPacket({ container: container as never, orderId: "order_x" });
+    expect(r).toMatchObject({ outcome: "failed", reason: "order order_x not found" });
+  });
+
+  it("any other order-module error still throws (infra, retried)", async () => {
+    const container = containerThrowing(new Error("connection refused"));
+    await expect(
+      buildLabJobPacket({ container: container as never, orderId: "order_x" }),
+    ).rejects.toThrow("connection refused");
   });
 });

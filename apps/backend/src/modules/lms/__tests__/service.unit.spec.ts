@@ -495,3 +495,26 @@ describe("LmsModuleService.listJobsHoldingRx", () => {
     expect(new Set(held.map((j) => j.id)).size).toBe(1100);
   });
 });
+
+describe("LmsModuleService.listAllJobIdsByStatus", () => {
+  it("returns every job in the status across pages, without the snapshot", async () => {
+    const { service } = makeService();
+    const all = Array.from({ length: 1234 }, (_, i) => ({
+      id: `j${i}`,
+      order_id: `o${i}`,
+      status: "pending_rx",
+    }));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const list = jest.fn(async (_sel: unknown, cfg: any) => all.slice(cfg.skip, cfg.skip + cfg.take));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (service as any).listLabJobs = list;
+
+    const jobs = await service.listAllJobIdsByStatus("pending_rx");
+    expect(jobs).toHaveLength(1234);
+    expect(new Set(jobs.map((j) => j.id)).size).toBe(1234);
+    const [selector, cfg] = list.mock.calls[0];
+    expect(selector).toEqual({ status: "pending_rx" });
+    expect(cfg.select).not.toContain("packet_snapshot");
+    expect(cfg.order).toEqual({ created_at: "ASC", id: "ASC" });
+  });
+});

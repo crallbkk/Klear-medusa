@@ -7,6 +7,7 @@ import {
   type TrackingEvent,
   type ShippingWebhookEvent,
   type ThaiCarrier,
+  isShippingProvider,
 } from "./types";
 import { UnconfiguredShippopProvider } from "./providers/_unconfigured";
 import { ShippopProvider } from "./providers/shippop";
@@ -19,10 +20,10 @@ export const SHIPPING_MODULE = "klear_shipping";
 // from env (SHIPPING_DEFAULT_CARRIER, default "FLE" = Flash Express);
 // per-shipment overrides flow through createShipment.input.carrier.
 //
-// Architectural note: this module is currently invoked from subscribers
-// and admin actions, not from Medusa's native fulfillment lifecycle. The
-// conversion to an `AbstractFulfillmentProviderService` is tracked as
-// task 2.11 in DEV_TRACKER.md.
+// Architectural note: Medusa's fulfillment lifecycle goes through the native
+// adapter in `./provider` (ShippopFulfillmentService, registered in
+// medusa-config.ts). This plain service backs the webhook route's
+// verify-and-parse step.
 
 function resolveProvider(): IShippingProvider {
   const apiKey = process.env.SHIPPOP_API_KEY;
@@ -48,8 +49,14 @@ export default class ShippingModuleService {
   private readonly provider: IShippingProvider;
   private readonly defaultCarrier: ThaiCarrier;
 
-  constructor(_container?: unknown, providerOverride?: IShippingProvider) {
-    this.provider = providerOverride ?? resolveProvider();
+  // `providerOverride` is for tests. Medusa itself calls
+  // `new ShippingModuleService(container, moduleOptions)`, so the second arg
+  // is the (empty) module options object at runtime: only a real provider is
+  // accepted as an override.
+  constructor(_container?: unknown, providerOverride?: unknown) {
+    this.provider = isShippingProvider(providerOverride)
+      ? providerOverride
+      : resolveProvider();
     this.defaultCarrier = resolveDefaultCarrier();
   }
 

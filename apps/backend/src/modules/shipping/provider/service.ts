@@ -23,8 +23,9 @@ import type {
   ThaiAddress,
   ThaiCarrier,
 } from "../types";
-import { shippopTrackingUrl } from "../types";
+import { isShippingProvider, shippopTrackingUrl } from "../types";
 import { str, thaiAddressLevels } from "../../../lib/thai-address";
+import { isLensSku } from "../../../lib/catalogue";
 
 // Medusa-native fulfillment-provider adapter wrapping ShippopProvider.
 //
@@ -93,12 +94,14 @@ export class ShippopFulfillmentService extends AbstractFulfillmentProviderServic
   constructor(
     { logger }: InjectedDependencies,
     options: ShippopFulfillmentOptions,
-    providerOverride?: IShippingProvider
+    providerOverride?: unknown
   ) {
     super();
     this.logger_ = logger;
     this.options_ = options;
-    this.provider_ = providerOverride ?? buildProvider();
+    // Test seam only: accept the override solely when it is a real provider,
+    // never whatever Medusa passes positionally.
+    this.provider_ = isShippingProvider(providerOverride) ? providerOverride : buildProvider();
   }
 
   async getFulfillmentOptions(): Promise<FulfillmentOption[]> {
@@ -150,7 +153,9 @@ export class ShippopFulfillmentService extends AbstractFulfillmentProviderServic
       declared_value_thb: estimateDeclaredValueThb(context),
       carriers: [courier],
     });
-    const match = rates.find((r) => r.carrier === courier) ?? rates[0];
+    // Only the selected carrier's rate. Falling back to another carrier's
+    // price would quote the customer for one courier and book another.
+    const match = rates.find((r) => r.carrier === courier);
     if (!match) {
       throw new Error(`No rate returned by Shippop for carrier ${courier}`);
     }
@@ -177,7 +182,7 @@ export class ShippopFulfillmentService extends AbstractFulfillmentProviderServic
     const publicCode = (order?.metadata?.public_code as string | undefined) ?? orderId;
     const idempotencyKey = (fulfillment.id ?? `${orderId}_${Date.now()}`) as string;
 
-    const declaredValue = estimateDeclaredValueFromItems(items);
+    const declaredValue = estimateDeclaredValueFromItems(items, order);
     const parcel = computeParcelFromItems(items, this.options_.default_parcel);
 
     const shipment = await this.provider_.createShipment({
@@ -330,21 +335,63 @@ function estimateDeclaredValueThb(context: CalculateShippingOptionPriceDTO["cont
   return Math.max(1, Math.round(Number(total)));
 }
 
-function estimateDeclaredValueFromItems(items: Partial<Omit<FulfillmentItemDTO, "fulfillment">>[]): number {
-  // Items don't carry unit_price in the FulfillmentItem DTO; fall back to a
-  // conservative default. Future PR: thread the order subtotal through.
-  return Math.max(1, items.length) * 1500;
+type FulfillmentItemLike = Partial<Omit<FulfillmentItemDTO, "fulfillment">>;
+
+// Checkout adds every pair as TWO line items (frame variant + lens variant),
+// so a lens line is part of a pair, not a parcel of its own.
+function isLensItem(item: FulfillmentItemLike): boolean {
+  return isLensSku(item.sku);
+}
+
+function itemQuantity(item: FulfillmentItemLike): number {
+  const q = Number(item.quantity ?? 1);
+  return Number.isFinite(q) && q > 0 ? q : 1;
+}
+
+/** Number of physical pairs (cases) in the parcel: frame items x quantity. */
+export function countPairs(items: FulfillmentItemLike[]): number {
+  const pairs = items
+    .filter((it) => !isLensItem(it))
+    .reduce((n, it) => n + itemQuantity(it), 0);
+  return Math.max(1, pairs);
+}
+
+/**
+ * Declared (insured) value in THB. Prefers the real price paid: each
+ * fulfillment item's order line `unit_price x quantity` (frame AND lens lines,
+ * since together they are what is in the box). Falls back to 1,500 THB per
+ * pair when the order lines aren't available.
+ */
+function estimateDeclaredValueFromItems(
+  items: FulfillmentItemLike[],
+  order: Partial<FulfillmentOrderDTO> | undefined,
+): number {
+  const lines = new Map(
+    (order?.items ?? []).map((li) => [li.id, Number(li.unit_price)] as const),
+  );
+  let total = 0;
+  let priced = items.length > 0;
+  for (const it of items) {
+    const unit = it.line_item_id ? lines.get(it.line_item_id) : undefined;
+    if (unit === undefined || !Number.isFinite(unit)) {
+      priced = false;
+      break;
+    }
+    total += unit * itemQuantity(it);
+  }
+  if (priced && total > 0) return Math.max(1, Math.round(total));
+  return countPairs(items) * 1500;
 }
 
 function computeParcelFromItems(
-  items: Partial<Omit<FulfillmentItemDTO, "fulfillment">>[],
+  items: FulfillmentItemLike[],
   defaults: ShippopFulfillmentOptions["default_parcel"]
 ) {
-  // Eyewear: assume each pair is its own case, light. Stack weight linearly,
-  // keep dims at single-pair until we have real product weight data.
-  const count = Math.max(1, items.length);
+  // Eyewear: each pair is its own case, light. Stack weight per pair, keep
+  // dims at single-pair until we have real product weight data.
+  const pairs = countPairs(items);
   return {
-    weight_g: defaults.weight_g * count,
+    weight_g: defaults.weight_g * pairs,
     length_cm: defaults.length_cm,
     width_cm: defaults.width_cm,
     height_cm: defaults.height_cm,
