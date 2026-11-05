@@ -133,6 +133,18 @@ no-op; a `submitting` job (claim in flight) returns 409. This is the heal path: 
 `failed` job whose metadata/prescription was fixed, is rebuilt and — only if
 the rebuild yields a full packet — submitted.
 
+The same rebuild runs automatically for every `pending_rx` job every 30
+minutes (`src/jobs/heal-pending-rx.ts`). The sweep pages through **all**
+`pending_rx` jobs (`listAllJobIdsByStatus`, ids only, never the snapshot), not
+a capped page: a capped oldest-first page would return the same never-answered
+jobs every run and never reach newer ones. A job whose Medusa order no longer
+exists becomes `failed` ("order … not found") instead of erroring on every
+pass.
+
+`GET /admin/lab-jobs` lists newest first; with `?status=` it lists that
+status oldest first (the work queue). Both cap at `?limit=` (default 100, max
+500).
+
 ## PDPA boundary
 
 `packet_snapshot` holds plaintext Rx because the lab needs it. Never log it,
