@@ -797,3 +797,29 @@ describe("cylinder without an axis", () => {
     expect((err as Error).message).not.toMatch(/0\.75|1\.75|2\.00|63/);
   });
 });
+
+describe("decryptPrescription — request timeout", () => {
+  it("sends every request with an abort signal", async () => {
+    const seen: Array<AbortSignal | null | undefined> = [];
+    const fetchMock = jest.fn(async (_url: string, init?: RequestInit) => {
+      seen.push(init?.signal);
+      return jsonResponse(200, []);
+    });
+    await expect(
+      decryptPrescription("rx_1", { fetch: fetchMock as unknown as typeof fetch }),
+    ).rejects.toMatchObject({ code: "not_found" });
+    expect(seen[0]).toBeInstanceOf(AbortSignal);
+  });
+
+  it("turns a timeout into an rpc error that names no value", async () => {
+    const fetchMock = jest.fn(async () => {
+      const err = new Error("The operation was aborted due to timeout");
+      err.name = "TimeoutError";
+      throw err;
+    });
+    const p = decryptPrescription("rx_1", { fetch: fetchMock as unknown as typeof fetch });
+    await expect(p).rejects.toBeInstanceOf(SupabaseVaultError);
+    await expect(p).rejects.toMatchObject({ code: "rpc" });
+    await expect(p).rejects.toThrow(/timed out/);
+  });
+});

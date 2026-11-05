@@ -26,14 +26,16 @@ Verified against the Shippop Postman collection 2026-05-20 — see
 - `providers/shippop.ts` — real provider against the verified API
 - `provider/service.ts` — `ShippopFulfillmentService` (extends `AbstractFulfillmentProviderService`, registered with Medusa's built-in fulfillment module)
 - `provider/index.ts` — `ModuleProvider(Modules.FULFILLMENT, ...)` registration
-- `__tests__/shippop.unit.spec.ts` — 14 cases against a mocked fetch
-- `__tests__/service.unit.spec.ts` — 12 interface-shape + unconfigured tests
-- `provider/__tests__/service.unit.spec.ts` — 12 adapter delegation tests
+- `__tests__/shippop.unit.spec.ts` — provider against a mocked fetch
+- `__tests__/service.unit.spec.ts` — interface shape, unconfigured fallback, construction as Medusa does it
+- `provider/__tests__/service.unit.spec.ts` — fulfillment adapter (address mapping, parcel, rates)
 - `SHIPPOP_API.md` — the curated subset of Shippop API docs we depend on
 
 Related (outside this folder):
 
 - `src/api/webhooks/shippop/[secret]/route.ts` — Shippop tracking webhook ingress; verifies path secret + emits `shippop.tracking.update` / `shippop.delivery.failed` on the event bus
+- `src/api/middlewares.ts` — keeps the webhook's raw body (`preserveRawBody`); see quirk 7
+- `src/subscribers/shippop-tracking.ts` — consumes those events: marks the fulfillment delivered and POSTs the storefront
 - `medusa-config.ts` — registers `ShippopFulfillmentService` under `@medusajs/medusa/fulfillment` providers list
 
 ## Required env (Railway)
@@ -81,12 +83,29 @@ Critical quirks (verified against the Postman docs):
    the path segment and passes it as `path_secret`.
 6. **Tracking timestamps are Bangkok-local** with no timezone marker.
    The provider converts to ISO-8601 UTC via `bangkokToIso`.
+7. **Webhook fields are nested** (`data[datetime]`, `data[reason]`).
+   Medusa's urlencoded parser turns them into an object, so the route reads
+   the raw body (`src/api/webhooks/shippop/raw-body.ts`); without it the
+   event time and the delivery-failure reason are lost.
+8. **Every call has a 20 s timeout** (`SHIPPOP_REQUEST_TIMEOUT_MS`). A timed
+   out `/booking/` or `/confirm/` is an UNKNOWN outcome (Shippop may have
+   booked it): check the Shippop dashboard before retrying that fulfillment.
+9. **A pair is two order lines** (frame + a `KLR-LENS-` lens line). Parcel
+   weight counts frame lines x quantity; declared value is what the customer
+   paid for the lines in the box (1,500 THB per pair when prices are missing).
+   `calculatePrice` quotes only the chosen carrier and refuses if Shippop
+   returns no rate for it.
+
+Medusa constructs module services as `new Service(container, moduleOptions)`.
+Both services take a provider override for tests only and accept it only when
+it is a real provider (`isShippingProvider`); before that guard, the module
+options object was used as the provider and every webhook failed.
 
 ## Next steps
 
 1. ~~Convert to `AbstractFulfillmentProviderService`~~ — **done** (this PR). Provider lives in `provider/`.
 2. ~~Webhook API route~~ — **done** (this PR). Route at `src/api/webhooks/shippop/[secret]/route.ts` verifies + emits on event bus.
-3. **Subscriber for the emitted events** (DEV_TRACKER 2.12) — listens for `shippop.tracking.update` / `shippop.delivery.failed`, looks up the Medusa Fulfillment by `data.shippop_tracking_code`, and calls `createOrderShipmentWorkflow` / `markOrderFulfillmentAsDeliveredWorkflow`. Also fires the matching LINE OA template.
+3. ~~Subscriber for the emitted events~~ — **done** (H1, `src/subscribers/shippop-tracking.ts`). Resolves the fulfillment by label `tracking_number`, marks it delivered, and POSTs the storefront, which sends the customer messages. Open: it does not mark the fulfillment *shipped* on `picked_up`, and a failed storefront POST is dropped (BACKLOG M11).
 4. **Polling fallback cron** (DEV_TRACKER 2.12, every ~30 min) — call `getTracking` for any shipment still in `picked_up` / `in_transit` to cover dropped webhooks.
 5. **Apply for Shippop merchant account** — off-platform, gated on Thai company registration. First true end-to-end test requires this.
 6. **R2 label persistence** — stash `getLabelHtml` output so we don't re-hit Shippop on every reprint, and so label URLs survive any Shippop-side TTL.

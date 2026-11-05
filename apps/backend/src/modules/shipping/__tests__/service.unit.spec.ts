@@ -120,3 +120,33 @@ describe("ShippingModuleService — interface shape", () => {
     ).rejects.toBeInstanceOf(ShippingError);
   });
 });
+
+describe("ShippingModuleService — constructed the way Medusa constructs it", () => {
+  const PREV = { ...process.env };
+  afterEach(() => {
+    process.env = { ...PREV };
+  });
+
+  it("ignores Medusa's module-options arg and uses the real Shippop provider", async () => {
+    process.env.SHIPPOP_API_KEY = "k";
+    process.env.SHIPPOP_API_BASE_URL = "https://shippop.test";
+    process.env.SHIPPOP_WEBHOOK_PATH_SECRET = "path-secret";
+    // Medusa: new Service(container, moduleOptions)
+    const svc = new ShippingModuleService({}, {});
+    const event = await svc.verifyAndParseWebhook({
+      raw_body: "tracking_code=SP1&order_status=POD",
+      headers: {},
+      path_secret: "path-secret",
+    });
+    expect(event.type).toBe("tracking_update");
+    expect(event.event.status).toBe("delivered");
+  });
+
+  it("falls back to the unconfigured provider (not the options object) without env", async () => {
+    delete process.env.SHIPPOP_API_KEY;
+    const svc = new ShippingModuleService({}, {});
+    await expect(
+      svc.verifyAndParseWebhook({ raw_body: "", headers: {}, path_secret: "x" }),
+    ).rejects.toMatchObject({ code: "not_configured" });
+  });
+});

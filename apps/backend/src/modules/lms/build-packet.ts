@@ -1,4 +1,4 @@
-import { Modules } from "@medusajs/framework/utils";
+import { MedusaError, Modules } from "@medusajs/framework/utils";
 import type { MedusaContainer } from "@medusajs/framework/types";
 import { PRESCRIPTION_MODULE } from "../prescription/service";
 import type PrescriptionModuleService from "../prescription/service";
@@ -140,9 +140,22 @@ export async function buildLabJobPacket(
   // Resolve Medusa's built-in order module from the container.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const orderModule: any = container.resolve(Modules.ORDER);
-  const order = await orderModule.retrieveOrder(orderId, {
-    relations: ["items", "shipping_address"],
-  });
+  // retrieveOrder THROWS MedusaError NOT_FOUND for a missing order (it never
+  // returns null). Turn that into a durable `failed` result: otherwise a job
+  // whose order was deleted makes every heal sweep throw, forever. Any other
+  // error (DB down) still throws, so the caller retries.
+  let order;
+  try {
+    order = await orderModule.retrieveOrder(orderId, {
+      relations: ["items", "shipping_address"],
+    });
+  } catch (err) {
+    if (err instanceof MedusaError && err.type === MedusaError.Types.NOT_FOUND) {
+      order = null;
+    } else {
+      throw err;
+    }
+  }
   if (!order) {
     return {
       outcome: "failed",

@@ -43,14 +43,16 @@ export interface ShippopConfig {
 
 type FetchLike = (
   input: string,
-  init?: { method?: string; headers?: Record<string, string>; body?: string }
+  init?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal }
 ) => Promise<{
   ok: boolean;
   status: number;
   text(): Promise<string>;
 }>;
 
-const TEN_MM_TO_CM = 0.1; // unused; keep for future if Shippop revises units
+/** Per-request limit. calculatePrice runs inside checkout's shipping-option
+ *  listing, so a hung Shippop must fail fast rather than hang the cart. */
+export const SHIPPOP_REQUEST_TIMEOUT_MS = 20_000;
 
 export class ShippopProvider implements IShippingProvider {
   readonly name = "shippop" as const;
@@ -272,12 +274,32 @@ export class ShippopProvider implements IShippingProvider {
 
   private async request(path: string, body: string, contentType: string): Promise<ShippopEnvelope> {
     const url = `${trimTrailingSlash(this.config.api_base_url)}${path}`;
-    const res = await this.fetchImpl(url, {
-      method: "POST",
-      headers: { "content-type": contentType, accept: "application/json" },
-      body,
-    });
-    const text = await res.text();
+    let res: Awaited<ReturnType<FetchLike>>;
+    let text: string;
+    try {
+      res = await this.fetchImpl(url, {
+        method: "POST",
+        headers: { "content-type": contentType, accept: "application/json" },
+        body,
+        signal: AbortSignal.timeout(SHIPPOP_REQUEST_TIMEOUT_MS),
+      });
+      text = await res.text();
+    } catch (err) {
+      if ((err as { name?: unknown } | null)?.name === "TimeoutError") {
+        // For /booking/ and /confirm/ the outcome is UNKNOWN, not failed:
+        // Shippop may have booked it. Check the Shippop dashboard before
+        // retrying a fulfillment that timed out.
+        throw new ShippingError(
+          "timeout",
+          `Shippop ${path} did not answer within ${SHIPPOP_REQUEST_TIMEOUT_MS / 1000}s`,
+        );
+      }
+      // Never echo the request (the body carries the api_key).
+      throw new ShippingError(
+        "network_error",
+        `Shippop ${path} request failed: ${err instanceof Error ? err.name : "unknown error"}`,
+      );
+    }
     if (!res.ok) {
       throw new ShippingError("http_error", `Shippop ${path} returned HTTP ${res.status}: ${text.slice(0, 500)}`, {
         status_code: res.status,

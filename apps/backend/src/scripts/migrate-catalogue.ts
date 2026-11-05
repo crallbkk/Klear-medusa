@@ -11,6 +11,7 @@ import {
   createShippingProfilesWorkflow,
 } from "@medusajs/medusa/core-flows";
 import { FRAME_SEED, type FrameSeed } from "./frame-seed";
+import { LENS_SKU_PREFIX, isLensSku } from "../lib/catalogue";
 
 // Klear catalogue migration. Idempotent: re-running upserts by handle.
 //
@@ -18,7 +19,10 @@ import { FRAME_SEED, type FrameSeed } from "./frame-seed";
 // NOT in FRAME_SEED (stale demo data left over from earlier seeds).
 //
 // With env `PURGE=true` (or `--purge` argv) those stale products are
-// deleted. Run once with purge to remove the leftover "Medusa T-Shirt".
+// deleted. CAREFUL: that includes every frame created in Medusa Admin that
+// was never added to FRAME_SEED. The lens product is always kept. Re-running
+// also resets each seeded frame's title, description, metadata and price to
+// the seed's values, overwriting Admin edits.
 //
 // Invocation (locally or via railway ssh):
 //   npx medusa exec ./src/scripts/migrate-catalogue.ts
@@ -180,8 +184,29 @@ export default async function migrate_catalogue({
     }
   }
 
-  // 3. Stale-product detection (everything not in the seed)
-  const stale = allProducts.filter((p) => !seedHandles.has(p.handle));
+  // 3. Stale-product detection (everything not in the seed).
+  //
+  // NEVER the lens product: "Klear Lenses" (variants KLR-LENS-*) is not a
+  // frame, so it is not in FRAME_SEED, but checkout adds a lens line from it
+  // to every order. Purging it would break every checkout.
+  const lensProductIds = new Set(
+    (
+      await productModule.listProductVariants(
+        { product_id: allProducts.map((p) => p.id) },
+        { select: ["id", "sku", "product_id"], take: 10_000 },
+      )
+    )
+      .filter((v) => isLensSku(v.sku))
+      .map((v) => v.product_id as string),
+  );
+  const stale = allProducts.filter(
+    (p) => !seedHandles.has(p.handle) && !lensProductIds.has(p.id),
+  );
+  if (lensProductIds.size) {
+    logger.info(
+      `Keeping ${lensProductIds.size} lens product(s) (${LENS_SKU_PREFIX}* variants): never stale`,
+    );
+  }
   if (stale.length) {
     logger.info(
       `Found ${stale.length} stale product(s) not in seed: ${stale

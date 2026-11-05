@@ -12,7 +12,7 @@ const mockRebuild = rebuildAndSubmitJob as jest.MockedFunction<
 
 function makeLms(pending: Array<{ id: string; order_id: string }>) {
   return {
-    listJobsByStatus: jest.fn().mockResolvedValue(pending),
+    listAllJobIdsByStatus: jest.fn().mockResolvedValue(pending),
   };
 }
 
@@ -41,7 +41,7 @@ describe("heal-pending-rx scheduled job", () => {
   it("does nothing (no rebuild) when there are no pending_rx jobs", async () => {
     const lms = makeLms([]);
     await runJob(lms);
-    expect(lms.listJobsByStatus).toHaveBeenCalledWith("pending_rx");
+    expect(lms.listAllJobIdsByStatus).toHaveBeenCalledWith("pending_rx");
     expect(mockRebuild).not.toHaveBeenCalled();
   });
 

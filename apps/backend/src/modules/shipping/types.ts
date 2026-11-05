@@ -190,6 +190,26 @@ export interface IShippingProvider {
   }): Promise<ShippingWebhookEvent>;
 }
 
+/**
+ * True only for a real provider object. Medusa constructs module services as
+ * `new Service(container, moduleOptions, ...)`, so a constructor's later
+ * positional args can be Medusa's own objects (the options `{}`), never a
+ * provider. Treating those as a provider is what broke every Shippop webhook
+ * ("verifyAndParseWebhook is not a function").
+ */
+export function isShippingProvider(value: unknown): value is IShippingProvider {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.getRates === "function" &&
+    typeof v.createShipment === "function" &&
+    typeof v.getTracking === "function" &&
+    typeof v.cancelShipment === "function" &&
+    typeof v.getLabelHtml === "function" &&
+    typeof v.verifyAndParseWebhook === "function"
+  );
+}
+
 export class ShippingError extends Error {
   readonly code: string;
   readonly status_code?: number;

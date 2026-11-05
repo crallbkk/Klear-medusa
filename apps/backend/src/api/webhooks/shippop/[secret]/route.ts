@@ -3,6 +3,7 @@ import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils";
 import { SHIPPING_MODULE } from "../../../../modules/shipping";
 import type ShippingModuleService from "../../../../modules/shipping/service";
 import { ShippingError } from "../../../../modules/shipping/types";
+import { extractRawBody } from "../raw-body";
 
 // Shippop tracking webhook.
 //
@@ -16,13 +17,13 @@ import { ShippingError } from "../../../../modules/shipping/types";
 //   2. Source-IP allowlist at the firewall (Railway / Cloudflare WAF)
 //
 // On a verified event we emit a Klear-namespaced event onto the event bus.
-// A subscriber (task 2.12) consumes the event and:
-//   - flips the matching Medusa Fulfillment via createOrderShipmentWorkflow
-//     / markOrderFulfillmentAsDeliveredWorkflow
-//   - fires the matching LINE OA template (storefront src/lib/line/templates.ts)
+// `src/subscribers/shippop-tracking.ts` consumes it: it marks the Medusa
+// fulfillment delivered and forwards the status to the storefront, which owns
+// the customer-facing order state and LINE/email messages.
 //
-// Until that subscriber lands, the event is emitted + logged so we can
-// observe deliveries against the sandbox without rejecting any payloads.
+// The body is read raw (`src/api/middlewares.ts` sets preserveRawBody for
+// this route): Medusa's urlencoded parser would otherwise turn
+// `data[datetime]` / `data[reason]` into a nested object.
 
 const EVENT_TRACKING_UPDATE = "shippop.tracking.update";
 const EVENT_DELIVERY_FAILED = "shippop.delivery.failed";
@@ -67,28 +68,6 @@ export const POST = async (req: MedusaRequest, res: MedusaResponse) => {
   // Shippop expects exactly this body for a successful ack.
   res.status(200).json({ success: 1 });
 };
-
-/**
- * Get the raw request body as a urlencoded string. Medusa's default body
- * parser parses urlencoded into `req.body` as an object, so we serialise
- * back. If a raw-body buffer was preserved by middleware, prefer that.
- */
-function extractRawBody(req: MedusaRequest): string {
-  const maybeRaw = (req as { rawBody?: Buffer | string }).rawBody;
-  if (typeof maybeRaw === "string") return maybeRaw;
-  if (Buffer.isBuffer(maybeRaw)) return maybeRaw.toString("utf8");
-  if (typeof req.body === "string") return req.body;
-  if (req.body && typeof req.body === "object") {
-    // Re-encode the parsed body back to urlencoded so verifyAndParseWebhook
-    // sees the same shape it would over the wire.
-    const params = new URLSearchParams();
-    for (const [k, v] of Object.entries(req.body as Record<string, unknown>)) {
-      params.set(k, String(v));
-    }
-    return params.toString();
-  }
-  return "";
-}
 
 function collectHeaders(req: MedusaRequest): Record<string, string> {
   const out: Record<string, string> = {};
