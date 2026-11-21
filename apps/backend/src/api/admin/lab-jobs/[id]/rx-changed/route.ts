@@ -18,6 +18,11 @@ import { NOT_BUILT, actorOf, sendProductionError, withoutPacket } from "../../pr
  *
  * Keep the same key for one request. A new key is a new change.
  */
+const TOO_LATE: Record<string, string> = {
+  not_in_production: "this job has no packet yet; use Rebuild packet instead",
+  too_late: "too late to change this job here: it has a label, is delivered or is cancelled",
+};
+
 export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<void> {
   const actor = actorOf(req, res);
   if (!actor) return;
@@ -44,7 +49,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
       });
       return;
     }
-    res.status(409).json(result);
+    res.status(409).json({ ...result, message: TOO_LATE[result.outcome] });
   } catch (err) {
     sendProductionError(res, err, "admin/lab-jobs/rx-changed", id);
   }

@@ -212,9 +212,11 @@ export function publicEvent<T extends Record<string, unknown>>(
   return rest;
 }
 
-/** Why a packet could not be built, in fixed words. The builder's own
- *  reason is free text that can be made from an error, so it stays in the
- *  job's `last_error` for ops and is not passed on by the routes. */
+/** Why a packet could not be built, in fixed words, for the answers of
+ *  Retry and of a changed prescription. The builder's own reason is kept in
+ *  the job's `last_error`, which the queue and the job screen do show: the
+ *  builder writes fixed sentences there. A lab provider's rejection is
+ *  stored there too (module README, "Routes for the lab", item 7). */
 export const NOT_BUILT: Record<string, string> = {
   pending_rx: "the prescription has not arrived yet",
   failed: "the packet could not be built; see the job's last error",

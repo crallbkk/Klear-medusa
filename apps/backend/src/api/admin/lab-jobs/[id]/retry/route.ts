@@ -47,7 +47,7 @@ export async function POST(
   const lms = req.scope.resolve(LMS_MODULE) as LmsModuleService;
   const id = req.params.id;
   if (!id) {
-    res.status(400).json({ error: "id required" });
+    res.status(400).json({ error: "id required", message: "id required" });
     return;
   }
 
@@ -62,7 +62,7 @@ export async function POST(
       err instanceof MedusaError &&
       err.type === MedusaError.Types.NOT_FOUND
     ) {
-      res.status(404).json({ error: "lab_job not found" });
+      res.status(404).json({ error: "lab_job not found", message: "lab_job not found" });
       return;
     }
     console.error(`[lab-jobs/retry] retrieve failed for ${id}: ${kindOf(err)}`);
@@ -70,15 +70,15 @@ export async function POST(
       tags: { route: "admin/lab-jobs/retry", reason: "retrieve_failed" },
       extra: { lab_job_id: id },
     });
-    res.status(500).json({ error: "internal error retrieving lab_job" });
+    res.status(500).json({ error: "internal error retrieving lab_job", message: "internal error retrieving lab_job" });
     return;
   }
   if (!job) {
-    res.status(404).json({ error: "lab_job not found" });
+    res.status(404).json({ error: "lab_job not found", message: "lab_job not found" });
     return;
   }
   if (job.status === "cancelled") {
-    res.status(400).json({ error: "cannot retry a cancelled job" });
+    res.status(400).json({ error: "cannot retry a cancelled job", message: "cannot retry a cancelled job" });
     return;
   }
   if (job.status === "submitted") {
@@ -89,14 +89,14 @@ export async function POST(
   if (job.status === "submitting") {
     // Another worker holds the submission claim right now — rebuilding under
     // it would race the in-flight provider call. Conflict, not an error.
-    res.status(409).json({ error: "submission claim in flight — retry shortly" });
+    res.status(409).json({ error: "submission claim in flight — retry shortly", message: "submission claim in flight — retry shortly" });
     return;
   }
 
   const IN_PRODUCTION = "the lab has started on this job; its packet cannot be rebuilt";
   if (job.stage && job.stage !== "ready") {
     // Checked before building, so no prescription is decrypted for nothing.
-    res.status(409).json({ error: IN_PRODUCTION });
+    res.status(409).json({ error: IN_PRODUCTION, message: IN_PRODUCTION });
     return;
   }
 
@@ -119,7 +119,7 @@ export async function POST(
     if (err instanceof LabJobNotRebuildableError) {
       // The job moved (into production, or was submitted or cancelled)
       // between the read above and the rebuild. Not an infra failure.
-      res.status(409).json({ error: "the job changed while it was being rebuilt; reload it" });
+      res.status(409).json({ error: "the job changed while it was being rebuilt; reload it", message: "the job changed while it was being rebuilt; reload it" });
       return;
     }
     console.error(`[lab-jobs/retry] retry failed for ${id}: ${kindOf(err)}`);
@@ -127,6 +127,6 @@ export async function POST(
       tags: { route: "admin/lab-jobs/retry", reason: "rebuild_failed" },
       extra: { lab_job_id: id, order_id: job.order_id },
     });
-    res.status(500).json({ error: "the retry failed; try again" });
+    res.status(500).json({ error: "the retry failed; try again", message: "the retry failed; try again" });
   }
 }

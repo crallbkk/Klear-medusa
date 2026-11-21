@@ -285,6 +285,7 @@ describe("the packet is shown by one route only", () => {
       retrieveLabJob: jest.fn().mockResolvedValue(JOB),
       listProductionEventsForJob: jest.fn().mockResolvedValue([]),
       listLabCosts: jest.fn().mockResolvedValue([]),
+      listLabVendors: jest.fn().mockResolvedValue([]),
       listQueue: jest.fn().mockResolvedValue([{ id: "labjob_1", stage: "ready", on_hold: false }]),
     };
     mockBuild.mockResolvedValue({
@@ -379,6 +380,7 @@ describe("the packet is shown by one route only", () => {
         { id: "prodevt_1", seq: 2, action: "PACKET_VIEWED", actor_id: "user_A", idempotency_key: "secret-key-A", request_hash: "abc" },
       ]),
       listLabCosts: jest.fn().mockResolvedValue([]),
+      listLabVendors: jest.fn().mockResolvedValue([]),
     };
     const res = makeRes();
     await call(production, makeReq(lms), res);
@@ -392,6 +394,7 @@ describe("the packet is shown by one route only", () => {
       retrieveLabJob: jest.fn().mockResolvedValue(JOB),
       listProductionEventsForJob: jest.fn().mockRejectedValue(notFound),
       listLabCosts: jest.fn().mockResolvedValue([]),
+      listLabVendors: jest.fn().mockResolvedValue([]),
     };
     let res = makeRes();
     await call(production, makeReq(lms), res);
@@ -467,7 +470,7 @@ describe("every lab route declares a permission", () => {
       .readdirSync(path.join(apiRoot, "admin"), { withFileTypes: true })
       .filter((e) => e.isDirectory() && e.name.startsWith("lab-"))
       .map((e) => path.join(apiRoot, "admin", e.name));
-    expect(labDirs.map((d) => path.basename(d)).sort()).toEqual(["lab-jobs", "lab-queue"]);
+    expect(labDirs.map((d) => path.basename(d)).sort()).toEqual(["lab-jobs", "lab-queue", "lab-reports"]);
     for (const file of labDirs.flatMap(routeFiles)) {
       const matcher =
         "/" +
@@ -484,7 +487,7 @@ describe("every lab route declares a permission", () => {
         }
       }
     }
-    expect(found.length).toBeGreaterThanOrEqual(9);
+    expect(found.length).toBeGreaterThanOrEqual(10);
     for (const route of found) expect([route, declared.has(route)]).toEqual([route, true]);
     // And no entry points at a lab route that does not exist.
     for (const key of declared.keys()) {

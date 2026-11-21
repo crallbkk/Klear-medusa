@@ -32,6 +32,7 @@ export default defineMiddlewares({
     // `policies` only when its role module is on (MEDUSA_FF_RBAC); see
     // `admin/lab-jobs/production-http.ts`.
     { matcher: "/admin/lab-queue", methods: ["GET"], policies: [LAB_READ] },
+    { matcher: "/admin/lab-reports", methods: ["GET"], policies: [LAB_READ] },
     { matcher: "/admin/lab-jobs", methods: ["GET"], policies: [LAB_READ] },
     { matcher: "/admin/lab-jobs/:id", methods: ["GET"], policies: [LAB_READ] },
     { matcher: "/admin/lab-jobs/:id/production", methods: ["GET"], policies: [LAB_READ] },

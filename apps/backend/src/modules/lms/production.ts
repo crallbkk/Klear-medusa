@@ -453,6 +453,101 @@ export function decide(
   }
 }
 
+// Details that pass every action's own checks. Used only to ask `decide`
+// whether the STAGE allows an action; nothing here is ever stored.
+const SAMPLE_DETAIL: Partial<Record<ProductionAction, Record<string, unknown>>> = {
+  LENS_ISSUED: { lenses: ["SAMPLE"] },
+  SENT_TO_LAB: { vendor: "sample", quoted_satang: 0 },
+  QC_FAILED: { reason: "sample" },
+  REMAKE_STARTED: { cause: "sample" },
+  LENS_SPOILED: { reason: "sample" },
+  FRAME_DAMAGED: { sku: "SAMPLE", reason: "sample" },
+  LENS_RETURNED_UNUSED: { lenses: ["SAMPLE"] },
+  HOLD: { reason: "sample" },
+  LAB_INVOICED: { invoiced_satang: 0 },
+  NOTE: { text: "sample" },
+};
+
+/**
+ * The actions a person could record on a job as it stands: the buttons the
+ * job screen shows. Asked of `decide` itself, so the screen can never offer
+ * what the rules refuse or hide what they allow. System actions and packet
+ * looks are not buttons and are never in the list.
+ */
+export function offeredActions(job: JobState & PacketState): ProductionAction[] {
+  return ACTIONS.filter((action) => {
+    if (SYSTEM_ONLY_ACTIONS.has(action)) return false;
+    if (action === "PACKET_VIEWED" || action === "PACKET_PRINTED") return false;
+    return wouldAccept(job, action);
+  });
+}
+
+/** The part of a job's packet the rules below read. */
+export type PacketState = {
+  status: string;
+  rx_redacted_at?: Date | string | null;
+};
+
+/**
+ * Why the state of a job's PACKET forbids an action, or null. `decide`
+ * knows where the physical job is; this knows whether there is a packet to
+ * work from. The writer checks both, and so does anything that says what a
+ * job offers.
+ */
+export function packetForbids(
+  job: PacketState & { stage: Stage | null },
+  action: ProductionAction,
+): string | null {
+  // READY and PRINTED need a built packet. A job can be at `ready` with
+  // its packet un-built again (a retry whose rebuild now waits for a
+  // prescription); the lab must not start on it, and while it stays at
+  // `ready` it can still be rebuilt.
+  if (
+    (action === "READY" || action === "PRINTED") &&
+    job.status !== "queued" &&
+    job.status !== "submitting" &&
+    job.status !== "submitted"
+  ) {
+    return `a job whose packet is ${job.status} is not ready for production`;
+  }
+  // Nor can the lab print from a packet whose prescription was removed (the
+  // packet route refuses to show it). A rebuild puts it back.
+  if (action === "PRINTED" && job.rx_redacted_at) {
+    return "the prescription was removed from this job; rebuild the packet first";
+  }
+  // A changed prescription replaces the packet. One a lab provider has,
+  // or is being given, cannot be replaced, so the job cannot go back.
+  if (
+    action === "RX_CHANGED" &&
+    job.status !== "queued" &&
+    job.status !== "failed" &&
+    job.status !== "pending_rx"
+  ) {
+    return `the packet of this job is ${job.status}; its prescription cannot be changed here`;
+  }
+  // A warranty remake needs the prescription back in the packet first
+  // (it is blanked some time after delivery). The caller rebuilds it.
+  if (action === "REMAKE_STARTED" && job.rx_redacted_at && job.stage !== "qc_failed") {
+    return "the prescription was removed from this job after delivery; rebuild the packet before starting a remake";
+  }
+  return null;
+}
+
+/** Would the writer accept this action on the job as it stands, given good
+ *  details? True for system actions too; who may record it is not asked.
+ *  (Two things only the database knows are not asked either: whether a lab
+ *  quote is waiting for an invoice, and which lenses were issued.) */
+export function wouldAccept(job: JobState & PacketState, action: ProductionAction): boolean {
+  if (packetForbids(job, action) !== null) return false;
+  try {
+    decide(job, action, SAMPLE_DETAIL[action] ?? {});
+    return true;
+  } catch (err) {
+    if (err instanceof ProductionError && err.code === "not_allowed") return false;
+    throw err;
+  }
+}
+
 /** The Bangkok calendar date of an instant. Bangkok is UTC+7 with no
  *  daylight saving. */
 export function bangkokDate(at: Date): string {

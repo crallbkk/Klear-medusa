@@ -327,9 +327,10 @@ so it will be a button.
 
 | Route | What it does | Permission |
 |---|---|---|
-| `GET /admin/lab-queue` | Jobs the lab still has work on, with a count per column | `lab_job:read` |
+| `GET /admin/lab-queue` | Jobs the lab still has work on, each with its board column and whether it is overdue, and a count per column | `lab_job:read` |
+| `GET /admin/lab-reports?weeks=N` | Lenses used per week with spoilage and remake rates, and lenses per job against its remake count. Counts only, no SKU | `lab_job:read` |
 | `GET /admin/lab-jobs`, `GET /admin/lab-jobs/:id` | Jobs, as before, now WITHOUT the packet | `lab_job:read` |
-| `GET /admin/lab-jobs/:id/production` | A job's state, history and outside-lab quotes | `lab_job:read` |
+| `GET /admin/lab-jobs/:id/production` | A job's state, history and outside-lab quotes, the steps it offers now, and the outside labs already used | `lab_job:read` |
 | `POST /admin/lab-jobs/:id/packet` | Shows the packet (the prescription) and records who looked, before it is returned | `lab_job:read` |
 | `POST /admin/lab-jobs/:id/actions` | Records one step the lab took | `lab_job:update` |
 | `POST /admin/lab-jobs/:id/ops-actions` | Hold and release | `lab_job_ops:update` |
@@ -383,6 +384,62 @@ so it will be a button.
    that echoes the request would put a prescription there.
 8. **Every look at a packet is its own record.** A key that was already
    used shows nothing. A job's history does not show anyone's keys.
+
+## Screens
+
+Three pages in Medusa Admin (`src/admin/routes/lab`), reached from "Lab" in
+the side menu: the queue board, a job, and reports. What is not drawing is
+in `src/admin/lib/lab.ts` and is tested against the production rules.
+
+1. **The screens hold no rules.** The queue route says which column a job
+   is in and whether it is overdue (`board.ts`). The job route says which
+   steps a job offers, asked of `decide` and of `packetForbids`, the same
+   two checks the writer makes. A database test walks every stage and
+   packet state and fails if a step is offered that the writer refuses, or
+   the other way round. It proves the two agree, not that a rule is
+   right, and it leaves out the three steps of item 2.
+2. **Two things the offer cannot know from the job alone:** whether a lab
+   quote exists or is waiting for an invoice (the job route checks the
+   quotes for the invoice) and which lenses were issued (the writer
+   refuses a lens that was not).
+   1. **A delivered job whose prescription was removed offers no remake**
+      and nothing on the screen can rebuild its packet (known gap 2 below).
+      A warranty remake after the retention period is not possible yet.
+3. **Overdue thresholds are placeholders** (`OVERDUE_AFTER_HOURS`,
+   `OVERDUE_WAITING_HOURS` in `board.ts`): one working day per bench step,
+   a week at an outside lab, three days for a labelled parcel or a missing
+   prescription. The design says they are agreed with the lab before
+   go-live. Nobody has agreed these.
+4. **The board also lists jobs stuck before production**: a packet that
+   failed, or a prescription that has not arrived. Nothing else showed
+   them. There is no age limit, so on the first deploy every such job in
+   the table appears at once, and one stays until its order is cancelled.
+5. **One request, one key.** A key belongs to a step, the job exactly as
+   the screen showed it, and what was typed. A second press or a retry
+   after a lost connection sends the same key; anything else is a new
+   request. After a request that got no answer the screen reloads and says
+   the step may have been recorded.
+6. **The packet on a screen.** It is kept in the page's memory only. The
+   packet route stamps it with the job row's `updated_at`; recording a step
+   does not change that, storing or blanking a packet does, and the screen
+   drops a packet whose stamp is no longer the job's. The check runs when
+   the job is re-read: once a minute while the page is visible, when its
+   tab comes back to the front, and after every action on it. Any other write to the job row (a hand-off attempt
+   to a lab provider, a changed last error) also drops it, though the
+   packet is the same; the person shows it again.
+7. **Printing.** "Print packet" records the print before the dialog opens,
+   so a cancelled dialog still leaves a print on record. The browser's own
+   print leaves the packet off the page, so paper cannot exist with only a
+   view on record. A screenshot or a phone photo is outside what software
+   can record.
+8. **Not built: lens stock on the job screen.** It needs the stock
+   snapshot from Klear Operations (the stock feed).
+9. **Not built: a person's name in the history.** It shows the admin user
+   id. Looking a name up needs Medusa's user route, which a lab role is
+   not meant to reach.
+10. **A lens SKU box accepts anything shaped like a SKU**, which includes
+    `1.25`. The warning beside free-text boxes is the only guard against a
+    lens power typed there.
 
 ## Release to Klear Operations
 

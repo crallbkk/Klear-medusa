@@ -9,6 +9,7 @@ import LabReleaseWindow from "./models/lab-release-window";
 import LabUsageRelease from "./models/lab-usage-release";
 import LabTotalDay from "./models/lab-total-day";
 import { addDays, dueWindows, releaseWeekday, type ReleaseWindow } from "./release";
+import { packetProblem, reportFrom } from "./board";
 import {
   type BuildPacketResult,
   type ILabProvider,
@@ -25,6 +26,7 @@ import {
   ProductionError,
   bangkokDate,
   decide,
+  packetForbids,
   type JobState,
   type ProductionAction,
   type Stage,
@@ -222,6 +224,42 @@ const QUEUE_COLUMNS = [
 ] as const;
 
 export type LabJobQueueRow = Pick<LabJobRow, (typeof QUEUE_COLUMNS)[number]>;
+
+/** The most jobs the report lists. */
+const REPORT_JOBS = 200;
+
+/** The lab's report: counts per week and per job. No SKU, no packet. */
+export type ProductionReport = {
+  /** The first day covered, a Monday in Bangkok. */
+  from: string;
+  /** Newest week first. Only weeks in which something happened. */
+  weeks: Array<{
+    week_start: string;
+    issued_for_orders: number;
+    spoilage_replacements: number;
+    remake_lenses: number;
+    frames_spoiled: number;
+    returned_unused: number;
+    qc_failed: number;
+    remakes_started: number;
+    /** Replacement lenses per lens issued for an order; null with none issued. */
+    spoilage_rate: number | null;
+    remake_rate: number | null;
+  }>;
+  /** True when more jobs used a lens in the period than are listed. */
+  jobs_truncated: boolean;
+  /** Jobs that used a lens in the period, 200 at most: those with the most
+   *  lenses beyond what their remakes explain first, then the most lenses. */
+  jobs: Array<{
+    lab_job_id: string;
+    order_id: string;
+    stage: string | null;
+    remake_count: number;
+    lenses_issued: number;
+    lenses_returned: number;
+    unexplained: number;
+  }>;
+};
 
 /** One released window as the feed serves it: totals only. */
 export type ReleasedWindow = {
@@ -940,42 +978,9 @@ class LmsModuleService extends MedusaService({
           `the job has moved (it is ${job.stage ?? "not ready"}); reload and try again`,
         );
       }
-      // READY and PRINTED need a built packet. A job can be at `ready` with
-      // its packet un-built again (a retry whose rebuild now waits for a
-      // prescription); the lab must not start on it, and while it stays at
-      // `ready` it can still be rebuilt.
-      if (
-        (action === "READY" || action === "PRINTED") &&
-        job.status !== "queued" &&
-        job.status !== "submitting" &&
-        job.status !== "submitted"
-      ) {
-        throw new ProductionError(
-          "not_allowed",
-          `a job whose packet is ${job.status} is not ready for production`,
-        );
-      }
-      // A changed prescription replaces the packet. One a lab provider has,
-      // or is being given, cannot be replaced, so the job cannot go back.
-      if (
-        action === "RX_CHANGED" &&
-        job.status !== "queued" &&
-        job.status !== "failed" &&
-        job.status !== "pending_rx"
-      ) {
-        throw new ProductionError(
-          "not_allowed",
-          `the packet of this job is ${job.status}; its prescription cannot be changed here`,
-        );
-      }
-      // A warranty remake needs the prescription back in the packet first
-      // (it is blanked some time after delivery). The caller rebuilds it.
-      if (action === "REMAKE_STARTED" && job.rx_redacted_at && job.stage !== "qc_failed") {
-        throw new ProductionError(
-          "not_allowed",
-          "the prescription was removed from this job after delivery; rebuild the packet before starting a remake",
-        );
-      }
+      // Whether there is a packet to work from (see `packetForbids`).
+      const forbidden = packetForbids(job, action);
+      if (forbidden) throw new ProductionError("not_allowed", forbidden);
 
       const state: JobState = {
         stage: job.stage,
@@ -1408,16 +1413,21 @@ class LmsModuleService extends MedusaService({
   }
 
   /**
-   * The jobs the lab still has work on, longest-waiting first, WITHOUT their
-   * packets: every job at a stage before `delivered`, and any job (also a
-   * cancelled one) with the cut-or-uncut question still open.
+   * The jobs on the queue board, longest-waiting first, without their
+   * packets: every job at a stage the lab still works in, a finished or
+   * cancelled job with a cut-or-uncut question still open, and a job that
+   * never reached production because its packet failed or its prescription
+   * has not arrived.
    */
   async listQueue(): Promise<LabJobQueueRow[]> {
-    return (await this.listLabJobs(
+    const rows = (await this.listLabJobs(
       {
         $or: [
           { stage: [...QUEUE_STAGES] },
           { cut_question_pending: true },
+          // Not in production yet and stuck before it: the packet failed
+          // or the prescription has not arrived. Nothing else shows these.
+          { stage: null, status: ["failed", "pending_rx"] },
         ],
       },
       {
@@ -1427,6 +1437,160 @@ class LmsModuleService extends MedusaService({
         take: QUEUE_LIMIT + 1,
       },
     )) as unknown as LabJobQueueRow[];
+    // Longest-waiting first. A job with no stage has waited since it was
+    // created. Past the limit, which rows are missing is decided by the
+    // database's order (by time in stage, jobs with no stage last), so the
+    // board then says only that there are more, not which.
+    const since = (j: LabJobQueueRow) => new Date(j.stage_since ?? j.created_at).getTime();
+    return rows.sort((a, b) => since(a) - since(b) || (a.id < b.id ? -1 : 1));
+  }
+
+  /** Every outside lab a job was ever sent to, one spelling each, for the
+   *  screen to offer instead of typing the name again. */
+  async listLabVendors(): Promise<string[]> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return await (this as any).baseRepository_.transaction(async (em: Sql) => {
+      const rows = await em.execute(
+        // One spelling per lab: the one used most recently.
+        `select (array_agg("vendor" order by "created_at" desc, "id" desc))[1] as "vendor"
+           from "lab_cost"
+          where "deleted_at" is null
+          group by lower("vendor")
+          order by lower("vendor")
+          limit 100`,
+      );
+      return rows.map((r) => String(r.vendor));
+    });
+  }
+
+  /**
+   * The lab's report over the last `weeks` weeks (design 10.9): lenses used
+   * per week by reason with the spoilage and remake rates, and lenses per
+   * job against its remake count.
+   *
+   * Counts only. A lens SKU is a lens power, and beside a job it is health
+   * data, so no SKU is in the report.
+   *
+   * The weekly rates count lenses issued as replacements. A replacement
+   * that later went back on the shelf uncut is not taken off: a returned
+   * lens is booked as a return, without the reason it was issued under.
+   *
+   * `unexplained` is the lenses a job used beyond a pair for the order and
+   * a pair per counted remake. It is a prompt to look, not an accusation: a
+   * lens reissued after a spoil or a changed prescription is not a counted
+   * remake (README, known gap 3).
+   */
+  async productionReport(weeks = 12, now: Date = new Date()): Promise<ProductionReport> {
+    const from = reportFrom(now, weeks);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return await (this as any).baseRepository_.transaction(async (em: Sql) => {
+      const usage = await em.execute(
+        `select to_char(date_trunc('week', "entered_on"::date), 'YYYY-MM-DD') as "week_start",
+                coalesce(sum(-"qty") filter (where "reason" = 'order'), 0)::int as "issued_for_orders",
+                coalesce(sum(-"qty") filter (where "reason" = 'spoilage_replacement'), 0)::int
+                  as "spoilage_replacements",
+                coalesce(sum(-"qty") filter (where "reason" = 'remake'), 0)::int as "remake_lenses",
+                coalesce(sum(-"qty") filter (where "reason" = 'spoilage'), 0)::int as "frames_spoiled",
+                coalesce(sum("qty") filter (where "reason" = 'return_unused'), 0)::int
+                  as "returned_unused"
+           from "lab_usage"
+          where "deleted_at" is null and "entered_on" >= ?
+          group by 1`,
+        [from],
+      );
+      const events = await em.execute(
+        `select to_char(date_trunc('week', ("created_at" at time zone 'Asia/Bangkok')::date),
+                        'YYYY-MM-DD') as "week_start",
+                (count(*) filter (where "action" = 'QC_FAILED'))::int as "qc_failed",
+                (count(*) filter (where "action" = 'REMAKE_STARTED'))::int as "remakes_started"
+           from "production_event"
+          where "deleted_at" is null
+            and "action" in ('QC_FAILED', 'REMAKE_STARTED')
+            and ("created_at" at time zone 'Asia/Bangkok')::date >= cast(? as date)
+          group by 1`,
+        [from],
+      );
+      const jobs = await em.execute(
+        `select u."lab_job_id", j."order_id", j."stage", j."remake_count",
+                (count(*) filter (where u."qty" < 0 and u."reason" <> 'spoilage'))::int
+                  as "lenses_issued",
+                (count(*) filter (where u."reason" = 'return_unused'))::int as "lenses_returned"
+           from "lab_usage" u
+           join "lab_job" j on j."id" = u."lab_job_id"
+          where u."deleted_at" is null
+            and j."deleted_at" is null
+            and u."lab_job_id" in (
+              select "lab_job_id" from "lab_usage"
+               where "deleted_at" is null and "entered_on" >= ?)
+          group by 1, 2, 3, 4
+          -- The jobs to look at first: most lenses beyond what remakes
+          -- explain, then most lenses.
+          order by greatest(0,
+                     count(*) filter (where u."qty" < 0 and u."reason" <> 'spoilage')
+                     - count(*) filter (where u."reason" = 'return_unused')
+                     - 2 * (1 + j."remake_count")) desc,
+                   "lenses_issued" desc, u."lab_job_id"
+          limit ${REPORT_JOBS + 1}`,
+        [from],
+      );
+
+      const byWeek = new Map<string, ProductionReport["weeks"][number]>();
+      const week = (start: string) => {
+        let w = byWeek.get(start);
+        if (!w) {
+          w = {
+            week_start: start,
+            issued_for_orders: 0,
+            spoilage_replacements: 0,
+            remake_lenses: 0,
+            frames_spoiled: 0,
+            returned_unused: 0,
+            qc_failed: 0,
+            remakes_started: 0,
+            spoilage_rate: null,
+            remake_rate: null,
+          };
+          byWeek.set(start, w);
+        }
+        return w;
+      };
+      for (const r of usage) {
+        const w = week(String(r.week_start));
+        w.issued_for_orders = Number(r.issued_for_orders);
+        w.spoilage_replacements = Number(r.spoilage_replacements);
+        w.remake_lenses = Number(r.remake_lenses);
+        w.frames_spoiled = Number(r.frames_spoiled);
+        w.returned_unused = Number(r.returned_unused);
+        if (w.issued_for_orders > 0) {
+          w.spoilage_rate = w.spoilage_replacements / w.issued_for_orders;
+          w.remake_rate = w.remake_lenses / w.issued_for_orders;
+        }
+      }
+      for (const r of events) {
+        const w = week(String(r.week_start));
+        w.qc_failed = Number(r.qc_failed);
+        w.remakes_started = Number(r.remakes_started);
+      }
+      return {
+        from,
+        weeks: [...byWeek.values()].sort((a, b) => (a.week_start < b.week_start ? 1 : -1)),
+        jobs_truncated: jobs.length > REPORT_JOBS,
+        jobs: jobs.slice(0, REPORT_JOBS).map((r) => {
+          const lenses_issued = Number(r.lenses_issued);
+          const lenses_returned = Number(r.lenses_returned);
+          const remake_count = Number(r.remake_count);
+          return {
+            lab_job_id: String(r.lab_job_id),
+            order_id: String(r.order_id),
+            stage: (r.stage as string | null) ?? null,
+            remake_count,
+            lenses_issued,
+            lenses_returned,
+            unexplained: Math.max(0, lenses_issued - lenses_returned - 2 * (1 + remake_count)),
+          };
+        }),
+      };
+    });
   }
 
   /**
@@ -1442,20 +1606,10 @@ class LmsModuleService extends MedusaService({
     actorId: string,
     key: string,
     printed = false,
-  ): Promise<{ packet: LabJobPacket; job: LabJobProductionState }> {
+  ): Promise<{ packet: LabJobPacket; job: LabJobProductionState; as_of: Date }> {
     const usable = (job: LabJobRow): void => {
-      if (job.status !== "queued" && job.status !== "submitting" && job.status !== "submitted") {
-        throw new ProductionError(
-          "not_allowed",
-          `this job has no packet to work from (it is ${job.status})`,
-        );
-      }
-      if (job.rx_redacted_at) {
-        throw new ProductionError(
-          "not_allowed",
-          "the prescription was removed from this job; rebuild the packet first",
-        );
-      }
+      const problem = packetProblem(job);
+      if (problem) throw new ProductionError("not_allowed", problem);
     };
     usable((await this.retrieveLabJob(jobId)) as unknown as LabJobRow);
     const recorded = await this.applyProductionAction({
@@ -1474,7 +1628,11 @@ class LmsModuleService extends MedusaService({
     // checked again in case it was replaced or blanked in between.
     const job = (await this.retrieveLabJob(jobId)) as unknown as LabJobRow;
     usable(job);
-    return { packet: job.packet_snapshot, job: recorded.job };
+    // `as_of` is the row's `updated_at` as read with the packet. Recording a
+    // production step does not touch it; storing or blanking a packet does.
+    // A screen holding this packet drops it once the job's `updated_at` is
+    // no longer this value.
+    return { packet: job.packet_snapshot, job: recorded.job, as_of: job.updated_at };
   }
 
   /** The idempotency key of a job's most recent LABELLED event, or null. */
