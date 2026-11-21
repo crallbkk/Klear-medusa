@@ -2,7 +2,8 @@ import type { MedusaContainer } from "@medusajs/framework/types";
 import { LMS_MODULE, LabJobNotRebuildableError } from "./service";
 import type LmsModuleService from "./service";
 import { buildLabJobPacket } from "./build-packet";
-import { ProductionError } from "./production";
+import { ProductionError, decide, type JobState } from "./production";
+import type { LabJobPacket } from "./types";
 
 type LabJobRow = Awaited<ReturnType<LmsModuleService["updateJobFromBuild"]>>;
 type SubmitResult = Awaited<ReturnType<LmsModuleService["submitJob"]>>;
@@ -134,6 +135,98 @@ export async function applyChangedPrescription(
   }
   const job = await lms.updateJobFromBuild(jobId, result);
   return { outcome: "changed", job };
+}
+
+export type WarrantyRemakeResult =
+  | { outcome: "started"; result: Awaited<ReturnType<LmsModuleService["applyProductionAction"]>> }
+  /** The prescription could not be fetched back; nothing was changed. */
+  | { outcome: "not_built"; buildOutcome: "pending_rx" | "failed" | "skip" };
+
+/**
+ * Start a warranty remake on a labelled or delivered job.
+ *
+ * If the readable prescription was removed from its packet (it is, some
+ * time after delivery), the packet is built again from the order, which
+ * decrypts the customer's stored prescription, and handed to the writer,
+ * which stores it in the same transaction as the REMAKE_STARTED event. So
+ * the prescription is back only if the remake is recorded, the record
+ * names who asked, and a refused request changes nothing.
+ *
+ * Nothing is decrypted for a request that is going to be refused anyway,
+ * as far as can be told before asking the writer: the key was already
+ * used (the writer then answers with the first result), the job is not
+ * where a warranty remake starts, the version is stale, or the rules
+ * would refuse the remake even with the prescription back.
+ */
+export async function startWarrantyRemake(
+  container: MedusaContainer,
+  input: {
+    job_id: string;
+    idempotency_key: string;
+    expected_version?: number;
+    cause: unknown;
+    actor_id: string;
+  },
+  // Replaced in tests, which have no order module or vault to build from.
+  build: typeof buildLabJobPacket = buildLabJobPacket,
+): Promise<WarrantyRemakeResult> {
+  const lms = container.resolve(LMS_MODULE) as LmsModuleService;
+  const record = (restore_packet?: LabJobPacket) =>
+    lms.applyProductionAction({
+      job_id: input.job_id,
+      action: "REMAKE_STARTED",
+      idempotency_key: input.idempotency_key,
+      expected_version: input.expected_version,
+      detail: { cause: input.cause },
+      actor: { type: "user", id: input.actor_id },
+      restore_packet,
+    });
+
+  // A key that was already used is answered by the writer with the first
+  // result, whatever has happened to the job since. Nothing is fetched.
+  if (await lms.hasProductionEventKey(input.idempotency_key)) {
+    return { outcome: "started", result: await record() };
+  }
+  const current = (await lms.retrieveLabJob(input.job_id)) as unknown as LabJobRow;
+  if (current.stage !== "labelled" && current.stage !== "delivered") {
+    throw new ProductionError(
+      "not_allowed",
+      "a warranty remake starts from a labelled or delivered job; this one is " +
+        (current.stage ?? "not in production"),
+    );
+  }
+  // A packet that still has its prescription: the plain remake.
+  if (!current.rx_redacted_at) return { outcome: "started", result: await record() };
+
+  if (input.expected_version !== undefined && input.expected_version !== current.stage_version) {
+    throw new ProductionError(
+      "conflict",
+      `the job has moved (it is ${current.stage}); reload and try again`,
+    );
+  }
+  if (current.status !== "queued") {
+    throw new ProductionError(
+      "not_allowed",
+      `the packet of this job is ${current.status}; its prescription cannot be put back here`,
+    );
+  }
+  // Would the remake be recorded with the prescription back? Throws the
+  // rule's own refusal (on hold, an open question, a missing cause).
+  decide(
+    {
+      stage: current.stage,
+      remake_count: current.remake_count,
+      on_hold: current.on_hold,
+      cut_question_pending: current.cut_question_pending,
+      next_issue_reason: current.next_issue_reason as JobState["next_issue_reason"],
+    },
+    "REMAKE_STARTED",
+    { cause: input.cause },
+  );
+
+  const built = await build({ container, orderId: current.order_id });
+  if (built.outcome !== "ok") return { outcome: "not_built", buildOutcome: built.outcome };
+  return { outcome: "started", result: await record(built.packet) };
 }
 
 export async function rebuildAndSubmitJob(

@@ -4,11 +4,16 @@
 import { GET as production } from "../[id]/production/route";
 import { GET as queue } from "../../lab-queue/route";
 import { GET as reports } from "../../lab-reports/route";
+import { POST as warrantyRemake } from "../[id]/warranty-remake/route";
+import { startWarrantyRemake } from "../../../../modules/lms/rebuild";
+import { ProductionError } from "../../../../modules/lms/production";
 import { LMS_MODULE } from "../../../../modules/lms/service";
 import { OVERDUE_AFTER_HOURS, OVERDUE_WAITING_HOURS } from "../../../../modules/lms/board";
 import { captureException } from "../../../../lib/observability/sentry";
 
 jest.mock("../../../../lib/observability/sentry", () => ({ captureException: jest.fn() }));
+jest.mock("../../../../modules/lms/rebuild", () => ({ startWarrantyRemake: jest.fn() }));
+const mockRemake = startWarrantyRemake as jest.MockedFunction<typeof startWarrantyRemake>;
 
 function makeRes() {
   const res = { status: jest.fn(), json: jest.fn() };
@@ -155,6 +160,16 @@ describe("GET /admin/lab-jobs/[id]/production", () => {
     );
     expect(blanked.json.mock.calls[0][0].actions.lab.includes("REMAKE_STARTED")).toBe(false);
     expect(blanked.json.mock.calls[0][0].actions.rx_changed).toBe(false);
+    // A provider has that packet, so it cannot be rewritten for a remake.
+    expect(blanked.json.mock.calls[0][0].actions.warranty_remake).toBe(false);
+
+    const ours = makeRes();
+    await call(
+      production,
+      makeReq(lmsFor({ ...JOB, stage: "delivered", status: "queued", rx_redacted_at: new Date() })),
+      ours,
+    );
+    expect(ours.json.mock.calls[0][0].actions.warranty_remake).toBe(true);
   });
 
   it("offers no step on a job that is not in production", async () => {
@@ -166,7 +181,105 @@ describe("GET /admin/lab-jobs/[id]/production", () => {
       packet: false,
       retry: true,
       rx_changed: false,
+      warranty_remake: false,
     });
+  });
+});
+
+describe("POST /admin/lab-jobs/[id]/warranty-remake", () => {
+  const body = {
+    action: "REMAKE_STARTED",
+    idempotency_key: "screen-key-0001",
+    expected_version: 9,
+    detail: { cause: "scratched" },
+  };
+  const post = (b: object, auth: object | null = { actor_id: "user_ops", actor_type: "user" }) => ({
+    ...makeReq({}),
+    body: b,
+    auth_context: auth ?? undefined,
+  });
+
+  beforeEach(() => mockRemake.mockReset());
+
+  it("fetches the prescription and starts the remake as the signed-in user", async () => {
+    mockRemake.mockResolvedValue({
+      outcome: "started",
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      result: { event: { id: "e1" }, job: { id: "labjob_1", stage: "printed" }, replayed: false } as any,
+    });
+    const res = makeRes();
+    await call(warrantyRemake, post({ ...body, actor: "someone else" }), res);
+    expect(mockRemake).toHaveBeenCalledWith(expect.anything(), {
+      job_id: "labjob_1",
+      idempotency_key: "screen-key-0001",
+      expected_version: 9,
+      cause: "scratched",
+      actor_id: "user_ops",
+    });
+    expect(res.json.mock.calls[0][0].job.stage).toBe("printed");
+    expect(JSON.stringify(res.json.mock.calls)).not.toMatch(/packet|sph_/);
+  });
+
+  it("answers 422 in fixed words when the prescription cannot be fetched", async () => {
+    mockRemake.mockResolvedValue({ outcome: "not_built", buildOutcome: "failed" });
+    const res = makeRes();
+    await call(warrantyRemake, post(body), res);
+    expect(res.status).toHaveBeenCalledWith(422);
+    expect(res.json.mock.calls[0][0].message).toMatch(/could not be fetched/);
+  });
+
+  it("takes a remake and nothing else, from a person only", async () => {
+    for (const action of ["PRINTED", "HOLD", "RX_CHANGED", "PACKET_VIEWED"]) {
+      const res = makeRes();
+      await call(warrantyRemake, post({ ...body, action }), res);
+      expect([action, res.status.mock.calls[0]?.[0]]).toEqual([action, 400]);
+    }
+    const key = makeRes();
+    await call(warrantyRemake, post(body, { actor_id: "apk_1", actor_type: "api-key" }), key);
+    expect(key.status).toHaveBeenCalledWith(403);
+    const nobody = makeRes();
+    await call(warrantyRemake, post(body, null), nobody);
+    expect(nobody.status).toHaveBeenCalledWith(401);
+    expect(mockRemake).not.toHaveBeenCalled();
+  });
+
+  it("refuses a malformed request before a job is read or a prescription fetched", async () => {
+    for (const wrong of [
+      { ...body, idempotency_key: "short" },
+      { ...body, idempotency_key: "k".repeat(201) },
+      { ...body, expected_version: undefined },
+      { ...body, detail: {} },
+      { ...body, detail: { cause: "   " } },
+      { ...body, detail: { cause: 5 } },
+      { ...body, detail: { cause: "c".repeat(501) } },
+      { ...body, detail: undefined },
+    ]) {
+      const res = makeRes();
+      await call(warrantyRemake, post(wrong), res);
+      expect([JSON.stringify(wrong).slice(0, 60), res.status.mock.calls[0]?.[0]]).toEqual([
+        JSON.stringify(wrong).slice(0, 60),
+        400,
+      ]);
+    }
+    expect(mockRemake).not.toHaveBeenCalled();
+  });
+
+  it("answers a rule's refusal with its own sentence", async () => {
+    mockRemake.mockRejectedValue(
+      new ProductionError("not_allowed", "a warranty remake starts from a labelled or delivered job; this one is edged"),
+    );
+    const res = makeRes();
+    await call(warrantyRemake, post(body), res);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json.mock.calls[0][0].message).toMatch(/labelled or delivered/);
+  });
+
+  it("never echoes an unexpected error's own text", async () => {
+    mockRemake.mockRejectedValue(new Error("decrypt: sph_right -2.25 for Somchai"));
+    const res = makeRes();
+    await call(warrantyRemake, post(body), res);
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(JSON.stringify(res.json.mock.calls)).not.toMatch(/sph_right|Somchai/);
   });
 });
 

@@ -117,12 +117,20 @@ export function packetProblem(job: {
  *   packet      show or print the packet
  *   retry       rebuild the packet of a job the lab has not started
  *   rx_changed  the customer's prescription changed during production
+ *   warranty_remake  start a remake on a labelled or delivered job whose
+ *               prescription was removed: it is fetched back first
  */
 export function alsoOffered(
   job: JobState & PacketState,
-): { packet: boolean; retry: boolean; rx_changed: boolean } {
+): { packet: boolean; retry: boolean; rx_changed: boolean; warranty_remake: boolean } {
   const started = job.stage !== null && job.stage !== "ready";
   return {
+    warranty_remake:
+      (job.stage === "labelled" || job.stage === "delivered") &&
+      Boolean(job.rx_redacted_at) &&
+      job.status === "queued" &&
+      // With the prescription back, would the remake itself be accepted?
+      wouldAccept({ ...job, rx_redacted_at: null }, "REMAKE_STARTED"),
     packet: packetProblem(job) === null,
     // The Retry route also rebuilds a queued job the lab has not started.
     // That is offered only when there is something to fix: its

@@ -8,6 +8,8 @@ import {
   type ProductionAction,
 } from "../production";
 import { reportFrom } from "../board";
+import { startWarrantyRemake } from "../rebuild";
+import { NO_ORDER_FACTS, rxRedactionReason } from "../rx-retention";
 import { sql } from "./db-harness";
 
 const ok = (orderId: string): BuildPacketResult => ({
@@ -344,6 +346,313 @@ export function screensSuite(service: LmsModuleService): void {
       // A rebuild puts the prescription back, and the job can start.
       await service.updateJobFromBuild(job!.id, ok("order_a"));
       expect((await act(job!.id, "PRINTED")).job.stage).toBe("printed");
+    });
+  });
+
+  describe("a warranty remake after the prescription was removed", () => {
+    const container = { resolve: () => service } as never;
+    const built = (orderId: string) =>
+      telling(orderId) as Extract<BuildPacketResult, { outcome: "ok" }>;
+    // Stands in for the real build, which needs the order module and the
+    // vault. Counts how often a prescription would have been decrypted.
+    let decrypted = 0;
+    const build = (async () => {
+      decrypted++;
+      return built("order_a");
+    }) as never;
+    beforeEach(() => {
+      decrypted = 0;
+    });
+
+    const delivered = async (orderId = "order_a") => {
+      const job = await service.createFromBuild(telling(orderId));
+      await sql(`update lab_job set stage = 'delivered', stage_since = now() where id = $1`, [job!.id]);
+      await service.redactJobRx(job!.id);
+      return job!.id;
+    };
+    const state = async (id: string) =>
+      (
+        await sql(
+          `select packet_snapshot->'prescription' as rx, rx_redacted_at, stage, status,
+                  stage_version, event_seq, updated_at from lab_job where id = $1`,
+          [id],
+        )
+      )[0];
+    const ask = async (id: string, over: object = {}) => {
+      const s = await state(id);
+      return startWarrantyRemake(
+        container,
+        {
+          job_id: id,
+          idempotency_key: `remake-${++screenKey}-${Date.now()}`,
+          expected_version: s.stage_version as number,
+          cause: "scratched",
+          actor_id: "user_ops",
+          ...over,
+        },
+        build,
+      );
+    };
+
+    it("puts the prescription back and records the remake, together, as the person who asked", async () => {
+      const id = await delivered();
+      const before = await state(id);
+      expect(before.rx).toBeNull();
+
+      const done = await ask(id);
+      expect(done.outcome).toBe("started");
+      const after = await state(id);
+      expect(after.rx).toEqual({ sph_right: -2.25, sph_left: -3.75 });
+      expect(after.rx_redacted_at).toBeNull();
+      expect([after.stage, after.status]).toEqual(["printed", "queued"]);
+      // The packet changed, so a screen showing the blanked one drops it.
+      expect((after.updated_at as Date).getTime()).toBeGreaterThan((before.updated_at as Date).getTime());
+      const events = await service.listProductionEventsForJob(id);
+      const last = events[events.length - 1];
+      expect([last.action, last.actor_type, last.actor_id]).toEqual(["REMAKE_STARTED", "user", "user_ops"]);
+      // The record says the prescription was put back, and holds none of it.
+      expect(last.detail).toEqual({ cause: "scratched", warranty: true, prescription_restored: true });
+      expect(decrypted).toBe(1);
+    });
+
+    it("changes nothing, and decrypts nothing, when the request is going to be refused", async () => {
+      const id = await delivered();
+      const before = await state(id);
+      const refused = async (over: object, code: string) => {
+        await expect(ask(id, over)).rejects.toMatchObject({ code });
+        expect(await state(id)).toEqual(before);
+      };
+      await refused({ expected_version: (before.stage_version as number) + 5 }, "conflict");
+      await refused({ cause: "" }, "invalid_detail");
+      await refused({ cause: undefined }, "invalid_detail");
+      await sql(`update lab_job set status = 'failed' where id = $1`, [id]);
+      await expect(ask(id)).rejects.toMatchObject({ code: "not_allowed" });
+      await sql(`update lab_job set status = 'submitted' where id = $1`, [id]);
+      await expect(ask(id)).rejects.toMatchObject({ code: "not_allowed" });
+      await sql(`update lab_job set status = 'queued', stage = 'labelled', on_hold = true where id = $1`, [id]);
+      await expect(ask(id)).rejects.toMatchObject({ code: "not_allowed" });
+      for (const stage of ["ready", "edged", "qc_failed", "cancelled"]) {
+        await sql(`update lab_job set on_hold = false, stage = $2 where id = $1`, [id, stage]);
+        await expect(ask(id)).rejects.toMatchObject({ code: "not_allowed" });
+      }
+      expect((await state(id)).rx).toBeNull();
+      expect((await state(id)).rx_redacted_at).not.toBeNull();
+      expect(await service.listProductionEventsForJob(id)).toHaveLength(1);
+      expect(decrypted).toBe(0);
+    });
+
+    it("leaves the prescription out when the writer refuses after it was fetched", async () => {
+      // The job moves between the check and the write: the one case where
+      // a prescription is decrypted for nothing. It is still not stored.
+      const id = await delivered();
+      const moving = (async () => {
+        decrypted++;
+        await sql(`update lab_job set stage_version = stage_version + 1 where id = $1`, [id]);
+        return built("order_a");
+      }) as never;
+      const s = await state(id);
+      await expect(
+        startWarrantyRemake(
+          container,
+          {
+            job_id: id,
+            idempotency_key: "remake-moving-0001",
+            expected_version: s.stage_version as number,
+            cause: "scratched",
+            actor_id: "user_ops",
+          },
+          moving,
+        ),
+      ).rejects.toMatchObject({ code: "conflict" });
+      const after = await state(id);
+      expect([after.rx, after.rx_redacted_at === null, after.stage]).toEqual([null, false, "delivered"]);
+      expect(await service.listProductionEventsForJob(id)).toHaveLength(1);
+    });
+
+    it("answers a repeated request with the first result and fetches nothing again", async () => {
+      const id = await delivered();
+      const s = await state(id);
+      const request = {
+        job_id: id,
+        idempotency_key: "remake-repeat-0001",
+        expected_version: s.stage_version as number,
+        cause: "scratched",
+        actor_id: "user_ops",
+      };
+      await startWarrantyRemake(container, request, build);
+      expect(decrypted).toBe(1);
+      // Much later: the remake was delivered and blanked again. The same
+      // request arrives once more (a stuck retry, or someone replaying it).
+      await sql(`update lab_job set stage = 'delivered' where id = $1`, [id]);
+      await service.redactJobRx(id);
+      const events = (await service.listProductionEventsForJob(id)).length;
+      const again = await startWarrantyRemake(container, request, build);
+      expect(again.outcome === "started" && again.result.replayed).toBe(true);
+      expect(decrypted).toBe(1);
+      expect((await state(id)).rx).toBeNull();
+      expect(await service.listProductionEventsForJob(id)).toHaveLength(events);
+    });
+
+    it("says so, and changes nothing, when the stored prescription cannot be fetched", async () => {
+      const id = await delivered();
+      const before = await state(id);
+      const gone = (async () => ({ outcome: "failed", reason: "x", snapshot: {} })) as never;
+      const s = await state(id);
+      const done = await startWarrantyRemake(
+        container,
+        {
+          job_id: id,
+          idempotency_key: "remake-gone-0001",
+          expected_version: s.stage_version as number,
+          cause: "scratched",
+          actor_id: "user_ops",
+        },
+        gone,
+      );
+      expect(done).toEqual({ outcome: "not_built", buildOutcome: "failed" });
+      expect(await state(id)).toEqual(before);
+    });
+
+    it("starts the plain remake, fetching nothing, when the packet still has its prescription", async () => {
+      const job = await service.createFromBuild(telling("order_a"));
+      await sql(`update lab_job set stage = 'delivered' where id = $1`, [job!.id]);
+      const done = await ask(job!.id);
+      expect(done.outcome).toBe("started");
+      expect(decrypted).toBe(0);
+      const events = await service.listProductionEventsForJob(job!.id);
+      expect(events[events.length - 1].detail).toEqual({ cause: "scratched", warranty: true });
+    });
+
+    it("lets the writer put a prescription back for a warranty remake and nothing else", async () => {
+      const id = await delivered();
+      const packet = built("order_a").packet;
+      const s = await state(id);
+      const write = (over: object) =>
+        service.applyProductionAction({
+          job_id: id,
+          action: "REMAKE_STARTED",
+          idempotency_key: `writer-${++screenKey}-${Date.now()}`,
+          expected_version: s.stage_version as number,
+          actor: USER,
+          detail: { cause: "c" },
+          restore_packet: packet,
+          ...over,
+        });
+      await expect(write({ action: "NOTE", detail: { text: "t" } })).rejects.toMatchObject({
+        code: "not_allowed",
+      });
+      await sql(`update lab_job set stage = 'qc_failed' where id = $1`, [id]);
+      await expect(write({})).rejects.toMatchObject({ code: "not_allowed" });
+      await sql(`update lab_job set stage = 'delivered', rx_redacted_at = null where id = $1`, [id]);
+      await expect(write({})).rejects.toMatchObject({ code: "not_allowed" });
+      expect((await state(id)).rx).toBeNull();
+    });
+
+    it("tells the nightly sweep what it needs to leave the remake alone", async () => {
+      const id = await delivered();
+      await ask(id);
+      // An old job: by its age alone it would be blanked tonight.
+      await sql(`update lab_job set created_at = now() - interval '300 days' where id = $1`, [id]);
+      const [row] = (await service.listJobsHoldingRx()).filter((j) => j.id === id);
+      expect(row.stage).toBe("printed");
+      expect(row.rx_restored_at).toBeTruthy();
+      const longAgo = { deliveredAt: new Date(Date.now() - 200 * 24 * 3600_000), cancelled: false };
+      for (const order of [longAgo, NO_ORDER_FACTS]) {
+        expect(rxRedactionReason(row, order, new Date())).toBeNull();
+        // The same job without the stamp would be blanked tonight.
+        expect(rxRedactionReason({ ...row, rx_restored_at: null }, order, new Date())).not.toBeNull();
+      }
+    });
+
+    it("stamps the job only when a prescription is put back", async () => {
+      // A remake after a QC failure, and a plain remake of a delivered job
+      // that still has its prescription, are not restores.
+      const qc = await service.createFromBuild(ok("order_qc"));
+      for (const [action, detail] of [
+        ["PRINTED", undefined],
+        ["LENS_ISSUED", { lenses: ["LENS-A1", "LENS-A2"] }],
+        ["EDGED", undefined],
+        ["MOUNTED", undefined],
+        ["QC_FAILED", { reason: "r" }],
+        ["REMAKE_STARTED", { cause: "c" }],
+      ] as const) {
+        await act(qc!.id, action, detail as never);
+      }
+      const plain = await service.createFromBuild(ok("order_plain"));
+      await sql(`update lab_job set stage = 'delivered' where id = $1`, [plain!.id]);
+      await ask(plain!.id);
+      expect(
+        await sql(`select rx_restored_at from lab_job where id in ($1, $2)`, [qc!.id, plain!.id]),
+      ).toEqual([{ rx_restored_at: null }, { rx_restored_at: null }]);
+
+      const id = await delivered("order_b");
+      await ask(id);
+      expect((await sql(`select rx_restored_at from lab_job where id = $1`, [id]))[0].rx_restored_at).not.toBeNull();
+    });
+
+    it("holds at the writer itself: status, a repeated key, a packet that is not one", async () => {
+      const id = await delivered();
+      const packet = built("order_a").packet;
+      const s = await state(id);
+      const request = {
+        job_id: id,
+        action: "REMAKE_STARTED" as const,
+        idempotency_key: "writer-restore-0001",
+        expected_version: s.stage_version as number,
+        actor: USER,
+        detail: { cause: "c" },
+      };
+      for (const status of ["failed", "pending_rx", "submitted", "submitting"]) {
+        await sql(`update lab_job set status = $2 where id = $1`, [id, status]);
+        await expect(
+          service.applyProductionAction({ ...request, restore_packet: packet }),
+        ).rejects.toMatchObject({ code: "not_allowed" });
+      }
+      await sql(`update lab_job set status = 'queued' where id = $1`, [id]);
+      for (const notAPacket of [null, "x", 5, []]) {
+        await expect(
+          service.applyProductionAction({ ...request, restore_packet: notAPacket as never }),
+        ).rejects.toMatchObject({ code: "invalid_detail" });
+      }
+      expect((await state(id)).rx).toBeNull();
+
+      await service.applyProductionAction({ ...request, restore_packet: packet });
+      // Delivered and blanked again; the same key arrives WITH a packet.
+      await sql(`update lab_job set stage = 'delivered' where id = $1`, [id]);
+      await service.redactJobRx(id);
+      const again = await service.applyProductionAction({ ...request, restore_packet: packet });
+      expect(again.replayed).toBe(true);
+      expect((await state(id)).rx).toBeNull();
+    });
+
+    it("never carries the packet out of a restore that fails in the database", async () => {
+      const id = await delivered();
+      const s = await state(id);
+      await sql(`
+        create function test_fail() returns trigger language plpgsql as $$
+        begin raise exception 'forced failure'; end $$;
+        create trigger test_fail before insert on production_event
+          for each row execute function test_fail();`);
+      let caught: unknown;
+      try {
+        await service.applyProductionAction({
+          job_id: id,
+          action: "REMAKE_STARTED",
+          idempotency_key: "writer-restore-fail-1",
+          expected_version: s.stage_version as number,
+          actor: USER,
+          detail: { cause: "c" },
+          restore_packet: built("order_a").packet,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect(everythingIn(caught)).not.toMatch(/2\.25|3\.75|Secretname|66811112222|sph_right/);
+      // Rolled back with the event: nothing was put back.
+      await sql(`drop trigger test_fail on production_event`);
+      expect((await state(id)).rx).toBeNull();
+      expect((await state(id)).rx_redacted_at).not.toBeNull();
     });
   });
 

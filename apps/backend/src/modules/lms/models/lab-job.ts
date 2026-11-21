@@ -48,6 +48,9 @@ const LabJob = model.define("lab_job", {
   // When the readable prescription in packet_snapshot was blanked. Null
   // while the snapshot may still hold one. A rebuild (retry) clears this.
   rx_redacted_at: model.dateTime().nullable(),
+  // When the readable prescription was put back to start a warranty
+  // remake. Null on a job that never had one. See `rx-retention.ts`.
+  rx_restored_at: model.dateTime().nullable(),
 
   // ── Production (see production.ts) ─────────────────────────────────────
   // Where the physical job is. Null until the packet is built. A cache of

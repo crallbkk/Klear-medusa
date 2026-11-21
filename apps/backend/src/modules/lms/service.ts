@@ -121,6 +121,8 @@ export type LabJobRow = {
   submitted_at: Date | null;
   /** When the readable prescription in `packet_snapshot` was blanked. */
   rx_redacted_at: Date | null;
+  /** When it was put back to start a warranty remake; null if never. */
+  rx_restored_at: Date | null;
   /** Production: where the physical job is. Null until the packet is built. */
   stage: Stage | null;
   stage_since: Date | null;
@@ -180,6 +182,15 @@ export type ProductionActionInput = {
   /** When it happened, if entered later from the paper log. */
   happened_at?: Date | null;
   detail?: Record<string, unknown>;
+  /**
+   * A warranty remake on a job whose readable prescription was removed: the
+   * packet, freshly built from the order, to put back. Stored in the same
+   * transaction as the REMAKE_STARTED event, so the prescription is back
+   * only if the remake is recorded, and the event says it was put back.
+   * Accepted only with REMAKE_STARTED on a labelled or delivered job whose
+   * packet is ours to rewrite (`queued`) and is blanked.
+   */
+  restore_packet?: LabJobPacket;
 };
 
 export type ProductionActionResult = {
@@ -296,7 +307,15 @@ type Sql = { execute: (sql: string, params?: unknown[]) => Promise<any[]> };
 /** The columns the retention sweep needs — deliberately NOT the snapshot. */
 export type LabJobRetentionRow = Pick<
   LabJobRow,
-  "id" | "order_id" | "status" | "created_at" | "updated_at" | "rx_redacted_at"
+  | "id"
+  | "order_id"
+  | "status"
+  | "created_at"
+  | "updated_at"
+  | "rx_redacted_at"
+  | "rx_restored_at"
+  | "stage"
+  | "stage_since"
 >;
 
 /**
@@ -763,6 +782,9 @@ class LmsModuleService extends MedusaService({
             "created_at",
             "updated_at",
             "rx_redacted_at",
+            "rx_restored_at",
+            "stage",
+            "stage_since",
           ],
           take: PAGE,
           skip,
@@ -978,8 +1000,32 @@ class LmsModuleService extends MedusaService({
           `the job has moved (it is ${job.stage ?? "not ready"}); reload and try again`,
         );
       }
+      // A prescription to put back for a warranty remake: only where that
+      // is what is happening.
+      const restoring = input.restore_packet !== undefined;
+      if (restoring) {
+        const p = input.restore_packet as unknown;
+        if (p === null || typeof p !== "object" || Array.isArray(p)) {
+          throw new ProductionError("invalid_detail", "the packet to put back is not a packet");
+        }
+        if (action !== "REMAKE_STARTED" || (job.stage !== "labelled" && job.stage !== "delivered")) {
+          throw new ProductionError(
+            "not_allowed",
+            "a prescription is only put back to start a remake on a labelled or delivered job",
+          );
+        }
+        if (job.status !== "queued") {
+          throw new ProductionError(
+            "not_allowed",
+            `the packet of this job is ${job.status}; its prescription cannot be put back here`,
+          );
+        }
+        if (!job.rx_redacted_at) {
+          throw new ProductionError("not_allowed", "this job's packet still has its prescription");
+        }
+      }
       // Whether there is a packet to work from (see `packetForbids`).
-      const forbidden = packetForbids(job, action);
+      const forbidden = packetForbids(restoring ? { ...job, rx_redacted_at: null } : job, action);
       if (forbidden) throw new ProductionError("not_allowed", forbidden);
 
       const state: JobState = {
@@ -1030,6 +1076,24 @@ class LmsModuleService extends MedusaService({
       // rebuild stores the new packet the job has none to work from, which
       // is what `pending_rx` means; PRINTED is refused, and both the Retry
       // button and the half-hourly heal sweep rebuild it.
+      if (restoring) {
+        // Merged over the stored packet, as a rebuild is. `updated_at` moves
+        // because the packet changed: a screen showing the blanked one
+        // drops it (see `viewPacket`).
+        sets.push(
+          `"packet_snapshot" = coalesce("packet_snapshot", '{}'::jsonb) || ?::jsonb`,
+          `"rx_redacted_at" = null`,
+          // The one place this is set. Retention keeps the prescription
+          // from here while the remake is made (`rx-retention.ts`).
+          `"rx_restored_at" = ?`,
+          `"updated_at" = ?`,
+        );
+        params.push(JSON.stringify(input.restore_packet), now, now);
+        // Said on the event, as a fact with no values: this remake is made
+        // from the customer's stored prescription as it is now, which need
+        // not be the one the first pair was made from.
+        effect.detail = { ...effect.detail, prescription_restored: true };
+      }
       if (effect.packet_outdated && (job.status === "queued" || job.status === "failed")) {
         sets.push(`"status" = 'pending_rx'`, `"last_error" = ?`);
         params.push("prescription changed; the packet is being rebuilt");

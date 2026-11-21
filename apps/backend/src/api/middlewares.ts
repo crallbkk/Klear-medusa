@@ -41,5 +41,6 @@ export default defineMiddlewares({
     { matcher: "/admin/lab-jobs/:id/ops-actions", methods: ["POST"], policies: [LAB_OPS] },
     { matcher: "/admin/lab-jobs/:id/rx-changed", methods: ["POST"], policies: [LAB_OPS] },
     { matcher: "/admin/lab-jobs/:id/retry", methods: ["POST"], policies: [LAB_OPS] },
+    { matcher: "/admin/lab-jobs/:id/warranty-remake", methods: ["POST"], policies: [LAB_OPS] },
   ],
 });

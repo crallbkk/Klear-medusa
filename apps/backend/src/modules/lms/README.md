@@ -336,6 +336,7 @@ so it will be a button.
 | `POST /admin/lab-jobs/:id/ops-actions` | Hold and release | `lab_job_ops:update` |
 | `POST /admin/lab-jobs/:id/rx-changed` | A changed prescription on a job in production | `lab_job_ops:update` |
 | `POST /admin/lab-jobs/:id/retry` | Rebuild a packet, as before | `lab_job_ops:update` |
+| `POST /admin/lab-jobs/:id/warranty-remake` | Fetch the prescription back into a labelled or delivered job's packet and start a remake | `lab_job_ops:update` |
 
 1. **The packet leaves through one route.** The list and the job routes used
    to return `packet_snapshot`, prescription included, to any admin user
@@ -402,9 +403,16 @@ in `src/admin/lib/lab.ts` and is tested against the production rules.
    quote exists or is waiting for an invoice (the job route checks the
    quotes for the invoice) and which lenses were issued (the writer
    refuses a lens that was not).
-   1. **A delivered job whose prescription was removed offers no remake**
-      and nothing on the screen can rebuild its packet (known gap 2 below).
-      A warranty remake after the retention period is not possible yet.
+   1. **A warranty remake after the prescription was removed.** The
+      readable prescription is blanked from a packet 60 days after
+      delivery (the customer's stored, encrypted prescription is kept for
+      two years and is not touched by that). A labelled or delivered job
+      in that state offers "Start warranty remake" in place of the plain
+      remake: `POST /admin/lab-jobs/:id/warranty-remake` builds the packet
+      again from the order, which decrypts the stored prescription, puts
+      it back, and records REMAKE_STARTED. If the stored prescription is
+      gone (erased, or past its two years) the answer is 422 and nothing
+      changes.
 3. **Overdue thresholds** (`OVERDUE_AFTER_HOURS`, `OVERDUE_WAITING_HOURS`
    in `board.ts`). Glasses made in-house are produced the same day, so a
    bench step, an open cut question or a failed packet is overdue after
@@ -499,9 +507,31 @@ Known gaps, to be closed with the parts above:
 1. `LENS_ISSUED` checks that each SKU is well formed. It cannot yet check
    that it is the right lens for the prescription, because no mapping from a
    prescription to a lens SKU exists in this repository.
-2. A warranty remake needs the prescription back in the packet, but the
-   retention sweep decides from the order and would blank it again that
-   night. Retention must learn to keep a job that is back in production.
+2. Closed for jobs whose packet is ours (`queued`). A warranty remake puts
+   the prescription back (see "Screens", item 2.1). How it holds together:
+   1. The prescription is stored by the writer in the same transaction as
+      the REMAKE_STARTED event, whose detail says `prescription_restored`.
+      A refused request stores nothing. Nothing is decrypted for a request
+      that can be seen to fail beforehand. Two exceptions: a job that
+      moves in the moment between the check and the write, and the same
+      request sent twice at once (both fetch; one is recorded).
+   2. The writer stamps `lab_job.rx_restored_at` when it puts a
+      prescription back, and nothing else sets it. Retention
+      (`rx-retention.ts`) reads that stamp: the prescription is kept for
+      60 days after it was put back, or, once the remake is delivered
+      again, 60 days after that delivery. Moving the job between stages
+      does not extend it. A job that was never restored (a remake after a
+      QC failure included) is judged exactly as before.
+   3. If a remake is still unfinished 60 days after the prescription was
+      put back, it is blanked. The lab then works from the sheet it
+      printed, or starts the remake again once the job is back at
+      labelled or delivered.
+   4. The packet is built from the order as it is NOW. If the customer has
+      since saved a new prescription on that order's line, the remake is
+      made from the new one. The event says the prescription was put back;
+      it does not say whether it differs from the first.
+   5. Not possible once a lab provider holds the packet (`submitted`), or
+      for a job whose packet failed: neither is offered the button.
 3. `remake_count` counts QC and warranty remakes only. A lens reissued after
    a spoil, or after a customer's changed prescription, is not counted, so a
    report of "more lens issues than remakes explain" must allow for those.

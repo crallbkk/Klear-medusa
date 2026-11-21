@@ -397,6 +397,22 @@
           "enumItems": [],
           "mappedType": "datetime"
         },
+        "rx_restored_at": {
+          "name": "rx_restored_at",
+          "type": "timestamptz",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
         "stage": {
           "name": "stage",
           "type": "text",

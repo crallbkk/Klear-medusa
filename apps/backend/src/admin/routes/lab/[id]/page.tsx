@@ -41,7 +41,14 @@ type JobResponse = {
   job: LabJob & { rx_redacted_at?: string | null; next_issue_reason?: string };
   events: LabEvent[];
   costs: LabCost[];
-  actions: { lab: string[]; ops: string[]; packet: boolean; retry: boolean; rx_changed: boolean };
+  actions: {
+    lab: string[];
+    ops: string[];
+    packet: boolean;
+    retry: boolean;
+    rx_changed: boolean;
+    warranty_remake: boolean;
+  };
   vendors: string[];
 };
 
@@ -233,7 +240,7 @@ const LabJobPage = () => {
 
 type OpenForm = {
   action: string;
-  door: "actions" | "ops-actions";
+  door: "actions" | "ops-actions" | "warranty-remake";
   // The job as it was when the form was opened: what the person decided on.
   stage_version: number;
   event_seq: number | undefined;
@@ -299,11 +306,11 @@ const JobScreen = ({ id }: { id: string }) => {
     },
   });
 
-  const press = async (action: string) => {
+  const press = async (action: string, door?: Step["door"]) => {
     if (!data) return;
     const step: Step = {
       action,
-      door: data.actions.ops.includes(action) ? "ops-actions" : "actions",
+      door: door ?? (data.actions.ops.includes(action) ? "ops-actions" : "actions"),
       stage_version: data.job.stage_version,
       event_seq: data.job.event_seq,
       values: {},
@@ -546,6 +553,19 @@ const JobScreen = ({ id }: { id: string }) => {
               }}
             >
               Prescription changed
+            </Button>
+          ) : null}
+          {actions.warranty_remake ? (
+            // The prescription was removed from this packet after delivery.
+            // This fetches it back from the customer's stored prescription,
+            // then starts the remake.
+            <Button
+              size="small"
+              variant="primary"
+              disabled={busy}
+              onClick={() => press("REMAKE_STARTED", "warranty-remake")}
+            >
+              Start warranty remake
             </Button>
           ) : null}
           {actions.retry ? (

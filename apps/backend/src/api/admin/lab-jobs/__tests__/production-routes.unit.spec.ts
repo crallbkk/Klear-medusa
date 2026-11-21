@@ -487,7 +487,7 @@ describe("every lab route declares a permission", () => {
         }
       }
     }
-    expect(found.length).toBeGreaterThanOrEqual(10);
+    expect(found.length).toBeGreaterThanOrEqual(11);
     for (const route of found) expect([route, declared.has(route)]).toEqual([route, true]);
     // And no entry points at a lab route that does not exist.
     for (const key of declared.keys()) {

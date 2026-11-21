@@ -73,7 +73,12 @@ describe("the buttons a job offers", () => {
     // way out is to rebuild it, which the screen then offers.
     const blanked = state("ready", { rx_redacted_at: new Date() });
     expect(offeredActions(blanked).includes("PRINTED")).toBe(false);
-    expect(alsoOffered(blanked)).toEqual({ packet: false, retry: true, rx_changed: true });
+    expect(alsoOffered(blanked)).toEqual({
+      packet: false,
+      retry: true,
+      rx_changed: true,
+      warranty_remake: false,
+    });
     // Once the lab has started, a rebuild is no longer possible that way.
     expect(alsoOffered(state("edged", { rx_redacted_at: new Date() })).retry).toBe(false);
     expect(alsoOffered(state("ready")).retry).toBe(false);
@@ -246,6 +251,34 @@ describe("what the job screen offers besides the steps", () => {
     for (const status of ["submitted", "submitting", "cancelled"]) {
       expect([status, alsoOffered(job({ stage: "printed", status })).rx_changed]).toEqual([status, false]);
     }
+  });
+});
+
+describe("a warranty remake after the prescription was removed", () => {
+  const blanked = (stage: Stage | null, over: object = {}) =>
+    state(stage, { rx_redacted_at: new Date(), ...over });
+
+  it("is offered on a labelled or delivered job, where the plain remake is not", () => {
+    for (const stage of ["labelled", "delivered"] as const) {
+      expect(offeredActions(blanked(stage)).includes("REMAKE_STARTED")).toBe(false);
+      expect(alsoOffered(blanked(stage)).warranty_remake).toBe(true);
+    }
+  });
+
+  it("is not offered when the plain remake works, or the job is somewhere else", () => {
+    expect(alsoOffered(state("delivered")).warranty_remake).toBe(false);
+    for (const stage of [null, "ready", "edged", "qc_failed", "cancelled"] as const) {
+      expect([stage, alsoOffered(blanked(stage)).warranty_remake]).toEqual([stage, false]);
+    }
+    // Only a packet that is ours to rewrite and to work from.
+    for (const status of ["submitted", "submitting", "failed", "pending_rx", "cancelled"]) {
+      expect([status, alsoOffered(blanked("delivered", { status })).warranty_remake]).toEqual([
+        status,
+        false,
+      ]);
+    }
+    // Not while the job is held or a cut question is open.
+    expect(alsoOffered(blanked("labelled", { on_hold: true })).warranty_remake).toBe(false);
   });
 });
 

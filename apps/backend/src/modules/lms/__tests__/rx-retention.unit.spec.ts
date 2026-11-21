@@ -209,3 +209,82 @@ describe("orderRetentionFacts", () => {
     expect(facts.deliveredAt?.getTime()).toBe(daysAgo(3).getTime());
   });
 });
+
+describe("rxRedactionReason: a prescription put back for a warranty remake", () => {
+  // The writer stamps `rx_restored_at` when it puts a prescription back to
+  // start a warranty remake. Nothing else sets it: not a QC remake, not a
+  // rebuild, not a stage move.
+  const longAgo = delivered(daysAgo(200));
+  const restored = (days: number, over: object = {}) =>
+    job({
+      created_at: daysAgo(400),
+      rx_restored_at: daysAgo(days),
+      stage: "printed",
+      stage_since: daysAgo(days),
+      ...over,
+    });
+
+  it("keeps it while the remake is made, whatever the order and the job's age say", () => {
+    // By the order alone (delivered 200 days ago) and by age alone (400
+    // days) this job would be blanked tonight.
+    expect(rxRedactionReason(restored(1), longAgo, NOW)).toBeNull();
+    // Also when the order has no delivery on record, or cannot be read.
+    expect(rxRedactionReason(restored(1), NO_ORDER_FACTS, NOW)).toBeNull();
+    for (const stage of ["ready", "printed", "edged", "qc_failed", "packed", "labelled"]) {
+      expect([stage, rxRedactionReason(restored(5, { stage }), longAgo, NOW)]).toEqual([stage, null]);
+    }
+  });
+
+  it("gives up 60 days after it was put back, however often the job has moved since", () => {
+    const moved = { stage_since: daysAgo(1) };
+    expect(rxRedactionReason(restored(RX_REDACT_AFTER_DELIVERY_DAYS - 1, moved), longAgo, NOW)).toBeNull();
+    expect(rxRedactionReason(restored(RX_REDACT_AFTER_DELIVERY_DAYS, moved), longAgo, NOW)).toBe("delivered");
+    expect(rxRedactionReason(restored(RX_REDACT_AFTER_DELIVERY_DAYS, moved), NO_ORDER_FACTS, NOW)).toBe(
+      "delivered",
+    );
+  });
+
+  it("counts 60 days from the remake's own delivery once it is delivered again", () => {
+    const again = (deliveredDays: number) =>
+      restored(100, { stage: "delivered", stage_since: daysAgo(deliveredDays) });
+    expect(rxRedactionReason(again(RX_REDACT_AFTER_DELIVERY_DAYS - 1), longAgo, NOW)).toBeNull();
+    expect(rxRedactionReason(again(RX_REDACT_AFTER_DELIVERY_DAYS), longAgo, NOW)).toBe("delivered");
+    expect(rxRedactionReason(again(RX_REDACT_AFTER_DELIVERY_DAYS), NO_ORDER_FACTS, NOW)).toBe("delivered");
+  });
+
+  it("still blanks a cancelled job or order at once", () => {
+    expect(rxRedactionReason(restored(1, { status: "cancelled" }), longAgo, NOW)).toBe("cancelled");
+    expect(rxRedactionReason(restored(1), { deliveredAt: null, cancelled: true }, NOW)).toBe("cancelled");
+    // A remake cancelled in the lab: back to the ordinary rules.
+    expect(rxRedactionReason(restored(1, { stage: "cancelled" }), longAgo, NOW)).toBe("delivered");
+  });
+
+  it("falls back to the ordinary rules when the stamp cannot be read", () => {
+    expect(rxRedactionReason(restored(1, { rx_restored_at: "nonsense" }), longAgo, NOW)).toBe("delivered");
+  });
+
+  it("changes nothing for a job that was never restored, remade at QC or not", () => {
+    // What the rule said before production fields existed, for the same job.
+    const plain = (over: object) => job({ created_at: daysAgo(10), ...over });
+    const cases: Array<[object, ReturnType<typeof delivered> | typeof NO_ORDER_FACTS]> = [
+      // QC-remade, stage never moved on, order delivered since.
+      [{ remake_count: 1, stage: "qc_passed", stage_since: daysAgo(110) }, delivered(daysAgo(100))],
+      // QC-remade, paper-log steps entered after delivery.
+      [{ remake_count: 1, stage: "packed", stage_since: daysAgo(10) }, delivered(daysAgo(70))],
+      // QC-remade, delivered once, old.
+      [{ remake_count: 2, stage: "delivered", stage_since: daysAgo(15), created_at: daysAgo(185) }, NO_ORDER_FACTS],
+      // QC-remade, delivery event recorded late.
+      [{ remake_count: 1, stage: "delivered", stage_since: daysAgo(30) }, delivered(daysAgo(100))],
+      // Never delivered, moved yesterday, very old.
+      [{ remake_count: 1, stage: "edged", stage_since: daysAgo(1), created_at: daysAgo(400) }, NO_ORDER_FACTS],
+      // Young and undelivered.
+      [{ remake_count: 1, stage: "edged", stage_since: daysAgo(1) }, NO_ORDER_FACTS],
+    ];
+    for (const [fields, order] of cases) {
+      const withProduction = rxRedactionReason(plain(fields), order, NOW);
+      const { stage: _s, stage_since: _ss, remake_count: _r, ...bare } = plain(fields) as Record<string, unknown>;
+      const before = rxRedactionReason(bare as never, order, NOW);
+      expect([JSON.stringify(fields), withProduction]).toEqual([JSON.stringify(fields), before]);
+    }
+  });
+});
