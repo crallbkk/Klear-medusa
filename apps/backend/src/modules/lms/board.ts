@@ -14,22 +14,24 @@ import {
 /**
  * Hours a job may sit in a stage before the board calls it overdue.
  *
- * THESE ARE PLACEHOLDERS. The design (10.9) says the first thresholds are
- * agreed with the lab before go-live; nobody has agreed these. One working
- * day for a step done at the bench, a week for an outside lab, three days
- * for a parcel the carrier has not delivered. A finished job has none.
+ * Glasses made in-house are produced the same day (the owner, 2026-11-21),
+ * so a step at the bench is overdue after four hours: a job that has not
+ * moved in half a working day will not finish that day. The other two are
+ * still placeholders nobody has agreed: a week for an outside lab, three
+ * days for a parcel the carrier has not delivered. A finished job has none.
  */
+const BENCH_HOURS = 4;
 export const OVERDUE_AFTER_HOURS: Partial<Record<Stage, number>> = {
-  ready: 24,
-  printed: 24,
-  lens_issued: 24,
+  ready: BENCH_HOURS,
+  printed: BENCH_HOURS,
+  lens_issued: BENCH_HOURS,
   sent_to_lab: 7 * 24,
-  received_from_lab: 24,
-  edged: 24,
-  mounted: 24,
-  qc_passed: 24,
-  qc_failed: 24,
-  packed: 24,
+  received_from_lab: BENCH_HOURS,
+  edged: BENCH_HOURS,
+  mounted: BENCH_HOURS,
+  qc_passed: BENCH_HOURS,
+  qc_failed: BENCH_HOURS,
+  packed: BENCH_HOURS,
   labelled: 3 * 24,
 };
 
@@ -39,8 +41,8 @@ export const OVERDUE_AFTER_HOURS: Partial<Record<Stage, number>> = {
  * the prescription later is given three days before the board flags it.
  */
 export const OVERDUE_WAITING_HOURS: Record<string, number> = {
-  question: 24,
-  packet_failed: 24,
+  question: BENCH_HOURS,
+  packet_failed: BENCH_HOURS,
   waiting_rx: 3 * 24,
 };
 

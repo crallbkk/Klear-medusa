@@ -222,6 +222,31 @@ describe("production rules: an open cut-or-uncut question", () => {
   });
 });
 
+describe("production rules: a job on hold", () => {
+  it("refuses every step a person takes that moves the job, until it is released", () => {
+    for (const [action, t] of Object.entries(TABLE) as [ProductionAction, (typeof TABLE)["READY"]][]) {
+      const system = ["READY", "LABELLED", "LABEL_CANCELLED", "DELIVERED", "RX_CHANGED", "CANCELLED"].includes(action);
+      for (const from of t.from) {
+        const held = job(from, { on_hold: true });
+        if (system) {
+          // The order's own events are facts; a hold does not stop them.
+          expect(() => decide(held, action, DETAIL[action] ?? {})).not.toThrow();
+        } else {
+          expect(() => decide(held, action, DETAIL[action] ?? {})).toThrow(/on hold/);
+        }
+      }
+    }
+  });
+
+  it("still takes a note, a broken frame, a lab invoice and the release itself", () => {
+    const held = job("edged", { on_hold: true });
+    expect(() => decide(held, "NOTE", { text: "t" })).not.toThrow();
+    expect(() => decide(held, "FRAME_DAMAGED", { sku: "KLR-1", reason: "r" })).not.toThrow();
+    expect(() => decide(held, "LAB_INVOICED", { invoiced_satang: 1 })).not.toThrow();
+    expect(decide(held, "RELEASE").patch).toEqual({ on_hold: false, hold_reason: null });
+  });
+});
+
 describe("bangkokDate", () => {
   it("gives the Bangkok calendar day of an instant", () => {
     expect(bangkokDate(new Date("2026-11-30T16:59:59Z"))).toBe("2026-11-30");

@@ -255,6 +255,18 @@ export function decide(
 ): Effect {
   const none: Effect = { patch: {}, usage: [], detail: {} };
 
+  // On hold means stop: nothing a person does moves the job until it is
+  // released. What the order itself does (a label, a delivery, a cancel, a
+  // changed prescription) is a fact and is recorded all the same, and so
+  // are notes, a broken frame and a lab's invoice.
+  if (
+    job.on_hold &&
+    (STAGE_ACTIONS as readonly string[]).includes(action) &&
+    !SYSTEM_ONLY_ACTIONS.has(action)
+  ) {
+    throw new ProductionError("not_allowed", `${action} must wait: the job is on hold; release it first`);
+  }
+
   switch (action) {
     case "READY":
       if (job.stage !== null) refuse(action, job);

@@ -405,11 +405,18 @@ in `src/admin/lib/lab.ts` and is tested against the production rules.
    1. **A delivered job whose prescription was removed offers no remake**
       and nothing on the screen can rebuild its packet (known gap 2 below).
       A warranty remake after the retention period is not possible yet.
-3. **Overdue thresholds are placeholders** (`OVERDUE_AFTER_HOURS`,
-   `OVERDUE_WAITING_HOURS` in `board.ts`): one working day per bench step,
-   a week at an outside lab, three days for a labelled parcel or a missing
-   prescription. The design says they are agreed with the lab before
-   go-live. Nobody has agreed these.
+3. **Overdue thresholds** (`OVERDUE_AFTER_HOURS`, `OVERDUE_WAITING_HOURS`
+   in `board.ts`). Glasses made in-house are produced the same day, so a
+   bench step, an open cut question or a failed packet is overdue after
+   four hours. Still placeholders nobody has agreed: a week at an outside
+   lab, three days for a labelled parcel or a missing prescription. The
+   clock runs through nights and weekends; a job left at the bench on
+   Friday evening is overdue on Monday morning, which is right, and one
+   that arrived at 17:55 is flagged at opening time, which is noise.
+   1. **On hold means stop.** A held job refuses every step a person takes
+      that moves it, until it is released. Notes, a broken frame, a lab
+      invoice and what the order itself does (label, delivery, cancel, a
+      changed prescription) are still recorded.
 4. **The board also lists jobs stuck before production**: a packet that
    failed, or a prescription that has not arrived. Nothing else showed
    them. There is no age limit, so on the first deploy every such job in
