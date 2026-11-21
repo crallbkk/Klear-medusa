@@ -7,6 +7,17 @@ import { LMS_MODULE, LabJobNotRebuildableError } from "../../../../../modules/lm
 import type LmsModuleService from "../../../../../modules/lms/service";
 import { rebuildAndSubmitJob } from "../../../../../modules/lms/rebuild";
 import { captureException } from "../../../../../lib/observability/sentry";
+import { NOT_BUILT, errorKind, withoutPacket } from "../../production-http";
+
+// A job in an answer, never with its packet. The packet is shown by one
+// route, which records who looked.
+const bare = (job: unknown) => withoutPacket((job ?? {}) as Record<string, unknown>);
+// What kind of error, without its text. An error's message can hold a
+// whole packet (a failed save is the SQL with its values), and Sentry's
+// scrubber cannot clean a message, so the original error is never logged
+// or reported: a new one naming only its kind is.
+const kindOf = errorKind;
+const reportable = (err: unknown, what: string) => new Error(`${what}: ${errorKind(err)}`);
 
 /**
  * POST /admin/lab-jobs/[id]/retry — heal + re-attempt a lab job. No body.
@@ -54,12 +65,8 @@ export async function POST(
       res.status(404).json({ error: "lab_job not found" });
       return;
     }
-    console.error(
-      `[lab-jobs/retry] retrieve failed for ${id}: ${
-        err instanceof Error ? err.message : "unknown"
-      }`,
-    );
-    captureException(err, {
+    console.error(`[lab-jobs/retry] retrieve failed for ${id}: ${kindOf(err)}`);
+    captureException(reportable(err, "admin/lab-jobs/retry could not read the job"), {
       tags: { route: "admin/lab-jobs/retry", reason: "retrieve_failed" },
       extra: { lab_job_id: id },
     });
@@ -76,7 +83,7 @@ export async function POST(
   }
   if (job.status === "submitted") {
     // Already accepted by the provider — nothing to heal. Idempotent no-op.
-    res.json({ outcome: "submitted", job });
+    res.json({ outcome: "submitted", job: bare(job) });
     return;
   }
   if (job.status === "submitting") {
@@ -99,14 +106,14 @@ export async function POST(
     const r = await rebuildAndSubmitJob(req.scope, id, job.order_id);
 
     if (r.buildOutcome === "ok") {
-      res.json(r.submit);
+      res.json({ ...r.submit, job: bare(r.submit?.job) });
       return;
     }
 
     res.json({
       outcome: r.buildOutcome,
-      reason: r.reason,
-      job: r.job,
+      reason: NOT_BUILT[r.buildOutcome],
+      job: bare(r.job),
     });
   } catch (err) {
     if (err instanceof LabJobNotRebuildableError) {
@@ -115,17 +122,11 @@ export async function POST(
       res.status(409).json({ error: "the job changed while it was being rebuilt; reload it" });
       return;
     }
-    console.error(
-      `[lab-jobs/retry] retry failed for ${id}: ${
-        err instanceof Error ? err.message : "unknown"
-      }`,
-    );
-    captureException(err, {
+    console.error(`[lab-jobs/retry] retry failed for ${id}: ${kindOf(err)}`);
+    captureException(reportable(err, "admin/lab-jobs/retry failed"), {
       tags: { route: "admin/lab-jobs/retry", reason: "rebuild_failed" },
       extra: { lab_job_id: id, order_id: job.order_id },
     });
-    res.status(500).json({
-      error: err instanceof Error ? err.message : "Unknown error",
-    });
+    res.status(500).json({ error: "the retry failed; try again" });
   }
 }

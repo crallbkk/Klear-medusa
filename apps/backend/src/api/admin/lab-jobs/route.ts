@@ -4,6 +4,7 @@ import type {
 } from "@medusajs/framework";
 import { LMS_MODULE } from "../../../modules/lms/service";
 import type LmsModuleService from "../../../modules/lms/service";
+import { withoutPacket } from "./production-http";
 
 /**
  * GET /admin/lab-jobs — list lab jobs, optionally filtered by status.
@@ -16,10 +17,10 @@ import type LmsModuleService from "../../../modules/lms/service";
  *
  * Response shape mirrors the LabJobRow type from lms/service.ts.
  *
- * **PDPA note**: this endpoint returns `packet_snapshot` which
- * contains decrypted Rx data. The Medusa Admin dashboard requires a
- * superadmin/ops Medusa user to call it. Don't add this route's data
- * to logs, Sentry, or any persistent storage outside Medusa's DB.
+ * The packet (`packet_snapshot`, which holds the decrypted prescription) is
+ * NOT in the response. A list is no place for it, and nothing recorded who
+ * read it. One packet at a time is shown by
+ * `POST /admin/lab-jobs/[id]/packet`, which records the view.
  */
 export async function GET(
   req: MedusaRequest,
@@ -64,5 +65,8 @@ export async function GET(
     );
   }
 
-  res.json({ jobs, count: jobs.length });
+  res.json({
+    jobs: jobs.map((job) => withoutPacket(job as unknown as Record<string, unknown>)),
+    count: jobs.length,
+  });
 }

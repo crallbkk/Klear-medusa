@@ -259,8 +259,8 @@ packet builds, and moves from there only through
 this module. What crosses to Klear Operations is totals per release window,
 with no job, order, day or time (next section).
 
-Not built yet: the routes and screens that call the writer, and the lab
-role. Until then nothing moves a job between `ready` and `packed`.
+Not built yet: the screens. Until they exist, the lab's steps can only be
+recorded by calling the routes below directly.
 
 ## Following the order
 
@@ -322,6 +322,67 @@ status is `pending_rx`, so the old packet cannot be printed; if storing the
 new packet fails, the Retry button or the half-hourly heal sweep finishes
 it. Nothing calls it yet; Medusa has no event for a changed prescription,
 so it will be a button.
+
+## Routes for the lab
+
+| Route | What it does | Permission |
+|---|---|---|
+| `GET /admin/lab-queue` | Jobs the lab still has work on, with a count per column | `lab_job:read` |
+| `GET /admin/lab-jobs`, `GET /admin/lab-jobs/:id` | Jobs, as before, now WITHOUT the packet | `lab_job:read` |
+| `GET /admin/lab-jobs/:id/production` | A job's state, history and outside-lab quotes | `lab_job:read` |
+| `POST /admin/lab-jobs/:id/packet` | Shows the packet (the prescription) and records who looked, before it is returned | `lab_job:read` |
+| `POST /admin/lab-jobs/:id/actions` | Records one step the lab took | `lab_job:update` |
+| `POST /admin/lab-jobs/:id/ops-actions` | Hold and release | `lab_job_ops:update` |
+| `POST /admin/lab-jobs/:id/rx-changed` | A changed prescription on a job in production | `lab_job_ops:update` |
+| `POST /admin/lab-jobs/:id/retry` | Rebuild a packet, as before | `lab_job_ops:update` |
+
+1. **The packet leaves through one route.** The list and the job routes used
+   to return `packet_snapshot`, prescription included, to any admin user
+   with nothing recorded. They no longer do.
+2. **Who did it** is the signed-in admin user (`auth_context.actor_id`),
+   never a field of the request.
+3. **Errors.** A rule's refusal is answered with its own plain sentence. Any
+   other failure is answered with a fixed sentence and reported with ids
+   only: a database error's text can hold a lens SKU beside a job id.
+4. **Permissions.** Medusa 2.14.2 ships a role module (`@medusajs/rbac`),
+   off by default behind the `MEDUSA_FF_RBAC` feature flag. The permissions
+   above are declared on the routes in `api/middlewares.ts`, where Medusa
+   reads them. **Medusa enforces them only when that flag is on.** While it
+   is off, any signed-in admin user can call these routes, exactly as they
+   could call the lab-job routes before. With it on, a user needs a role
+   that grants the permission, and a user with no role is refused on every
+   route that declares one, which includes Medusa's own order and customer
+   routes. Turning it on is a decision for the owner. What it does, read
+   from Medusa's code:
+   1. It is a feature flag, off by default.
+   2. Roles are written into the sign-in token. A role given or taken away
+      takes effect at that person's next sign-in.
+   3. A Medusa migration script gives every existing admin user the
+      built-in super-admin role when migrations run with the flag on.
+      Without that, they are refused almost everywhere.
+   4. A secret API key carries no role, so with the flag on it is refused
+      on every route that declares a permission.
+   5. A lab role can only be given `lab_job:read` and the others once those
+      policies are registered with `definePolicies`; Medusa removes any
+      policy it does not find registered at each start. They are not
+      registered yet; that comes with the decision, as does the lab
+      permission test, which must pass before any lab account exists.
+5. **People only.** A secret API key also signs in on `/admin`. The routes
+   that record who did something, or show the packet, refuse it (403).
+   The read-only routes (queue, list, job, history) do answer an API key:
+   they show order ids, a job's last error and its history, never the
+   packet.
+6. **A failed save never carries the packet.** Every insert and update of a
+   lab job goes through two overridden methods of the service that replace
+   the driver's error (the SQL with the packet written in) by one built
+   from its error code. The half-hourly sweep, the order-placed subscriber
+   and the Retry route used to log and report that text.
+7. **A job's last error is plain words.** It is shown on the queue. Reasons
+   written by the packet builder are fixed sentences. When a real lab
+   provider is wired, store its error code, not its message: a provider
+   that echoes the request would put a prescription there.
+8. **Every look at a packet is its own record.** A key that was already
+   used shows nothing. A job's history does not show anyone's keys.
 
 ## Release to Klear Operations
 

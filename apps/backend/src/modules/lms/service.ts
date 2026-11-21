@@ -54,7 +54,7 @@ export const STAGELESS_SWEEP_DAYS = 30;
  */
 export class ProductionWriteError extends Error {
   readonly code: string | null;
-  constructor(cause: unknown) {
+  constructor(cause: unknown, what = "the production action could not be recorded") {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = cause as any;
     const code = typeof e?.code === "string" ? e.code : null;
@@ -66,12 +66,21 @@ export class ProductionWriteError extends Error {
       .filter((v) => typeof v === "string" && /^[A-Za-z_]{1,40}$/.test(v))
       .join("/");
     super(
-      `the production action could not be recorded (database error ${code ?? (kind || "unknown")}${
+      `${what} (database error ${code ?? (kind || "unknown")}${
         constraint ? `, constraint ${constraint}` : ""
       })`,
     );
     this.name = "ProductionWriteError";
     this.code = code;
+  }
+}
+
+/** A second live job for the same order was refused by the unique index.
+ *  Carries nothing of the row. */
+export class LabJobDuplicateError extends Error {
+  constructor() {
+    super("a lab job for that order already exists");
+    this.name = "LabJobDuplicateError";
   }
 }
 
@@ -178,6 +187,42 @@ export type ProductionActionResult = {
   replayed: boolean;
 };
 
+/** Stages at which the lab still has work on a job. */
+const QUEUE_STAGES = [
+  "ready",
+  "printed",
+  "lens_issued",
+  "sent_to_lab",
+  "received_from_lab",
+  "edged",
+  "mounted",
+  "qc_passed",
+  "qc_failed",
+  "packed",
+  "labelled",
+] as const;
+
+/** The most jobs the queue returns. Past it the board says so. */
+export const QUEUE_LIMIT = 1000;
+
+/** What the queue board is given about a job. Not the packet. */
+const QUEUE_COLUMNS = [
+  "id",
+  "order_id",
+  "status",
+  "last_error",
+  "stage",
+  "stage_since",
+  "stage_version",
+  "remake_count",
+  "on_hold",
+  "hold_reason",
+  "cut_question_pending",
+  "created_at",
+] as const;
+
+export type LabJobQueueRow = Pick<LabJobRow, (typeof QUEUE_COLUMNS)[number]>;
+
 /** One released window as the feed serves it: totals only. */
 export type ReleasedWindow = {
   window_end: string;
@@ -247,6 +292,32 @@ class LmsModuleService extends MedusaService({
 }) {
   private readonly provider: ILabProvider = new UnimplementedLabProvider();
 
+  // Every insert and update of a lab job goes through these two. When one
+  // fails, the driver's error message is the SQL with its values written
+  // in, and for a lab job that is the whole packet: prescription, name,
+  // phone, address. Callers log such errors and send them to Sentry, whose
+  // scrubber cannot clean an error's message. So the original error never
+  // leaves this class: it is replaced by one built from the error code.
+  // Nothing else in this class may call createLabJobs or updateLabJobs.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async saveNewJob_(data: any): Promise<any> {
+    try {
+      return await this.createLabJobs(data);
+    } catch (err) {
+      if (this.isUniqueViolation(err)) throw new LabJobDuplicateError();
+      throw new ProductionWriteError(err, "the lab job could not be saved");
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async saveJobChange_(change: any): Promise<any> {
+    try {
+      return await this.updateLabJobs(change);
+    } catch (err) {
+      throw new ProductionWriteError(err, "the lab job could not be saved");
+    }
+  }
+
   /**
    * Detects a Postgres unique-constraint violation (SQLSTATE 23505) however
    * MikroORM/pg wraps it, so concurrent duplicate inserts can be treated as
@@ -255,6 +326,7 @@ class LmsModuleService extends MedusaService({
   private isUniqueViolation(err: unknown): boolean {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = err as any;
+    if (err instanceof LabJobDuplicateError) return true;
     const code = e?.code ?? e?.cause?.code ?? e?.errno;
     if (code === "23505") return true;
     // What actually reaches this code on a real database: Medusa's repository
@@ -287,7 +359,7 @@ class LmsModuleService extends MedusaService({
     last_error?: string | null;
   }): Promise<LabJobRow> {
     try {
-      const created = (await this.createLabJobs({
+      const created = (await this.saveNewJob_({
         order_id: data.order_id,
         status: data.status,
         packet_snapshot: data.packet_snapshot,
@@ -388,7 +460,7 @@ class LmsModuleService extends MedusaService({
     if (result.outcome === "skip") {
       // The order became frame-only since the row was created (unusual). Leave
       // the snapshot untouched; just record why nothing was submitted.
-      const updated = (await this.updateLabJobs({
+      const updated = (await this.saveJobChange_({
         selector: { id: jobId },
         data: { last_error: result.reason },
       })) as unknown as LabJobRow[];
@@ -408,7 +480,7 @@ class LmsModuleService extends MedusaService({
     ) {
       return current;
     }
-    const updated = (await this.updateLabJobs({
+    const updated = (await this.saveJobChange_({
       selector: { id: jobId },
       data: {
         status: fields.status,
@@ -545,7 +617,7 @@ class LmsModuleService extends MedusaService({
     // the read-check above this reduces double-submission from
     // seconds-likely to pathological. A native conditional UPDATE would
     // close it fully if a provider ever proves non-idempotent.)
-    const claimed = (await this.updateLabJobs({
+    const claimed = (await this.saveJobChange_({
       selector: { id: jobId, status: "queued" },
       data: { status: "submitting" },
     })) as unknown as LabJobRow[];
@@ -613,7 +685,7 @@ class LmsModuleService extends MedusaService({
     jobId: string,
     data: Record<string, unknown>,
   ): Promise<LabJobRow | null> {
-    const updated = (await this.updateLabJobs({
+    const updated = (await this.saveJobChange_({
       selector: { id: jobId, status: "submitting" },
       data,
     })) as unknown as LabJobRow[];
@@ -703,7 +775,7 @@ class LmsModuleService extends MedusaService({
     // the `prescription` key is overwritten and every other key keeps the
     // value in the row. Writing back a full copy of what we read would put
     // stale keys over a rebuild that landed in between.
-    const updated = (await this.updateLabJobs({
+    const updated = (await this.saveJobChange_({
       selector: { id: jobId, status: job.status, rx_redacted_at: null },
       data: { packet_snapshot: { prescription: null }, rx_redacted_at: new Date() },
     })) as unknown as LabJobRow[];
@@ -1333,6 +1405,76 @@ class LmsModuleService extends MedusaService({
           invoiced_to_date_satang,
         })),
     }));
+  }
+
+  /**
+   * The jobs the lab still has work on, longest-waiting first, WITHOUT their
+   * packets: every job at a stage before `delivered`, and any job (also a
+   * cancelled one) with the cut-or-uncut question still open.
+   */
+  async listQueue(): Promise<LabJobQueueRow[]> {
+    return (await this.listLabJobs(
+      {
+        $or: [
+          { stage: [...QUEUE_STAGES] },
+          { cut_question_pending: true },
+        ],
+      },
+      {
+        select: [...QUEUE_COLUMNS],
+        order: { stage_since: "ASC", id: "ASC" },
+        // One more than the limit, so "there are more" is known, not guessed.
+        take: QUEUE_LIMIT + 1,
+      },
+    )) as unknown as LabJobQueueRow[];
+  }
+
+  /**
+   * Show a job's packet (it holds the prescription) to a person, recording
+   * who looked first. If the view cannot be recorded, the packet is not
+   * returned. Refused when the job has no packet to work from: one still
+   * waiting for a prescription or failed, one whose prescription changed
+   * and is not rebuilt yet (the stored packet is then the OLD one), or one
+   * blanked after delivery.
+   */
+  async viewPacket(
+    jobId: string,
+    actorId: string,
+    key: string,
+    printed = false,
+  ): Promise<{ packet: LabJobPacket; job: LabJobProductionState }> {
+    const usable = (job: LabJobRow): void => {
+      if (job.status !== "queued" && job.status !== "submitting" && job.status !== "submitted") {
+        throw new ProductionError(
+          "not_allowed",
+          `this job has no packet to work from (it is ${job.status})`,
+        );
+      }
+      if (job.rx_redacted_at) {
+        throw new ProductionError(
+          "not_allowed",
+          "the prescription was removed from this job; rebuild the packet first",
+        );
+      }
+    };
+    usable((await this.retrieveLabJob(jobId)) as unknown as LabJobRow);
+    const recorded = await this.applyProductionAction({
+      job_id: jobId,
+      action: printed ? "PACKET_PRINTED" : "PACKET_VIEWED",
+      idempotency_key: key,
+      actor: { type: "user", id: actorId },
+    });
+    // Every look is its own record. A key that was already used records
+    // nothing, so it shows nothing: otherwise one record would cover any
+    // number of looks, by anyone who learned the key.
+    if (recorded.replayed) {
+      throw new ProductionError("key_reused", "use a new key to look at the packet again");
+    }
+    // Read after recording: this is the packet as it stands now, and it is
+    // checked again in case it was replaced or blanked in between.
+    const job = (await this.retrieveLabJob(jobId)) as unknown as LabJobRow;
+    usable(job);
+    return { packet: job.packet_snapshot, job: recorded.job };
   }
 
   /** The idempotency key of a job's most recent LABELLED event, or null. */

@@ -14,6 +14,7 @@ import { TEST_DB_NAME, resetDatabase } from "./db-harness";
 import { productionSuite } from "./production.db-suite";
 import { releaseSuite } from "./release.db-suite";
 import { orderEventsSuite } from "./order-events.db-suite";
+import { screensSuite } from "./screens.db-suite";
 
 jest.setTimeout(120_000);
 
@@ -33,5 +34,6 @@ moduleIntegrationTestRunner<LmsModuleService>({
     productionSuite(service);
     releaseSuite(service);
     orderEventsSuite(service);
+    screensSuite(service);
   },
 });

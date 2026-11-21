@@ -1,6 +1,7 @@
 import { defineMiddlewares } from "@medusajs/framework/http";
 import { sentryErrorHandler } from "../lib/observability/http-error-handler";
 import { requirePackedBeforeLabel } from "./admin/orders/require-packed";
+import { LAB_ACT, LAB_OPS, LAB_READ } from "./admin/lab-jobs/production-http";
 
 /**
  * Custom HTTP config.
@@ -27,5 +28,17 @@ export default defineMiddlewares({
       methods: ["POST"],
       middlewares: [requirePackedBeforeLabel],
     },
+    // The lab's routes and the permission each needs. Medusa enforces
+    // `policies` only when its role module is on (MEDUSA_FF_RBAC); see
+    // `admin/lab-jobs/production-http.ts`.
+    { matcher: "/admin/lab-queue", methods: ["GET"], policies: [LAB_READ] },
+    { matcher: "/admin/lab-jobs", methods: ["GET"], policies: [LAB_READ] },
+    { matcher: "/admin/lab-jobs/:id", methods: ["GET"], policies: [LAB_READ] },
+    { matcher: "/admin/lab-jobs/:id/production", methods: ["GET"], policies: [LAB_READ] },
+    { matcher: "/admin/lab-jobs/:id/packet", methods: ["POST"], policies: [LAB_READ] },
+    { matcher: "/admin/lab-jobs/:id/actions", methods: ["POST"], policies: [LAB_ACT] },
+    { matcher: "/admin/lab-jobs/:id/ops-actions", methods: ["POST"], policies: [LAB_OPS] },
+    { matcher: "/admin/lab-jobs/:id/rx-changed", methods: ["POST"], policies: [LAB_OPS] },
+    { matcher: "/admin/lab-jobs/:id/retry", methods: ["POST"], policies: [LAB_OPS] },
   ],
 });

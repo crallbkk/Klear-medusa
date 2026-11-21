@@ -217,7 +217,9 @@ describe("POST /admin/lab-jobs/[id]/retry", () => {
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({
         outcome: "pending_rx",
-        reason: "still awaiting Rx",
+        // A fixed sentence, not the builder's own text (that stays in the
+        // job's last_error).
+        reason: "the prescription has not arrived yet",
       }),
     );
   });
