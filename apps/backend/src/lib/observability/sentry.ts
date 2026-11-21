@@ -61,6 +61,13 @@ const RX_PATTERNS: readonly RegExp[] = [
   /ciphertext/i,
   /plaintext/i,
   /decrypted/i,
+  // Production actions (modules/lms/production.ts): a lens SKU encodes a
+  // power, and an action's `detail` holds SKUs and free text typed by the
+  // lab. Next to a job or order id either is health data.
+  /^lenses$/i,
+  /^sku$/i,
+  /^detail$/i,
+  /^hold_reason$/i,
 ];
 
 /** Secrets / credentials. `key_alias`'s VALUE (e.g. the literal constant

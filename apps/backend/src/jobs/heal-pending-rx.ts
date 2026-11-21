@@ -41,6 +41,16 @@ export default async function healPendingRxJob(
   // All of them, not a capped page: a capped oldest-first page would return
   // the same never-answered jobs every run and never reach newer ones.
   const pending = await lms.listAllJobIdsByStatus("pending_rx");
+
+  // Built jobs that have no production stage (a stage write that failed, or
+  // a job created by the previous deployment during a deploy) get one here.
+  try {
+    const staged = await lms.markStagelessJobsReady();
+    if (staged > 0) console.info(`[heal-pending-rx] put ${staged} built job(s) at ready`);
+  } catch (err) {
+    captureException(err, { tags: { job: "heal-pending-rx", reason: "stage_sweep_failed" } });
+  }
+
   if (pending.length === 0) return;
 
   let healed = 0;

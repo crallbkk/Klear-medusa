@@ -3,7 +3,7 @@ import type {
   MedusaResponse,
 } from "@medusajs/framework";
 import { MedusaError } from "@medusajs/framework/utils";
-import { LMS_MODULE } from "../../../../../modules/lms/service";
+import { LMS_MODULE, LabJobNotRebuildableError } from "../../../../../modules/lms/service";
 import type LmsModuleService from "../../../../../modules/lms/service";
 import { rebuildAndSubmitJob } from "../../../../../modules/lms/rebuild";
 import { captureException } from "../../../../../lib/observability/sentry";
@@ -21,6 +21,9 @@ import { captureException } from "../../../../../lib/observability/sentry";
  *   rebuild → pending_rx → still waiting; row updated, no submit
  *   rebuild → failed     → still broken; reason refreshed, no submit
  *   rebuild → skip       → order became frame-only; reason recorded, no submit
+ *
+ * A job the lab has started on (stage past `ready`) → 409: its packet is
+ * what the lab's sheet was printed from and is not rebuilt.
  *
  * Errors: unknown job id → 404; cancelled → 400 (operator error); anything
  * else (DB down, order module failure, …) → 500 — an infra failure is not a
@@ -83,6 +86,13 @@ export async function POST(
     return;
   }
 
+  const IN_PRODUCTION = "the lab has started on this job; its packet cannot be rebuilt";
+  if (job.stage && job.stage !== "ready") {
+    // Checked before building, so no prescription is decrypted for nothing.
+    res.status(409).json({ error: IN_PRODUCTION });
+    return;
+  }
+
   try {
     // Rebuild from the current order metadata so fixes are picked up
     // (queued / failed / pending_rx) — shared with the heal-pending-rx job.
@@ -99,6 +109,12 @@ export async function POST(
       job: r.job,
     });
   } catch (err) {
+    if (err instanceof LabJobNotRebuildableError) {
+      // The job moved (into production, or was submitted or cancelled)
+      // between the read above and the rebuild. Not an infra failure.
+      res.status(409).json({ error: "the job changed while it was being rebuilt; reload it" });
+      return;
+    }
     console.error(
       `[lab-jobs/retry] retry failed for ${id}: ${
         err instanceof Error ? err.message : "unknown"

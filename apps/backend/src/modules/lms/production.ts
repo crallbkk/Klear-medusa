@@ -1,0 +1,444 @@
+// Production rules for a lab job: which action is allowed from which stage,
+// where it leads, and what it records (lens or frame usage, an outside lab's
+// quote). Pure functions with no database access; `LmsModuleService.
+// applyProductionAction` runs them inside one transaction under a row lock.
+//
+// `status` (queued / submitted / failed / ...) keeps its meaning: building and
+// handing off the packet. `stage` is where the physical job is.
+
+export const STAGES = [
+  "ready",
+  "printed",
+  "lens_issued",
+  "sent_to_lab",
+  "received_from_lab",
+  "edged",
+  "mounted",
+  "qc_passed",
+  "qc_failed",
+  "packed",
+  "labelled",
+  "delivered",
+  "cancelled",
+] as const;
+export type Stage = (typeof STAGES)[number];
+
+/** Stages before a shipping label exists. A cancel or a changed prescription
+ *  is only possible here. */
+const BEFORE_LABEL: ReadonlySet<Stage> = new Set([
+  "ready",
+  "printed",
+  "lens_issued",
+  "sent_to_lab",
+  "received_from_lab",
+  "edged",
+  "mounted",
+  "qc_passed",
+  "qc_failed",
+  "packed",
+]);
+
+/** Stages at which a lens from Klear's own shelf has been cut or fitted. */
+const LENS_CUT: ReadonlySet<Stage> = new Set([
+  "edged",
+  "mounted",
+  "qc_passed",
+  "qc_failed",
+  "packed",
+]);
+
+export const STAGE_ACTIONS = [
+  "READY",
+  "PRINTED",
+  "LENS_ISSUED",
+  "SENT_TO_LAB",
+  "RECEIVED_FROM_LAB",
+  "EDGED",
+  "MOUNTED",
+  "QC_PASSED",
+  "QC_FAILED",
+  "REMAKE_STARTED",
+  "REWORK",
+  "LENS_SPOILED",
+  "PACKED",
+  "LABELLED",
+  "DELIVERED",
+  "RX_CHANGED",
+  "CANCELLED",
+] as const;
+export const NOTE_ACTIONS = [
+  "FRAME_DAMAGED",
+  "LENS_RETURNED_UNUSED",
+  "LENS_CUT_CONFIRMED",
+  "HOLD",
+  "RELEASE",
+  "PACKET_VIEWED",
+  "PACKET_PRINTED",
+  "LAB_INVOICED",
+  "NOTE",
+] as const;
+export const ACTIONS = [...STAGE_ACTIONS, ...NOTE_ACTIONS] as const;
+export type ProductionAction = (typeof ACTIONS)[number];
+
+/** Actions only the system may record (subscribers and the packet builder),
+ *  never a person pressing a button. */
+export const SYSTEM_ONLY_ACTIONS: ReadonlySet<ProductionAction> = new Set([
+  "READY",
+  "LABELLED",
+  "DELIVERED",
+  "RX_CHANGED",
+  "CANCELLED",
+]);
+
+/** Why a lens left the shelf. These are the reasons operations books against
+ *  (design 10.4); `spoilage` is also used for a frame broken in the lab. */
+export type UsageReason =
+  | "order"
+  | "spoilage_replacement"
+  | "remake"
+  | "spoilage"
+  | "return_unused";
+
+export type ProductionErrorCode =
+  | "not_allowed" // the action is not valid from the job's current stage
+  | "invalid_detail" // the action's details are missing or malformed
+  | "conflict" // someone else changed the job; re-read and try again
+  | "not_found"
+  | "key_reused"; // the idempotency key belongs to a different action
+
+export class ProductionError extends Error {
+  readonly code: ProductionErrorCode;
+  constructor(code: ProductionErrorCode, message: string) {
+    super(message);
+    this.name = "ProductionError";
+    this.code = code;
+  }
+}
+
+/** The part of a job the rules read. */
+export type JobState = {
+  stage: Stage | null;
+  remake_count: number;
+  on_hold: boolean;
+  cut_question_pending: boolean;
+  /** The reason the next lens issue will be booked under. */
+  next_issue_reason: UsageReason;
+};
+
+export type UsageLine = { sku: string; reason: UsageReason; qty: number };
+
+export type Effect = {
+  /** Set when the action moves the job; absent for a note-type action. */
+  to_stage?: Stage;
+  patch: Partial<
+    Pick<
+      JobState,
+      "remake_count" | "on_hold" | "cut_question_pending" | "next_issue_reason"
+    > & { hold_reason: string | null }
+  >;
+  usage: UsageLine[];
+  /** An outside lab's quote, opened by SENT_TO_LAB. */
+  open_cost?: { vendor: string; quoted_satang: number; expected_on: string | null };
+  /** RECEIVED_FROM_LAB: the open quote's work has come back. */
+  receive_cost?: true;
+  /** LAB_INVOICED: the amount on the lab's invoice for this job. */
+  invoice_cost?: { invoiced_satang: number };
+  /** LENS_RETURNED_UNUSED: the SKUs the operator is putting back on the
+   *  shelf. The service checks each was issued on this job and not already
+   *  returned; the rules cannot see earlier events. */
+  return_lenses?: string[];
+  /** CANCELLED: the packet's `status` is set to cancelled with the stage. */
+  cancel_status?: true;
+  /** What is stored on the event. Never a prescription value. */
+  detail: Record<string, unknown>;
+};
+
+// Lens and frame SKUs as printed on the envelope or the frame bag. Same
+// pattern as Klear Operations' stock items, so a usage row can never carry a
+// string the stock ledger would refuse.
+const SKU = /^[A-Z0-9][A-Z0-9._+\-]{1,63}$/;
+
+function text(detail: Record<string, unknown>, key: string, max = 500): string {
+  const v = detail[key];
+  if (typeof v !== "string" || v.trim() === "") {
+    throw new ProductionError("invalid_detail", `"${key}" is required`);
+  }
+  if (v.length > max) {
+    throw new ProductionError("invalid_detail", `"${key}" is longer than ${max} characters`);
+  }
+  return v.trim();
+}
+
+function sku(value: unknown, what: string): string {
+  if (typeof value !== "string" || !SKU.test(value)) {
+    throw new ProductionError(
+      "invalid_detail",
+      `${what} must be a SKU as printed on the label (capitals, digits, . _ + -)`,
+    );
+  }
+  return value;
+}
+
+function satang(detail: Record<string, unknown>, key: string): number {
+  const v = detail[key];
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v > 2_000_000_000) {
+    throw new ProductionError(
+      "invalid_detail",
+      `"${key}" must be a whole number of satang, zero or more`,
+    );
+  }
+  return v;
+}
+
+function dateOrNull(detail: Record<string, unknown>, key: string): string | null {
+  const v = detail[key];
+  if (v === undefined || v === null || v === "") return null;
+  // Round-trip, because Date.parse accepts 31 February and rolls it over.
+  const ok =
+    typeof v === "string" &&
+    /^\d{4}-\d{2}-\d{2}$/.test(v) &&
+    !Number.isNaN(Date.parse(`${v}T00:00:00Z`)) &&
+    new Date(`${v}T00:00:00Z`).toISOString().slice(0, 10) === v;
+  if (!ok) {
+    throw new ProductionError("invalid_detail", `"${key}" must be a real date, YYYY-MM-DD`);
+  }
+  return v as string;
+}
+
+function refuse(action: ProductionAction, job: JobState): never {
+  throw new ProductionError(
+    "not_allowed",
+    `${action} is not possible while the job is ${job.stage ?? "not ready"}`,
+  );
+}
+
+function need(job: JobState, action: ProductionAction, ...from: Stage[]): void {
+  if (job.stage === null || !from.includes(job.stage)) refuse(action, job);
+}
+
+/** While nobody has said whether the issued lens was cut, the job does not
+ *  go back into production: a second issue would make "which lens is going
+ *  back" unanswerable (design 10.2 rule 2). */
+function needQuestionAnswered(job: JobState, action: ProductionAction): void {
+  if (job.cut_question_pending) {
+    throw new ProductionError(
+      "not_allowed",
+      `${action} must wait: first say whether the lens already issued was cut`,
+    );
+  }
+}
+
+function skuList(detail: Record<string, unknown>, what: string): string[] {
+  const lenses = detail.lenses;
+  // A pair is two. One is allowed: after a single spoiled lens only that
+  // one is replaced, and only an uncut one goes back.
+  if (!Array.isArray(lenses) || lenses.length < 1 || lenses.length > 2) {
+    throw new ProductionError("invalid_detail", `"lenses" must list ${what}, one or two`);
+  }
+  return lenses.map((l, i) => sku(l, `lens ${i + 1}`));
+}
+
+/**
+ * Decide what an action does to a job, or throw a `ProductionError` saying
+ * why it cannot be done. Reads nothing but its arguments.
+ */
+export function decide(
+  job: JobState,
+  action: ProductionAction,
+  detail: Record<string, unknown> = {},
+): Effect {
+  const none: Effect = { patch: {}, usage: [], detail: {} };
+
+  switch (action) {
+    case "READY":
+      if (job.stage !== null) refuse(action, job);
+      return { ...none, to_stage: "ready" };
+
+    case "PRINTED":
+      need(job, action, "ready");
+      needQuestionAnswered(job, action);
+      return { ...none, to_stage: "printed" };
+
+    case "LENS_ISSUED": {
+      need(job, action, "printed");
+      needQuestionAnswered(job, action);
+      const skus = skuList(detail, "the SKU on each lens envelope");
+      return {
+        ...none,
+        to_stage: "lens_issued",
+        usage: skus.map((s) => ({ sku: s, reason: job.next_issue_reason, qty: -1 })),
+        detail: { lenses: skus, reason: job.next_issue_reason },
+      };
+    }
+
+    case "SENT_TO_LAB": {
+      need(job, action, "printed");
+      needQuestionAnswered(job, action);
+      const vendor = text(detail, "vendor", 120);
+      const quoted_satang = satang(detail, "quoted_satang");
+      const expected_on = dateOrNull(detail, "expected_on");
+      return {
+        ...none,
+        to_stage: "sent_to_lab",
+        open_cost: { vendor, quoted_satang, expected_on },
+        detail: { vendor, quoted_satang, expected_on },
+      };
+    }
+
+    case "RECEIVED_FROM_LAB":
+      need(job, action, "sent_to_lab");
+      return { ...none, to_stage: "received_from_lab", receive_cost: true };
+
+    case "EDGED":
+      need(job, action, "lens_issued");
+      return { ...none, to_stage: "edged" };
+
+    case "MOUNTED":
+      need(job, action, "edged", "received_from_lab");
+      return { ...none, to_stage: "mounted" };
+
+    case "QC_PASSED":
+      need(job, action, "mounted");
+      return { ...none, to_stage: "qc_passed" };
+
+    case "QC_FAILED":
+      need(job, action, "mounted");
+      return { ...none, to_stage: "qc_failed", detail: { reason: text(detail, "reason") } };
+
+    case "REMAKE_STARTED": {
+      need(job, action, "qc_failed", "labelled", "delivered");
+      const cause = text(detail, "cause");
+      // After a QC failure the replacement lens is production spoilage. After
+      // the customer has the glasses it is a warranty remake.
+      const warranty = job.stage !== "qc_failed";
+      return {
+        ...none,
+        to_stage: "printed",
+        patch: {
+          remake_count: job.remake_count + 1,
+          next_issue_reason: warranty ? "remake" : "spoilage_replacement",
+        },
+        detail: { cause, warranty },
+      };
+    }
+
+    case "REWORK":
+      need(job, action, "qc_failed");
+      return { ...none, to_stage: "edged" };
+
+    case "LENS_SPOILED":
+      need(job, action, "lens_issued", "edged", "mounted");
+      return {
+        ...none,
+        to_stage: "printed",
+        patch: { next_issue_reason: "spoilage_replacement" },
+        detail: { reason: text(detail, "reason") },
+      };
+
+    case "PACKED":
+      need(job, action, "qc_passed");
+      return { ...none, to_stage: "packed" };
+
+    case "LABELLED":
+      need(job, action, "packed");
+      return { ...none, to_stage: "labelled" };
+
+    case "DELIVERED":
+      need(job, action, "labelled");
+      return { ...none, to_stage: "delivered" };
+
+    case "RX_CHANGED": {
+      if (job.stage === null || !BEFORE_LABEL.has(job.stage)) refuse(action, job);
+      const patch: Effect["patch"] = {};
+      // A lens issued and maybe not yet cut: someone must say which, and
+      // the answer decides how the next pair is booked (LENS_CUT_CONFIRMED:
+      // a remake. LENS_RETURNED_UNUSED: nothing was lost, so no change).
+      if (job.stage === "lens_issued") patch.cut_question_pending = true;
+      // A lens already cut for the old prescription is lost; the next issue
+      // is a remake.
+      if (LENS_CUT.has(job.stage)) patch.next_issue_reason = "remake";
+      return { ...none, to_stage: "ready", patch };
+    }
+
+    case "CANCELLED": {
+      if (job.stage !== null && !BEFORE_LABEL.has(job.stage)) refuse(action, job);
+      const patch: Effect["patch"] = { on_hold: false, hold_reason: null };
+      if (job.stage === "lens_issued") patch.cut_question_pending = true;
+      return { ...none, to_stage: "cancelled", patch, cancel_status: true };
+    }
+
+    case "FRAME_DAMAGED": {
+      if (job.stage === null || job.stage === "cancelled" || job.stage === "delivered") {
+        refuse(action, job);
+      }
+      const s = sku(detail.sku, `"sku"`);
+      return {
+        ...none,
+        usage: [{ sku: s, reason: "spoilage", qty: -1 }],
+        detail: { sku: s, reason: text(detail, "reason") },
+      };
+    }
+
+    case "LENS_RETURNED_UNUSED":
+      if (!job.cut_question_pending) {
+        throw new ProductionError(
+          "not_allowed",
+          "a lens can only be returned unused while the cut-or-uncut question is open",
+        );
+      }
+      {
+        const skus = skuList(detail, "the SKU of each lens going back on the shelf");
+        return {
+          ...none,
+          patch: { cut_question_pending: false },
+          return_lenses: skus,
+          detail: { lenses: skus },
+        };
+      }
+
+    case "LENS_CUT_CONFIRMED":
+      if (!job.cut_question_pending) {
+        throw new ProductionError("not_allowed", "there is no cut-or-uncut question open on this job");
+      }
+      // The lens is lost. If the job goes on (a changed prescription), the
+      // pair issued next is a remake; a cancelled job issues nothing more.
+      return {
+        ...none,
+        patch:
+          job.stage === "cancelled"
+            ? { cut_question_pending: false }
+            : { cut_question_pending: false, next_issue_reason: "remake" },
+      };
+
+    case "HOLD": {
+      if (job.stage === null || job.stage === "cancelled" || job.stage === "delivered") {
+        refuse(action, job);
+      }
+      if (job.on_hold) throw new ProductionError("not_allowed", "the job is already on hold");
+      const reason = text(detail, "reason");
+      return { ...none, patch: { on_hold: true, hold_reason: reason }, detail: { reason } };
+    }
+
+    case "RELEASE":
+      if (!job.on_hold) throw new ProductionError("not_allowed", "the job is not on hold");
+      return { ...none, patch: { on_hold: false, hold_reason: null } };
+
+    case "PACKET_VIEWED":
+    case "PACKET_PRINTED":
+      return none;
+
+    case "LAB_INVOICED": {
+      const invoiced_satang = satang(detail, "invoiced_satang");
+      return { ...none, invoice_cost: { invoiced_satang }, detail: { invoiced_satang } };
+    }
+
+    case "NOTE":
+      return { ...none, detail: { text: text(detail, "text", 2000) } };
+  }
+}
+
+/** The Bangkok calendar date of an instant. Bangkok is UTC+7 with no
+ *  daylight saving. */
+export function bangkokDate(at: Date): string {
+  return new Date(at.getTime() + 7 * 3600 * 1000).toISOString().slice(0, 10);
+}

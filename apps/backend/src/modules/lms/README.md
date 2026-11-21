@@ -212,3 +212,91 @@ MedusaService list or update does), and nothing else soft-deletes a lab job.
   details live on the Medusa order.
 - **Orders shipped in parts.** Delivery is judged from the fulfillments that
   exist. An order is one pair in one parcel today.
+
+## Production: where the physical job is
+
+`status` describes the packet (built, waiting for a prescription, failed).
+`stage` describes the glasses. A job gets its first stage, `ready`, when its
+packet builds, and moves from there only through
+`LmsModuleService.applyProductionAction`.
+
+1. **Rules** live in `production.ts`: every action, the stages it is allowed
+   from, where it leads, and what it records. Pure functions; the full table
+   is asserted in `__tests__/production.unit.spec.ts`.
+2. **History** is `production_event`, one numbered row per action per job.
+   `lab_job.stage`, `stage_since` and `stage_version` are a cache of the
+   latest stage-changing row, written in the same transaction.
+3. **One writer.** `applyProductionAction` locks the job row, returns the
+   first result if the idempotency key was already used, refuses a caller
+   whose `expected_version` is stale, then writes the job, the event and any
+   usage or cost rows together. `MedusaService` also generates
+   `createProductionEvents`, `createLabUsages`, `createLabCosts` and their
+   update and delete twins. Do not call them. Triggers refuse update and
+   delete on `production_event` and `lab_usage`, and an insert of a row
+   that is already soft-deleted (it would sit outside the unique indexes).
+   TRUNCATE is not blocked, because Medusa's HTTP integration test runner
+   truncates every table between tests.
+4. **Errors say little on purpose.** A database failure inside the writer
+   comes out as `ProductionWriteError`, built from the error code and
+   constraint name only. The driver's own message contains the SQL with its
+   values (a lens SKU beside a job id), so it is never passed on.
+5. **Lens and frame usage** is `lab_usage`, one row per piece, with the
+   reason operations books it under (`order`, `spoilage_replacement`,
+   `remake`, `spoilage`, `return_unused`).
+6. **An outside lab's quote** is `lab_cost`, one row per send.
+7. **Cancelling** sets `stage` and `status` to cancelled in one write.
+   `cancelJob` goes through the writer.
+8. **A job the lab has started on is not rebuilt.** `updateJobFromBuild`
+   (the Retry button and the heal sweep) refuses once the stage is past
+   `ready`, because the lab's printed sheet came from the stored packet. A
+   changed prescription on such a job will be an `RX_CHANGED` event.
+9. **A built job with no stage** (a stage write that failed, or a job made
+   by the previous deployment during a deploy) is given one by
+   `markStagelessJobsReady`, run by the `heal-pending-rx` job, for jobs up
+   to 30 days old. Older jobs predate production and keep no stage.
+
+`lab_usage` and `lab_cost` tie a lens power or a cost to a job. They stay in
+this module. What crosses to Klear Operations is totals per release window,
+with no job, order, day or time (not built yet).
+
+Not built yet: the routes and screens that call the writer, the subscribers
+that record `LABELLED`, `DELIVERED`, `CANCELLED` and `RX_CHANGED`, the check
+that a label cannot be booked before `packed`, the usage release, and the
+lab role. Until then nothing calls the writer except the packet build.
+
+Known gaps, to be closed with the parts above:
+
+1. `LENS_ISSUED` checks that each SKU is well formed. It cannot yet check
+   that it is the right lens for the prescription, because no mapping from a
+   prescription to a lens SKU exists in this repository.
+2. A warranty remake needs the prescription back in the packet, but the
+   retention sweep decides from the order and would blank it again that
+   night. Retention must learn to keep a job that is back in production.
+3. `remake_count` counts QC and warranty remakes only. A lens reissued after
+   a spoil, or after a customer's changed prescription, is not counted, so a
+   report of "more lens issues than remakes explain" must allow for those.
+4. A job that failed QC at an outside lab and is then made in-house books
+   its lens as a spoilage replacement, although no Klear lens was spoiled.
+5. Free-text fields (a note, a hold or QC reason) are where a person could
+   type a prescription. The screens must say not to.
+6. When one lens of a pair goes back uncut and the other had been cut, the
+   pair issued next is booked to the order; the lost lens is not booked as
+   a remake.
+7. The stage sweep reports each job it cannot set as its own error. If the
+   stage write failed for every job, that is one report per job per pass.
+8. The database tests import `pg`, which this package does not declare; it
+   resolves through the workspace's hoisted install.
+
+## Database tests
+
+`*.db.spec.ts` files run against a real Postgres whose schema is built by
+running this module's migration files in order (`__tests__/db-harness.ts`),
+which is what a deploy does. CI starts a Postgres for them. Locally, point
+them at any Postgres you can create a database on:
+
+```bash
+DB_HOST=localhost DB_PORT=5432 DB_USERNAME=postgres DB_PASSWORD=postgres npm run test:db
+```
+
+They create and reuse one database, `medusa_lms_test`, and drop its `public`
+schema before every test. Never point them at a database you care about.

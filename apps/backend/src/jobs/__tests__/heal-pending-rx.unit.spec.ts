@@ -13,6 +13,7 @@ const mockRebuild = rebuildAndSubmitJob as jest.MockedFunction<
 function makeLms(pending: Array<{ id: string; order_id: string }>) {
   return {
     listAllJobIdsByStatus: jest.fn().mockResolvedValue(pending),
+    markStagelessJobsReady: jest.fn().mockResolvedValue(0),
   };
 }
 
@@ -43,6 +44,17 @@ describe("heal-pending-rx scheduled job", () => {
     await runJob(lms);
     expect(lms.listAllJobIdsByStatus).toHaveBeenCalledWith("pending_rx");
     expect(mockRebuild).not.toHaveBeenCalled();
+    // The stage sweep runs every pass, pending jobs or not.
+    expect(lms.markStagelessJobsReady).toHaveBeenCalledTimes(1);
+  });
+
+  it("still heals pending jobs when the stage sweep fails", async () => {
+    const lms = makeLms([{ id: "job_a", order_id: "order_a" }]);
+    lms.markStagelessJobsReady.mockRejectedValue(new Error("db down"));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockRebuild.mockResolvedValue({ buildOutcome: "ok", job: {}, submit: {} } as any);
+    await runJob(lms);
+    expect(mockRebuild).toHaveBeenCalledTimes(1);
   });
 
   it("rebuilds every pending_rx job — heals the ones whose Rx has landed, leaves the rest", async () => {
