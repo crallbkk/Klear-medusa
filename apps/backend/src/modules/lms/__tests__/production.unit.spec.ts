@@ -46,6 +46,7 @@ const TABLE: Record<(typeof STAGE_ACTIONS)[number], { from: (Stage | null)[]; to
   LENS_SPOILED: { from: ["lens_issued", "edged", "mounted"], to: "printed" },
   PACKED: { from: ["qc_passed"], to: "packed" },
   LABELLED: { from: ["packed"], to: "labelled" },
+  LABEL_CANCELLED: { from: ["labelled"], to: "packed" },
   DELIVERED: { from: ["labelled"], to: "delivered" },
   RX_CHANGED: {
     from: [

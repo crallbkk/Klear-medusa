@@ -883,6 +883,19 @@ class LmsModuleService extends MedusaService({
           `a job whose packet is ${job.status} is not ready for production`,
         );
       }
+      // A changed prescription replaces the packet. One a lab provider has,
+      // or is being given, cannot be replaced, so the job cannot go back.
+      if (
+        action === "RX_CHANGED" &&
+        job.status !== "queued" &&
+        job.status !== "failed" &&
+        job.status !== "pending_rx"
+      ) {
+        throw new ProductionError(
+          "not_allowed",
+          `the packet of this job is ${job.status}; its prescription cannot be changed here`,
+        );
+      }
       // A warranty remake needs the prescription back in the packet first
       // (it is blanked some time after delivery). The caller rebuilds it.
       if (action === "REMAKE_STARTED" && job.rx_redacted_at && job.stage !== "qc_failed") {
@@ -936,6 +949,14 @@ class LmsModuleService extends MedusaService({
       // A cancelled job's packet is cancelled too, in the same write, so
       // nothing later submits or rebuilds it.
       if (effect.cancel_status) sets.push(`"status" = 'cancelled'`);
+      // A changed prescription: the stored packet is the old one. Until a
+      // rebuild stores the new packet the job has none to work from, which
+      // is what `pending_rx` means; PRINTED is refused, and both the Retry
+      // button and the half-hourly heal sweep rebuild it.
+      if (effect.packet_outdated && (job.status === "queued" || job.status === "failed")) {
+        sets.push(`"status" = 'pending_rx'`, `"last_error" = ?`);
+        params.push("prescription changed; the packet is being rebuilt");
+      }
       // Guarded on the version read under the lock: belt and braces, and it
       // keeps the write correct even if a caller ever drops the lock.
       const updated = await em.execute(
@@ -1312,6 +1333,24 @@ class LmsModuleService extends MedusaService({
           invoiced_to_date_satang,
         })),
     }));
+  }
+
+  /** The idempotency key of a job's most recent LABELLED event, or null. */
+  async lastLabelKey(jobId: string): Promise<string | null> {
+    const rows = (await this.listProductionEvents(
+      { lab_job_id: jobId, action: "LABELLED" },
+      { select: ["idempotency_key"], order: { seq: "DESC" }, take: 1 },
+    )) as unknown as Array<{ idempotency_key: string }>;
+    return rows[0]?.idempotency_key ?? null;
+  }
+
+  /** Has an event with this idempotency key been recorded? */
+  async hasProductionEventKey(key: string): Promise<boolean> {
+    const rows = await this.listProductionEvents(
+      { idempotency_key: key },
+      { select: ["id"], take: 1 },
+    );
+    return rows.length > 0;
   }
 
   /** A job's production history, oldest first. */

@@ -62,6 +62,7 @@ export const STAGE_ACTIONS = [
   "LENS_SPOILED",
   "PACKED",
   "LABELLED",
+  "LABEL_CANCELLED",
   "DELIVERED",
   "RX_CHANGED",
   "CANCELLED",
@@ -85,6 +86,7 @@ export type ProductionAction = (typeof ACTIONS)[number];
 export const SYSTEM_ONLY_ACTIONS: ReadonlySet<ProductionAction> = new Set([
   "READY",
   "LABELLED",
+  "LABEL_CANCELLED",
   "DELIVERED",
   "RX_CHANGED",
   "CANCELLED",
@@ -149,6 +151,10 @@ export type Effect = {
   return_lenses?: string[];
   /** CANCELLED: the packet's `status` is set to cancelled with the stage. */
   cancel_status?: true;
+  /** RX_CHANGED: the stored packet is for the old prescription. The job's
+   *  `status` goes to `pending_rx` until a rebuild stores the new packet,
+   *  so nobody can print from the old one in between. */
+  packet_outdated?: true;
   /** What is stored on the event. Never a prescription value. */
   detail: Record<string, unknown>;
 };
@@ -345,6 +351,14 @@ export function decide(
       need(job, action, "packed");
       return { ...none, to_stage: "labelled" };
 
+    case "LABEL_CANCELLED":
+      // The label was cancelled in Medusa before the carrier took the
+      // parcel: the boxed glasses are waiting for a label again. (Not in the
+      // design's table, which has no way back from `labelled`; without it a
+      // re-booked label could never be recorded.)
+      need(job, action, "labelled");
+      return { ...none, to_stage: "packed" };
+
     case "DELIVERED":
       need(job, action, "labelled");
       return { ...none, to_stage: "delivered" };
@@ -359,7 +373,7 @@ export function decide(
       // A lens already cut for the old prescription is lost; the next issue
       // is a remake.
       if (LENS_CUT.has(job.stage)) patch.next_issue_reason = "remake";
-      return { ...none, to_stage: "ready", patch };
+      return { ...none, to_stage: "ready", patch, packet_outdated: true };
     }
 
     case "CANCELLED": {

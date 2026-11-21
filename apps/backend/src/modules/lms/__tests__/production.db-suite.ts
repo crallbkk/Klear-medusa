@@ -398,6 +398,8 @@ export function productionSuite(service: LmsModuleService): void {
 
         // The lens went back uncut, so the pair issued next is the order's
         // own lens cost, not a remake.
+        // The changed prescription's packet is rebuilt before the lab starts again.
+        await service.updateJobFromBuild(jobId, ok("order_1"));
         await act(jobId, "PRINTED");
         await act(jobId, "LENS_ISSUED", { lenses: ["LENS-C", "LENS-D"] });
         expect(
@@ -422,6 +424,8 @@ export function productionSuite(service: LmsModuleService): void {
         });
         const cut = await act(jobId, "LENS_CUT_CONFIRMED");
         expect(cut.job).toMatchObject({ cut_question_pending: false, next_issue_reason: "remake" });
+        // The changed prescription's packet is rebuilt before the lab starts again.
+        await service.updateJobFromBuild(jobId, ok("order_1"));
         await act(jobId, "PRINTED");
         await act(jobId, "LENS_ISSUED", { lenses: ["LENS-C", "LENS-D"] });
         expect(
@@ -447,6 +451,8 @@ export function productionSuite(service: LmsModuleService): void {
             actor: SYSTEM,
           });
         await change();
+        // The changed prescription's packet is rebuilt before the lab starts again.
+        await service.updateJobFromBuild(jobId, ok("order_1"));
         await act(jobId, "PRINTED");
         await act(jobId, "LENS_ISSUED", { lenses: ["LENS-C", "LENS-D"] });
         await change();
@@ -651,6 +657,8 @@ export function productionSuite(service: LmsModuleService): void {
           idempotency_key: key(),
           actor: SYSTEM,
         });
+        // The changed prescription's packet is rebuilt before the lab starts again.
+        await service.updateJobFromBuild(jobId, ok("order_1"));
         await act(jobId, "PRINTED");
         await act(jobId, "SENT_TO_LAB", { vendor: "Lab One", quoted_satang: 45000 });
         await act(jobId, "RECEIVED_FROM_LAB");

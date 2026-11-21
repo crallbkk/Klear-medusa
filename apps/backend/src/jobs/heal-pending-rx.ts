@@ -29,6 +29,10 @@ import { captureException } from "../lib/observability/sentry";
  * metadata-change event. An immediate nudge (storefront → this heal path) is a
  * small additive follow-up if progression latency ever matters.
  *
+ * `pending_rx` also covers a job in production whose prescription changed
+ * and whose new packet is not stored yet (see `applyChangedPrescription`);
+ * the same rebuild finishes it.
+ *
  * Scope: `pending_rx` only. Genuinely `failed` jobs (bad signature, missing
  * address, tampering) are NOT swept — they need ops attention via
  * `/admin/lab-jobs` + the manual retry route, not silent auto-retry.

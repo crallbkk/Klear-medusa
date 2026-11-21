@@ -259,10 +259,69 @@ packet builds, and moves from there only through
 this module. What crosses to Klear Operations is totals per release window,
 with no job, order, day or time (next section).
 
-Not built yet: the routes and screens that call the writer, the subscribers
-that record `LABELLED`, `DELIVERED`, `CANCELLED` and `RX_CHANGED`, the check
-that a label cannot be booked before `packed`, and the lab role. Until then
-nothing calls the writer except the packet build.
+Not built yet: the routes and screens that call the writer, and the lab
+role. Until then nothing moves a job between `ready` and `packed`.
+
+## Following the order
+
+`subscribers/lab-job-order-events.ts` and `order-events.ts` keep a job in
+step with its Medusa order. Each is recorded once per fulfillment (or per
+order, for a cancel), however often the event arrives, and an order with no
+lab job is ignored.
+
+| Medusa event | Action | From | To |
+|---|---|---|---|
+| `order.fulfillment_created` (a label was booked) | `LABELLED` | `packed` | `labelled` |
+| `order.fulfillment_canceled` | `LABEL_CANCELLED` | `labelled` | `packed` |
+| `delivery.created` | `DELIVERED` | `labelled` | `delivered` |
+| `order.canceled` | `CANCELLED` | any stage before `labelled` | `cancelled` |
+
+`LABEL_CANCELLED` is not in the design's table; without a way back from
+`labelled`, a label booked again after a cancel could never be recorded.
+
+An order can have several fulfillments (an accessory, a split parcel, a
+claim's replacement). Only the fulfillment whose label moved the job to
+`labelled` can cancel that label or deliver the job; events for the others
+are refused. If a new label arrives while the job is still marked as
+labelled by an earlier fulfillment that is cancelled in Medusa, the lost
+cancel is recorded first and the label moves to the new fulfillment.
+
+Limit: the first fulfillment booked for an order whose job is `packed` is
+taken to be the glasses. If an accessory on the same order is shipped first,
+it labels (and later delivers) the job. This holds while an order is one
+parcel; checking the fulfillment's items against the frame comes with the
+screens.
+
+A job at `ready` with status `pending_rx` is one whose prescription changed
+and whose new packet is not stored yet; its stored packet is the OLD one.
+Any screen that shows or prints a packet must check `status`, not only that
+a packet exists. The event bus delivers once, so a write that fails for a
+passing reason is retried up to three times in the handler; what still
+fails is reported and the job is left where it was.
+
+**A label cannot be booked before the job is packed**, when
+`LMS_REQUIRE_PACKED_BEFORE_LABEL=true`. A middleware on
+`POST /admin/orders/:id/fulfillments` (`api/admin/orders/require-packed.ts`)
+answers 409 before Medusa's workflow runs, so nothing is booked with the
+carrier. (The workflow's own hook runs after the label exists.) It refuses
+a job at any stage before `packed`, and a lens order whose packet was never
+built. It lets through a job at `labelled` or `delivered` (another parcel on
+the same order), an order with no lab job, and a job from before production.
+`POST /admin/fulfillments` (no order route, not used by the order page) is
+not covered and emits no order event. The setting
+is off by default and must stay off until the lab works in the lab system:
+with it on and no way to reach `packed`, no lens order could ship. While it
+is off, an event that does not fit the job's stage is logged and nothing
+else; while it is on, it is reported as a fault.
+
+**A changed prescription** on a job in production goes through
+`applyChangedPrescription` (`rebuild.ts`): build the new packet first, then
+record `RX_CHANGED` (back to `ready`, and the cut-or-uncut question if a
+lens was issued), then store the new packet. Between the last two the job's
+status is `pending_rx`, so the old packet cannot be printed; if storing the
+new packet fails, the Retry button or the half-hourly heal sweep finishes
+it. Nothing calls it yet; Medusa has no event for a changed prescription,
+so it will be a button.
 
 ## Release to Klear Operations
 
