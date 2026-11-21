@@ -20,6 +20,48 @@ export type LabJobStatusValue =
   | "cancelled"
   | "pending_rx";
 
+/**
+ * A database failure while saving a lab job. Built from the driver's error
+ * code and constraint name ONLY. The driver's own message holds the SQL
+ * with its values written in, and an error message is the one place the
+ * Sentry scrubber cannot clean, so that message is never passed on.
+ */
+export class ProductionWriteError extends Error {
+  readonly code: string | null;
+  constructor(cause: unknown, what = "the lab job could not be saved") {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const e = cause as any;
+    // Only what has the shape of an error code or of a constraint's name.
+    const code = typeof e?.code === "string" && /^[A-Z0-9_]{1,12}$/.test(e.code) ? e.code : null;
+    const constraint =
+      typeof e?.constraint === "string" && /^[A-Za-z0-9_]{1,63}$/.test(e.constraint)
+        ? e.constraint
+        : null;
+    // Medusa rewrites some driver errors (unique, not-null, foreign key)
+    // into its own error with no code. Its `type` and class name hold no
+    // values, so they are safe to pass on; its message is not.
+    const kind = [e?.type, e?.name ?? e?.constructor?.name]
+      .filter((v) => typeof v === "string" && /^[A-Za-z_]{1,40}$/.test(v))
+      .join("/");
+    super(
+      `${what} (database error ${code ?? (kind || "unknown")}${
+        constraint ? `, constraint ${constraint}` : ""
+      })`,
+    );
+    this.name = "ProductionWriteError";
+    this.code = code;
+  }
+}
+
+/** A second live job for the same order was refused by the unique index.
+ *  Carries nothing of the row. */
+export class LabJobDuplicateError extends Error {
+  constructor() {
+    super("a lab job for that order already exists");
+    this.name = "LabJobDuplicateError";
+  }
+}
+
 /** Statuses from which a rebuild (retry heal) is allowed to rewrite the row. */
 const REBUILDABLE_STATUSES: ReadonlySet<LabJobStatusValue> = new Set([
   "queued",
@@ -91,6 +133,33 @@ class LmsModuleService extends MedusaService({
   private readonly provider: ILabProvider = new UnimplementedLabProvider();
 
   /**
+   * Every insert and update of a lab job goes through these two. The
+   * driver's error for a failed save is the SQL with its values written in,
+   * which for a lab job is the whole packet: prescription, name, phone,
+   * address. Callers log errors and send them to Sentry, whose scrubber
+   * cannot clean an error message. So that text never leaves here: it is
+   * replaced by an error built from the error code alone.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async saveNewJob_(data: any): Promise<any> {
+    try {
+      return await this.createLabJobs(data);
+    } catch (err) {
+      if (this.isUniqueViolation(err)) throw new LabJobDuplicateError();
+      throw new ProductionWriteError(err, "the lab job could not be saved");
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async saveJobChange_(change: any): Promise<any> {
+    try {
+      return await this.updateLabJobs(change);
+    } catch (err) {
+      throw new ProductionWriteError(err, "the lab job could not be saved");
+    }
+  }
+
+  /**
    * Detects a Postgres unique-constraint violation (SQLSTATE 23505) however
    * MikroORM/pg wraps it, so concurrent duplicate inserts can be treated as
    * "already created" rather than crashing the subscriber.
@@ -98,12 +167,26 @@ class LmsModuleService extends MedusaService({
   private isUniqueViolation(err: unknown): boolean {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = err as any;
+    if (err instanceof LabJobDuplicateError) return true;
     const code = e?.code ?? e?.cause?.code ?? e?.errno;
     if (code === "23505") return true;
-    const name = e?.constructor?.name ?? e?.name ?? "";
-    if (typeof name === "string" && /UniqueConstraint/i.test(name)) return true;
-    const msg = err instanceof Error ? err.message : String(err);
-    return /duplicate key value|unique constraint|23505/i.test(msg);
+    // What actually reaches this code on a real database: Medusa's repository
+    // turns the pg error into a MedusaError of type "invalid_data" with the
+    // message "Lab job with order_id: ..., already exists." and no pg code
+    // (`dbErrorMapper` in @medusajs/utils). Found by the database tests; the
+    // fake store in the unit tests throws the raw pg shape.
+    if (
+      e?.type === "invalid_data" &&
+      typeof e?.message === "string" &&
+      /^Lab job with order_id: .*, already exists\.$/.test(e.message)
+    ) {
+      return true;
+    }
+    // Nothing else. The error's free text is never searched: the driver's
+    // message is the INSERT with the packet written in, so a phone number
+    // containing 23505, or a customer called "Unique Constraint", would turn
+    // any failed insert into "already exists".
+    return false;
   }
 
   /**
@@ -118,7 +201,7 @@ class LmsModuleService extends MedusaService({
     last_error?: string | null;
   }): Promise<LabJobRow> {
     try {
-      const created = (await this.createLabJobs({
+      const created = (await this.saveNewJob_({
         order_id: data.order_id,
         status: data.status,
         packet_snapshot: data.packet_snapshot,
@@ -205,7 +288,7 @@ class LmsModuleService extends MedusaService({
     if (result.outcome === "skip") {
       // The order became frame-only since the row was created (unusual). Leave
       // the snapshot untouched; just record why nothing was submitted.
-      const updated = (await this.updateLabJobs({
+      const updated = (await this.saveJobChange_({
         selector: { id: jobId },
         data: { last_error: result.reason },
       })) as unknown as LabJobRow[];
@@ -225,7 +308,7 @@ class LmsModuleService extends MedusaService({
     ) {
       return current;
     }
-    const updated = (await this.updateLabJobs({
+    const updated = (await this.saveJobChange_({
       selector: { id: jobId },
       data: {
         status: fields.status,
@@ -361,7 +444,7 @@ class LmsModuleService extends MedusaService({
     // the read-check above this reduces double-submission from
     // seconds-likely to pathological. A native conditional UPDATE would
     // close it fully if a provider ever proves non-idempotent.)
-    const claimed = (await this.updateLabJobs({
+    const claimed = (await this.saveJobChange_({
       selector: { id: jobId, status: "queued" },
       data: { status: "submitting" },
     })) as unknown as LabJobRow[];
@@ -380,7 +463,7 @@ class LmsModuleService extends MedusaService({
       const { provider_job_id } = await this.provider.submitJob(
         job.packet_snapshot,
       );
-      const updated = (await this.updateLabJobs({
+      const updated = (await this.saveJobChange_({
         selector: { id: jobId },
         data: {
           status: "submitted",
@@ -402,7 +485,7 @@ class LmsModuleService extends MedusaService({
       ) {
         // Expected pre-lab-partner state — release the claim back to
         // queued, just count the attempt.
-        const updated = (await this.updateLabJobs({
+        const updated = (await this.saveJobChange_({
           selector: { id: jobId },
           data: {
             status: "queued",
@@ -413,7 +496,7 @@ class LmsModuleService extends MedusaService({
         return { outcome: "queued_no_provider", job: updated[0]! };
       }
 
-      const updated = (await this.updateLabJobs({
+      const updated = (await this.saveJobChange_({
         selector: { id: jobId },
         data: {
           status: "failed",
@@ -500,7 +583,7 @@ class LmsModuleService extends MedusaService({
     // the `prescription` key is overwritten and every other key keeps the
     // value in the row. Writing back a full copy of what we read would put
     // stale keys over a rebuild that landed in between.
-    const updated = (await this.updateLabJobs({
+    const updated = (await this.saveJobChange_({
       selector: { id: jobId, status: job.status, rx_redacted_at: null },
       data: { packet_snapshot: { prescription: null }, rx_redacted_at: new Date() },
     })) as unknown as LabJobRow[];
@@ -510,7 +593,7 @@ class LmsModuleService extends MedusaService({
   /** Mark a queued / failed / pending_rx / submitted job as cancelled.
    *  Called when the customer cancels before lab production starts. */
   async cancelJob(jobId: string): Promise<LabJobRow> {
-    const updated = (await this.updateLabJobs({
+    const updated = (await this.saveJobChange_({
       selector: { id: jobId },
       data: { status: "cancelled" },
     })) as unknown as LabJobRow[];

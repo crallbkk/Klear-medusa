@@ -3,10 +3,49 @@ import type {
   MedusaResponse,
 } from "@medusajs/framework";
 import { MedusaError } from "@medusajs/framework/utils";
-import { LMS_MODULE } from "../../../../../modules/lms/service";
+import {
+  LMS_MODULE,
+  LabJobDuplicateError,
+  LabJobNotRebuildableError,
+  ProductionWriteError,
+} from "../../../../../modules/lms/service";
 import type LmsModuleService from "../../../../../modules/lms/service";
 import { rebuildAndSubmitJob } from "../../../../../modules/lms/rebuild";
 import { captureException } from "../../../../../lib/observability/sentry";
+import { errorKind } from "../../production-http";
+
+// Errors whose text this code builds itself, from ids, a status and an
+// error code. Their message is safe to log, to report and to answer with.
+const ownWords = (err: unknown): string | null =>
+  err instanceof ProductionWriteError ||
+  err instanceof LabJobNotRebuildableError ||
+  err instanceof LabJobDuplicateError
+    ? err.message
+    : null;
+
+// How a failure is named in the log: its own words if they are ours,
+// otherwise only what kind of error it is.
+const named = (err: unknown): string => ownWords(err) ?? errorKind(err);
+
+// What is sent to Sentry. One of our own errors goes as it is, with its
+// stack. Anything else is replaced by its kind: an error's message is the
+// one thing the Sentry scrubber cannot clean.
+const reportable = (err: unknown, what: string): Error => {
+  if (ownWords(err) !== null) return err as Error;
+  const safe = new Error(`${what}: ${errorKind(err)}`);
+  // Keep where it came from: the original's stack frames, and only lines
+  // that are frames (they end in file:line:column). The message part of a
+  // stack, which can run over several lines, is left behind.
+  const stack = (err as { stack?: unknown })?.stack;
+  if (typeof stack === "string") {
+    const NL = String.fromCharCode(10);
+    const frames = stack.split(NL).filter((line) => /^\s+at .*:\d+:\d+\)?\r?$/.test(line));
+    if (frames.length > 0) {
+      safe.stack = [`${safe.name}: ${safe.message}`, ...frames].join(NL);
+    }
+  }
+  return safe;
+};
 
 /**
  * POST /admin/lab-jobs/[id]/retry — heal + re-attempt a lab job. No body.
@@ -52,11 +91,9 @@ export async function POST(
       return;
     }
     console.error(
-      `[lab-jobs/retry] retrieve failed for ${id}: ${
-        err instanceof Error ? err.message : "unknown"
-      }`,
+      `[lab-jobs/retry] retrieve failed for ${id}: ${named(err)}`,
     );
-    captureException(err, {
+    captureException(reportable(err, "admin/lab-jobs/retry could not read the job"), {
       tags: { route: "admin/lab-jobs/retry", reason: "retrieve_failed" },
       extra: { lab_job_id: id },
     });
@@ -99,17 +136,21 @@ export async function POST(
       job: r.job,
     });
   } catch (err) {
+    if (err instanceof LabJobNotRebuildableError) {
+      // The job moved on between this route's read and the rebuild. Not a
+      // fault: the heal sweep treats the same thing as nothing to report.
+      res.status(409).json({ error: err.message });
+      return;
+    }
     console.error(
-      `[lab-jobs/retry] retry failed for ${id}: ${
-        err instanceof Error ? err.message : "unknown"
-      }`,
+      `[lab-jobs/retry] retry failed for ${id}: ${named(err)}`,
     );
-    captureException(err, {
+    captureException(reportable(err, "admin/lab-jobs/retry failed"), {
       tags: { route: "admin/lab-jobs/retry", reason: "rebuild_failed" },
       extra: { lab_job_id: id, order_id: job.order_id },
     });
-    res.status(500).json({
-      error: err instanceof Error ? err.message : "Unknown error",
-    });
+    // Our own words if we have them; otherwise a fixed sentence, because
+    // an error's own text can carry values.
+    res.status(500).json({ error: ownWords(err) ?? "the retry failed; see the server log" });
   }
 }

@@ -133,6 +133,8 @@ describe("order-placed subscriber", () => {
     await runHandler(lms);
     expect(lms.createFromBuild).toHaveBeenCalledTimes(1);
     expect(created[0]!.outcome).toBe("failed");
+    // The reason is stored on the job: a fixed sentence, not the error's text.
+    expect(JSON.stringify(created[0])).not.toMatch(/exploded/);
     expect(lms.submitJob).not.toHaveBeenCalled();
   });
 
