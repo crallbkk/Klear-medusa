@@ -257,12 +257,58 @@ packet builds, and moves from there only through
 
 `lab_usage` and `lab_cost` tie a lens power or a cost to a job. They stay in
 this module. What crosses to Klear Operations is totals per release window,
-with no job, order, day or time (not built yet).
+with no job, order, day or time (next section).
 
 Not built yet: the routes and screens that call the writer, the subscribers
 that record `LABELLED`, `DELIVERED`, `CANCELLED` and `RX_CHANGED`, the check
-that a label cannot be booked before `packed`, the usage release, and the
-lab role. Until then nothing calls the writer except the packet build.
+that a label cannot be booked before `packed`, and the lab role. Until then
+nothing calls the writer except the packet build.
+
+## Release to Klear Operations
+
+1. **Windows** (`release.ts`). A window ends on a fixed weekday
+   (`LMS_RELEASE_WEEKDAY`, 0 to 6, Sunday if unset) and on the last day of
+   every month. A weekly end within three days before or after a month end
+   is skipped, and a weekly end never closes a window under four days old,
+   so no window is shorter than four days. The one exception: a month end
+   always closes, so the very first window can be short if production
+   starts just before one. The cadence is a setting; the shape of what
+   crosses is not.
+2. **Release** (`releaseDueWindows`, run hourly by the `release-lab-usage`
+   job). For each window that has ended in Bangkok and is not yet released,
+   in one transaction: a marker row (`lab_release_window`, also for an empty
+   window), totals per SKU and reason (`lab_usage_release`), and totals per
+   outside lab as of the window's last day (`lab_total_day`). Written once,
+   insert-only.
+3. **A row belongs to the window in which it was entered**, not the one in
+   which the work was done (`lab_usage.entered_on`). The writer and the
+   release share a lock, and the writer dates a row after the last released
+   window even if its clock is behind, so a row cannot land in a window
+   already released. The hourly job also checks that usage and released
+   totals agree and reports any difference.
+4. **Feed** `GET /ops-feed/lab-releases?after=YYYY-MM-DD&limit=N`, bearer
+   secret `KLEAR_OPS_FEED_SECRET` (at least 32 characters; unset means the
+   route answers 503). The cursor is a window's end date.
+5. **Limit, stated plainly.** At one or two jobs a week a window's totals
+   can still point at one order. Weekly totals are much weaker evidence than
+   a timestamped event, not none.
+6. **Before the first production event** there is no window and no marker.
+   Klear Operations must not wait for a marker for a period before the lab
+   system started.
+7. **Lab names.** Totals are grouped by the lab's name in lower case with
+   white space collapsed, and that is the name served. A fixed list of labs
+   chosen on the screen is the real fix and comes with the screens.
+8. **Open:** a quote whose work came back and is never invoiced (a remake
+   the lab does not bill) stays in "back and not invoiced" for good. It
+   needs a "written off" action or a decision that it should.
+9. **Lab totals assume one clock.** Usage dates are protected against a
+   process whose clock runs behind the releasing one; a lab quote's
+   timestamps are not. With two processes whose clocks differ, a receipt or
+   invoice written just after a release can be missing from that window's
+   total. The next window's total includes it (totals are cumulative).
+10. **Limit:** totals are 32-bit whole satang, about 21 million baht per lab
+   per figure. Past that the release fails loudly every hour until the
+   columns are widened.
 
 Known gaps, to be closed with the parts above:
 
@@ -289,7 +335,9 @@ Known gaps, to be closed with the parts above:
 
 ## Database tests
 
-`*.db.spec.ts` files run against a real Postgres whose schema is built by
+All database suites run from one file, `__tests__/lms.db.spec.ts` (each
+suite is a `*.db-suite.ts` function; see the note at the top of that file
+for why). They run against a real Postgres whose schema is built by
 running this module's migration files in order (`__tests__/db-harness.ts`),
 which is what a deploy does. CI starts a Postgres for them. Locally, point
 them at any Postgres you can create a database on:

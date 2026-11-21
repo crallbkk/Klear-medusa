@@ -1,17 +1,13 @@
-import { moduleIntegrationTestRunner } from "@medusajs/test-utils";
 import type LmsModuleService from "../service";
-import { LMS_MODULE, LabJobNotRebuildableError } from "../service";
+import { LabJobNotRebuildableError } from "../service";
 import { ProductionError, type ProductionAction } from "../production";
 import type { BuildPacketResult, LabJobPacket } from "../types";
 import {
-  TEST_DB_NAME,
   migrationNames,
   resetDatabase,
   runMigrations,
   sql,
 } from "./db-harness";
-
-jest.setTimeout(120_000);
 
 const PACKET: LabJobPacket = {
   job_ref: "klear-order_1",
@@ -61,19 +57,8 @@ async function code(promise: Promise<unknown>): Promise<string> {
   return "no error";
 }
 
-moduleIntegrationTestRunner<LmsModuleService>({
-  moduleName: LMS_MODULE,
-  resolve: "./src/modules/lms",
-  dbName: TEST_DB_NAME,
-  // No models handed to the runner: it would build the schema from them.
-  // The schema here comes from the migration files instead.
-  moduleModels: [],
-  hooks: {
-    beforeModuleInit: async () => {
-      await resetDatabase();
-    },
-  },
-  testSuite: ({ service }) => {
+/** Run inside the one runner in lms.db.spec.ts. */
+export function productionSuite(service: LmsModuleService): void {
     /** A person moving a job, reading the version first as a screen would. */
     async function act(
       jobId: string,
@@ -111,9 +96,9 @@ moduleIntegrationTestRunner<LmsModuleService>({
 
       it("gives jobs that existed before production a starting stage and the event that explains it", async () => {
         const names = migrationNames();
-        const last = names[names.length - 1];
-        expect(last).toBe("Migration20261120000100");
-        await resetDatabase(names.slice(0, -1));
+        const at = names.indexOf("Migration20261120000100");
+        expect(at).toBeGreaterThan(0);
+        await resetDatabase(names.slice(0, at));
         await sql(
           `insert into lab_job (id, order_id, status, packet_snapshot, attempts) values
              ('labjob_q', 'order_q', 'queued', '{}', 0),
@@ -133,7 +118,7 @@ moduleIntegrationTestRunner<LmsModuleService>({
           `insert into lab_job (id, order_id, status, packet_snapshot, attempts, created_at)
              values ('labjob_o', 'order_o', 'queued', '{}', 0, now() - interval '60 days')`,
         );
-        await runMigrations([last]);
+        await runMigrations(names.slice(at));
 
         const jobs = await sql(
           `select id, stage, stage_version, event_seq, stage_since = updated_at as since_ok
@@ -920,5 +905,4 @@ moduleIntegrationTestRunner<LmsModuleService>({
         expect(await service.listProductionEventsForJob(jobId)).toHaveLength(2);
       });
     });
-  },
-});
+}

@@ -5,6 +5,10 @@ import LabJob from "./models/lab-job";
 import ProductionEvent from "./models/production-event";
 import LabUsage from "./models/lab-usage";
 import LabCost from "./models/lab-cost";
+import LabReleaseWindow from "./models/lab-release-window";
+import LabUsageRelease from "./models/lab-usage-release";
+import LabTotalDay from "./models/lab-total-day";
+import { addDays, dueWindows, releaseWeekday, type ReleaseWindow } from "./release";
 import {
   type BuildPacketResult,
   type ILabProvider,
@@ -174,6 +178,20 @@ export type ProductionActionResult = {
   replayed: boolean;
 };
 
+/** One released window as the feed serves it: totals only. */
+export type ReleasedWindow = {
+  window_end: string;
+  released_at: Date;
+  usage: Array<{ id: string; sku: string; reason: string; net_qty: number }>;
+  lab_totals: Array<{
+    id: string;
+    vendor: string;
+    as_of: string;
+    quoted_uninvoiced_satang: number;
+    invoiced_to_date_satang: number;
+  }>;
+};
+
 const JOB_PRODUCTION_COLUMNS = `"id", "order_id", "stage", "stage_since", "stage_version", "event_seq",
   "remake_count", "on_hold", "hold_reason", "cut_question_pending", "next_issue_reason"`;
 
@@ -223,6 +241,9 @@ class LmsModuleService extends MedusaService({
   ProductionEvent,
   LabUsage,
   LabCost,
+  LabReleaseWindow,
+  LabUsageRelease,
+  LabTotalDay,
 }) {
   private readonly provider: ILabProvider = new UnimplementedLabProvider();
 
@@ -880,6 +901,20 @@ class LmsModuleService extends MedusaService({
       };
       const effect = decide(state, action, input.detail ?? {});
 
+      // An action that records usage or touches a lab quote shares the
+      // release's lock (the release takes the exclusive side): the release
+      // waits for it, and it waits for a release in progress. The clock is
+      // read only after the lock is held. Other actions (READY, a note, a
+      // hold) feed nothing into a release and do not wait for one.
+      if (
+        effect.usage.length > 0 ||
+        effect.return_lenses ||
+        effect.open_cost ||
+        effect.receive_cost ||
+        effect.invoice_cost
+      ) {
+        await em.execute(`select pg_advisory_xact_lock_shared(hashtext('lms_usage_release'))`);
+      }
       const now = new Date();
       const seq = job.event_seq + 1;
       const sets: string[] = [`"event_seq" = ?`];
@@ -972,7 +1007,20 @@ class LmsModuleService extends MedusaService({
           usage.push({ sku: s, reason: "return_unused", qty: 1 });
         }
       }
-      const enteredOn = bangkokDate(now);
+      // A usage row belongs to the window in which it is entered, and must
+      // never land in a window already released (it would be left out for
+      // good). Normally "today" is after every released window; if this
+      // process's clock is behind the releasing one's, the day after the
+      // last released window is used instead.
+      let enteredOn = bangkokDate(now);
+      if (usage.length > 0) {
+        const [lastWindow] = await em.execute(
+          `select "window_end" from "lab_release_window" order by "window_end" desc limit 1`,
+        );
+        if (lastWindow && lastWindow.window_end >= enteredOn) {
+          enteredOn = addDays(lastWindow.window_end, 1);
+        }
+      }
       for (const line of usage) {
         await em.execute(
           `insert into "lab_usage"
@@ -1113,6 +1161,157 @@ class LmsModuleService extends MedusaService({
       if (await this.markReadyForProduction(id)) set++;
     }
     return set;
+  }
+
+  // ── Release to Klear Operations ─────────────────────────────────────────
+
+  /**
+   * Release every window that has ended and has not been released: the
+   * window's marker, its usage totals per SKU and reason, and the lab totals
+   * as of its last day, all in one transaction per run. Safe to run as often
+   * as you like and from two processes at once (an advisory lock makes them
+   * take turns; the second finds nothing left to do).
+   *
+   * A window's rows are written once and never change. A usage row entered
+   * later belongs to the window in which it was ENTERED (`entered_on`), so
+   * nothing can arrive for a window after its release.
+   */
+  async releaseDueWindows(
+    now: Date = new Date(),
+    weekday: number = releaseWeekday(),
+  ): Promise<ReleaseWindow[]> {
+    const today = bangkokDate(now);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return await (this as any).baseRepository_.transaction(async (em: Sql) => {
+      await em.execute(`set local lock_timeout = '5s'`);
+      await em.execute(`select pg_advisory_xact_lock(hashtext('lms_usage_release'))`);
+
+      const [last] = await em.execute(
+        `select "window_end" from "lab_release_window" order by "window_end" desc limit 1`,
+      );
+      // Production starts with the first event; there is nothing to release,
+      // and no window to mark, before that.
+      const [first] = await em.execute(
+        `select to_char(min("created_at") at time zone 'Asia/Bangkok', 'YYYY-MM-DD') as "day"
+           from "production_event"`,
+      );
+      if (!last && !first?.day) return [];
+
+      const windows = dueWindows(last?.window_end ?? null, first?.day ?? today, today, weekday);
+      for (const w of windows) {
+        await em.execute(
+          `insert into "lab_release_window"
+             ("id", "window_start", "window_end", "released_at", "created_at", "updated_at")
+           values (?, ?, ?, ?, ?, ?)`,
+          [generateEntityId(undefined, "labwin"), w.window_start, w.window_end, now, now, now],
+        );
+        await em.execute(
+          `insert into "lab_usage_release"
+             ("id", "window_end", "sku", "reason", "net_qty", "created_at", "updated_at")
+           select 'labrel_' || replace(gen_random_uuid()::text, '-', ''), ?, u."sku", u."reason",
+                  sum(u."qty")::int, ?, ?
+             from "lab_usage" u
+            where u."entered_on" >= ? and u."entered_on" <= ?
+            group by u."sku", u."reason"
+           having sum(u."qty") <> 0`,
+          [w.window_end, now, now, w.window_start, w.window_end],
+        );
+        // Lab totals as of the end of the window's last day in Bangkok.
+        const cutoff = `${addDays(w.window_end, 1)}T00:00:00+07:00`;
+        await em.execute(
+          `insert into "lab_total_day"
+             ("id", "vendor", "as_of", "quoted_uninvoiced_satang", "invoiced_to_date_satang",
+              "created_at", "updated_at")
+           select 'labtot_' || replace(gen_random_uuid()::text, '-', ''), c."vendor_key", ?,
+                  coalesce(sum(c."quoted_satang") filter (
+                    where c."received_at" < ?::timestamptz
+                      and (c."invoiced_at" is null or c."invoiced_at" >= ?::timestamptz)), 0)::int,
+                  coalesce(sum(c."invoiced_satang") filter (
+                    where c."invoiced_at" < ?::timestamptz), 0)::int,
+                  ?, ?
+             from (select *, lower(btrim(regexp_replace("vendor", '\\s+', ' ', 'g'))) as "vendor_key"
+                     from "lab_cost") c
+            where c."deleted_at" is null and c."created_at" < ?::timestamptz
+            group by c."vendor_key"`,
+          [w.window_end, cutoff, cutoff, cutoff, now, now, cutoff],
+        );
+      }
+      return windows;
+    });
+  }
+
+  /**
+   * A check, not a repair: how many released totals (window, SKU, reason)
+   * disagree with the usage rows dated inside that window. Zero when every
+   * piece is accounted for. Anything else means a row was written into a
+   * window after its release (the writer is built so that cannot happen) or
+   * a table was changed by hand, and Klear Operations has been told the
+   * wrong totals. It stays non-zero until the cause is dealt with.
+   */
+  async unreleasedUsageDrift(): Promise<number> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return await (this as any).baseRepository_.transaction(async (em: Sql) => {
+      const [row] = await em.execute(
+        `with used as (
+           select w."window_end", u."sku", u."reason", sum(u."qty") as "qty"
+             from "lab_usage" u
+             join "lab_release_window" w
+               on u."entered_on" >= w."window_start" and u."entered_on" <= w."window_end"
+            group by 1, 2, 3
+           having sum(u."qty") <> 0
+         )
+         select count(*)::int as "drift"
+           from used
+           full join "lab_usage_release" r
+             on r."window_end" = used."window_end" and r."sku" = used."sku"
+            and r."reason" = used."reason"
+          where used."qty" is distinct from r."net_qty"`,
+      );
+      return Number(row?.drift ?? 0);
+    });
+  }
+
+  /**
+   * Released windows after a given window end, oldest first, each complete.
+   * This is everything the feed to Klear Operations serves: no job, order,
+   * day or time appears in it.
+   */
+  async listReleasedWindows(after: string | null, limit = 50): Promise<ReleasedWindow[]> {
+    const take = Math.min(Math.max(Math.trunc(limit) || 50, 1), 200);
+    const windows = (await this.listLabReleaseWindows(
+      after ? { window_end: { $gt: after } } : {},
+      { select: ["window_end", "released_at"], take, order: { window_end: "ASC" } },
+    )) as unknown as Array<{ window_end: string; released_at: Date }>;
+    if (windows.length === 0) return [];
+    const ends = windows.map((w) => w.window_end);
+    const usage = (await this.listLabUsageReleases(
+      { window_end: ends },
+      { select: ["id", "window_end", "sku", "reason", "net_qty"], take: null, order: { id: "ASC" } },
+    )) as unknown as Array<{ id: string; window_end: string; sku: string; reason: string; net_qty: number }>;
+    const totals = (await this.listLabTotalDays(
+      { as_of: ends },
+      {
+        select: ["id", "vendor", "as_of", "quoted_uninvoiced_satang", "invoiced_to_date_satang"],
+        take: null,
+        order: { id: "ASC" },
+      },
+    )) as unknown as ReleasedWindow["lab_totals"];
+    return windows.map((w) => ({
+      window_end: w.window_end,
+      released_at: w.released_at,
+      usage: usage
+        .filter((u) => u.window_end === w.window_end)
+        .map(({ id, sku, reason, net_qty }) => ({ id, sku, reason, net_qty })),
+      lab_totals: totals
+        .filter((t) => t.as_of === w.window_end)
+        .map(({ id, vendor, as_of, quoted_uninvoiced_satang, invoiced_to_date_satang }) => ({
+          id,
+          vendor,
+          as_of,
+          quoted_uninvoiced_satang,
+          invoiced_to_date_satang,
+        })),
+    }));
   }
 
   /** A job's production history, oldest first. */

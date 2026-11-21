@@ -274,7 +274,9 @@ export function decide(
     case "SENT_TO_LAB": {
       need(job, action, "printed");
       needQuestionAnswered(job, action);
-      const vendor = text(detail, "vendor", 120);
+      // One spelling per lab: inner runs of white space collapsed. Totals
+      // are grouped without regard to case as well (see the release).
+      const vendor = text(detail, "vendor", 120).replace(/\s+/g, " ");
       const quoted_satang = satang(detail, "quoted_satang");
       const expected_on = dateOrNull(detail, "expected_on");
       return {
