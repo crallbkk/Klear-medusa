@@ -438,6 +438,8 @@ describe("buildLabJobPacket — failed", () => {
     expect(result.outcome).toBe("failed");
     if (result.outcome !== "failed") return;
     expect(result.reason).toMatch(/decrypt failed/i);
+    // The reason is stored on the job: a fixed sentence, not the error's text.
+    expect(result.reason).toBe("prescription decrypt failed");
   });
 
   it("fails when the shipping address has no phone", async () => {

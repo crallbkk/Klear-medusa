@@ -57,9 +57,9 @@ export default async function orderPlacedHandler({
     });
     result = {
       outcome: "failed",
-      reason: `lab-job build threw: ${
-        err instanceof Error ? err.message : "unknown error"
-      }`,
+      // A fixed sentence: this reason is stored on the job and shown on
+      // the lab queue. The error itself went to Sentry above.
+      reason: "lab-job build threw an error",
       snapshot: { job_ref: `klear-${orderId}`, klear_order_id: orderId },
     };
   }

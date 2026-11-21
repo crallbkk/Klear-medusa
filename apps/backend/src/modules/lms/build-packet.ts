@@ -270,7 +270,13 @@ export async function buildLabJobPacket(
   if (typeof rawLensType !== "string" || !ALLOWED_LENS_TYPES.has(rawLensType)) {
     return {
       outcome: "failed",
-      reason: `unknown lens type: ${JSON.stringify(rawLensType ?? null)}`,
+      // The value comes from line metadata a client wrote; it is stored on
+      // the job and shown on the queue, so only a short plain word is kept.
+      reason: `unknown lens type: ${
+        typeof rawLensType === "string" && /^[\w-]{1,40}$/.test(rawLensType)
+          ? rawLensType
+          : "(not a lens type)"
+      }`,
       snapshot: {
         job_ref: jobRef,
         klear_order_id: orderId,
@@ -405,9 +411,10 @@ export async function buildLabJobPacket(
       });
       return {
         outcome: "failed",
-        reason: `prescription decrypt failed: ${
-          err instanceof Error ? err.message : "unknown error"
-        }`,
+        // A fixed sentence: this reason is stored on the job and shown
+        // on the queue, and the error's own text is not ours to vouch for.
+        // The error itself went to Sentry above.
+        reason: "prescription decrypt failed",
         snapshot: baseSnapshot,
       };
     }
