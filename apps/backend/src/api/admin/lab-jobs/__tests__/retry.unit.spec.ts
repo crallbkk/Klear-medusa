@@ -305,7 +305,7 @@ describe("POST /admin/lab-jobs/[id]/retry", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await POST(makeReq(lms) as any, res as any);
     expect(res.status).toHaveBeenCalledWith(500);
-    expect(res.json.mock.calls[0][0].error).toMatch(/could not be saved \(database error 23502/);
+    expect(res.json.mock.calls[0][0].error).toMatch(/\(database error 23502, constraint lab_job_status_check\)/);
     // Reported as itself, so Sentry keeps where it came from.
     const last = (captureException as jest.Mock).mock.calls.at(-1);
     expect(last[0]).toBeInstanceOf(ProductionWriteError);
