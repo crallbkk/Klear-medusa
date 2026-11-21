@@ -1,9 +1,15 @@
 import { MedusaError } from "@medusajs/framework/utils";
+import { captureException } from "../../../../lib/observability/sentry";
 import { POST } from "../[id]/retry/route";
-import { LMS_MODULE } from "../../../../modules/lms/service";
+import {
+  LMS_MODULE,
+  LabJobNotRebuildableError,
+  ProductionWriteError,
+} from "../../../../modules/lms/service";
 import { buildLabJobPacket } from "../../../../modules/lms/build-packet";
 import type { BuildPacketResult } from "../../../../modules/lms/types";
 
+jest.mock("../../../../lib/observability/sentry", () => ({ captureException: jest.fn() }));
 jest.mock("../../../../modules/lms/build-packet", () => ({
   buildLabJobPacket: jest.fn(),
 }));
@@ -11,6 +17,13 @@ jest.mock("../../../../modules/lms/build-packet", () => ({
 const mockBuild = buildLabJobPacket as jest.MockedFunction<
   typeof buildLabJobPacket
 >;
+
+const okResult = () =>
+  ({
+    outcome: "ok",
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    packet: { klear_order_id: "order_1" } as any,
+  }) as BuildPacketResult;
 
 function makeLms(overrides: Record<string, unknown> = {}) {
   return {
@@ -247,6 +260,74 @@ describe("POST /admin/lab-jobs/[id]/retry", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await POST(makeReq(lms) as any, res as any);
     expect(res.status).toHaveBeenCalledWith(500);
+  });
+
+  it("never echoes an error's own text in its answer or its log line", async () => {
+    // A database error's text is the SQL with its values written in.
+    // Over several lines, one of which starts like a stack frame.
+    mockBuild.mockRejectedValue(
+      new Error(
+        ['insert into "lab_job" ... sph_right -2.25 ...', "    at time zone Somchai Secretname", " values (...)"].join(
+          String.fromCharCode(10),
+        ),
+      ),
+    );
+    const logged = jest.spyOn(console, "error").mockImplementation(() => {});
+    const res = makeRes();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await POST(makeReq(makeLms()) as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(500);
+    const reported = (captureException as jest.Mock).mock.calls
+      .map((c) => `${String(c[0]?.message)} ${String(c[0]?.stack)} ${JSON.stringify(c[1])}`)
+      .join(" ");
+    expect((captureException as jest.Mock).mock.calls.length).toBeGreaterThan(0);
+    // What is reported still says where the failure came from.
+    const sent = (captureException as jest.Mock).mock.calls.at(-1)[0] as Error;
+    expect(sent.stack).toMatch(/retry\.unit\.spec\.ts:\d+:\d+/);
+    const said =
+      JSON.stringify(res.json.mock.calls) + JSON.stringify(logged.mock.calls) + reported;
+    logged.mockRestore();
+    expect(said).not.toMatch(/sph_right|2\.25|Secretname|lab_job"/);
+  });
+
+  it("answers in its own words when the failure is one this code describes itself", async () => {
+    mockBuild.mockResolvedValue(okResult());
+    // A failed save: built from the error code alone, so safe to show.
+    const lms = makeLms({
+      retrieveLabJob: jest
+        .fn()
+        .mockResolvedValue({ id: "labjob_1", order_id: "order_1", status: "pending_rx" }),
+      updateJobFromBuild: jest.fn().mockRejectedValue(
+        new ProductionWriteError({ code: "23502", constraint: "lab_job_status_check" }),
+      ),
+    });
+    const res = makeRes();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await POST(makeReq(lms) as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json.mock.calls[0][0].error).toMatch(/could not be saved \(database error 23502/);
+    // Reported as itself, so Sentry keeps where it came from.
+    const last = (captureException as jest.Mock).mock.calls.at(-1);
+    expect(last[0]).toBeInstanceOf(ProductionWriteError);
+  });
+
+  it("409s when the job moved on while it was being rebuilt", async () => {
+    mockBuild.mockResolvedValue(okResult());
+    const lms = makeLms({
+      retrieveLabJob: jest
+        .fn()
+        .mockResolvedValue({ id: "labjob_1", order_id: "order_1", status: "pending_rx" }),
+      updateJobFromBuild: jest.fn().mockRejectedValue(
+        new LabJobNotRebuildableError("updateJobFromBuild: job labjob_1 is submitted"),
+      ),
+    });
+    const res = makeRes();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (captureException as jest.Mock).mockClear();
+    await POST(makeReq(lms) as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(409);
+    // The job simply moved on: nothing to report.
+    expect(captureException).not.toHaveBeenCalled();
   });
 
   it("400s when the id param is missing", async () => {

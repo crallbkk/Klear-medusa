@@ -59,8 +59,12 @@ export class ProductionWriteError extends Error {
   constructor(cause: unknown, what = "the production action could not be recorded") {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = cause as any;
-    const code = typeof e?.code === "string" ? e.code : null;
-    const constraint = typeof e?.constraint === "string" ? e.constraint : null;
+    // Only what has the shape of an error code or of a constraint's name.
+    const code = typeof e?.code === "string" && /^[A-Z0-9_]{1,12}$/.test(e.code) ? e.code : null;
+    const constraint =
+      typeof e?.constraint === "string" && /^[A-Za-z0-9_]{1,63}$/.test(e.constraint)
+        ? e.constraint
+        : null;
     // Medusa rewrites some driver errors (unique, not-null, foreign key)
     // into its own error with no code. Its `type` and class name hold no
     // values, so they are safe to pass on; its message is not.
@@ -398,10 +402,11 @@ class LmsModuleService extends MedusaService({
     ) {
       return true;
     }
-    const name = e?.constructor?.name ?? e?.name ?? "";
-    if (typeof name === "string" && /UniqueConstraint/i.test(name)) return true;
-    const msg = err instanceof Error ? err.message : String(err);
-    return /duplicate key value|unique constraint|23505/i.test(msg);
+    // Nothing else. The error's free text is never searched: the driver's
+    // message is the INSERT with the packet written in, so a phone number
+    // containing 23505, or a customer called "Unique Constraint", would turn
+    // any failed insert into "already exists".
+    return false;
   }
 
   /**

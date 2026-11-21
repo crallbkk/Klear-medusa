@@ -3,7 +3,12 @@ import type {
   MedusaResponse,
 } from "@medusajs/framework";
 import { MedusaError } from "@medusajs/framework/utils";
-import { LMS_MODULE, LabJobNotRebuildableError } from "../../../../../modules/lms/service";
+import {
+  LMS_MODULE,
+  LabJobDuplicateError,
+  LabJobNotRebuildableError,
+  ProductionWriteError,
+} from "../../../../../modules/lms/service";
 import type LmsModuleService from "../../../../../modules/lms/service";
 import { rebuildAndSubmitJob } from "../../../../../modules/lms/rebuild";
 import { captureException } from "../../../../../lib/observability/sentry";
@@ -16,8 +21,34 @@ const bare = (job: unknown) => withoutPacket((job ?? {}) as Record<string, unkno
 // whole packet (a failed save is the SQL with its values), and Sentry's
 // scrubber cannot clean a message, so the original error is never logged
 // or reported: a new one naming only its kind is.
-const kindOf = errorKind;
-const reportable = (err: unknown, what: string) => new Error(`${what}: ${errorKind(err)}`);
+// Errors whose text this code builds itself, from ids, a status and an
+// error code. Their message is safe to log, to report and to answer with.
+const ownWords = (err: unknown): string | null =>
+  err instanceof ProductionWriteError || err instanceof LabJobDuplicateError ? err.message : null;
+
+// How a failure is named in the log: its own words if they are ours,
+// otherwise only what kind of error it is.
+const kindOf = (err: unknown): string => ownWords(err) ?? errorKind(err);
+
+// What is sent to Sentry. One of our own errors goes as it is, with its
+// stack. Anything else is replaced by its kind: an error's message is the
+// one thing the Sentry scrubber cannot clean.
+const reportable = (err: unknown, what: string): Error => {
+  if (ownWords(err) !== null) return err as Error;
+  const safe = new Error(`${what}: ${errorKind(err)}`);
+  // Keep where it came from: the original's stack frames, and only lines
+  // that are frames (they end in file:line:column). The message part of a
+  // stack, which can run over several lines, is left behind.
+  const stack = (err as { stack?: unknown })?.stack;
+  if (typeof stack === "string") {
+    const NL = String.fromCharCode(10);
+    const frames = stack.split(NL).filter((line) => /^\s+at .*:\d+:\d+\)?\r?$/.test(line));
+    if (frames.length > 0) {
+      safe.stack = [`${safe.name}: ${safe.message}`, ...frames].join(NL);
+    }
+  }
+  return safe;
+};
 
 /**
  * POST /admin/lab-jobs/[id]/retry — heal + re-attempt a lab job. No body.
@@ -127,6 +158,9 @@ export async function POST(
       tags: { route: "admin/lab-jobs/retry", reason: "rebuild_failed" },
       extra: { lab_job_id: id, order_id: job.order_id },
     });
-    res.status(500).json({ error: "the retry failed; try again", message: "the retry failed; try again" });
+    // Our own words if we have them; otherwise a fixed sentence, because
+    // an error's own text can carry values.
+    const said = ownWords(err) ?? "the retry failed; try again";
+    res.status(500).json({ error: said, message: said });
   }
 }

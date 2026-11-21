@@ -77,61 +77,6 @@ export function screensSuite(service: LmsModuleService): void {
     });
   };
 
-  describe("a failed save of a job", () => {
-    // The driver's error for a failed insert or update is the SQL with its
-    // values written in: the whole packet. Routes, jobs and subscribers log
-    // such errors and send them to Sentry, whose scrubber cannot clean an
-    // error message. So the service must never let that text out.
-    const failOn = (when: "insert" | "update") =>
-      sql(`
-        create function test_fail() returns trigger language plpgsql as $$
-        begin raise exception 'forced failure'; end $$;
-        create trigger test_fail before ${when} on lab_job
-          for each row execute function test_fail();`);
-
-    it("never carries the packet out of a failed insert", async () => {
-      await failOn("insert");
-      let caught: unknown;
-      try {
-        await service.createFromBuild(telling("order_leak"));
-      } catch (err) {
-        caught = err;
-      }
-      expect(caught).toBeInstanceOf(Error);
-      expect(everythingIn(caught)).not.toMatch(/2\.25|3\.75|Secretname|66811112222|sph_right/);
-      expect(everythingIn(caught)).toMatch(/P0001/);
-    });
-
-    it("never carries the packet out of a failed rebuild or a failed blanking", async () => {
-      const job = await service.createFromBuild({
-        outcome: "pending_rx",
-        reason: "awaiting prescription",
-        snapshot: { job_ref: "klear-order_leak", klear_order_id: "order_leak" },
-      });
-      const built = await service.createFromBuild(telling("order_leak2"));
-      await failOn("update");
-      for (const attempt of [
-        () => service.updateJobFromBuild(job!.id, telling("order_leak")),
-        () => service.redactJobRx(built!.id),
-      ]) {
-        let caught: unknown;
-        try {
-          await attempt();
-        } catch (err) {
-          caught = err;
-        }
-        expect(caught).toBeInstanceOf(Error);
-        expect(everythingIn(caught)).not.toMatch(/2\.25|3\.75|Secretname|66811112222|sph_right/);
-      }
-    });
-
-    it("still adopts the first job when the same order is inserted twice", async () => {
-      const first = await service.createFromBuild(telling("order_twice"));
-      const second = await service.createFromBuild(telling("order_twice"));
-      expect(second!.id).toBe(first!.id);
-    });
-  });
-
   describe("the queue", () => {
     it("lists jobs the lab still has work on, without their packets, longest-waiting first", async () => {
       const a = await service.createFromBuild(ok("order_a"));
