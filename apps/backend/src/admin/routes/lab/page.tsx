@@ -4,7 +4,7 @@ import { Badge, Button, Container, Heading, Text } from "@medusajs/ui";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { sdk } from "../../lib/client";
-import { BOARD_COLUMNS, failureMessage, shortId, stageLabel, waited, type QueueJob } from "../../lib/lab";
+import { BOARD_COLUMNS, failureMessage, jobTitle, stageLabel, waited, type QueueJob } from "../../lib/lab";
 
 type QueueResponse = {
   jobs: QueueJob[];
@@ -22,8 +22,8 @@ const JobRow = ({ job }: { job: QueueJob }) => (
     <div className="shadow-elevation-card-rest bg-ui-bg-component rounded-md px-4 py-3 transition-colors">
       <div className="flex items-center justify-between gap-3">
         <div className="flex flex-col">
-          <Text size="small" leading="compact" weight="plus" title={job.order_id}>
-            Order …{shortId(job.order_id)}
+          <Text size="small" leading="compact" weight="plus" title={job.order_id ?? job.id}>
+            {jobTitle(job)}
           </Text>
           <Text size="small" leading="compact" className="text-ui-fg-subtle">
             {stageLabel(job.stage)}

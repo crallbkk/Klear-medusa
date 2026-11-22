@@ -1,6 +1,7 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework";
 import { LMS_MODULE, QUEUE_LIMIT } from "../../../modules/lms/service";
 import type LmsModuleService from "../../../modules/lms/service";
+import { jobFor } from "../lab-jobs/production-http";
 import {
   OVERDUE_AFTER_HOURS,
   OVERDUE_WAITING_HOURS,
@@ -27,10 +28,12 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
     column: boardColumn(job),
     overdue: isOverdue(job, now),
   }));
+  // Counted before a lab account's view is cut down.
+  const shown = jobs.map((job) => jobFor(req, job));
   const counts: Record<string, number> = {};
   for (const job of jobs) counts[job.column] = (counts[job.column] ?? 0) + 1;
   res.json({
-    jobs,
+    jobs: shown,
     counts,
     overdue: jobs.filter((j) => j.overdue).length,
     overdue_after_hours: { ...OVERDUE_AFTER_HOURS, ...OVERDUE_WAITING_HOURS },

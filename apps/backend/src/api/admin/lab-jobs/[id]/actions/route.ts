@@ -1,7 +1,13 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework";
 import { LMS_MODULE } from "../../../../../modules/lms/service";
 import type LmsModuleService from "../../../../../modules/lms/service";
-import { LAB_ACTIONS, actorOf, readActionBody, sendProductionError } from "../../production-http";
+import {
+  LAB_ACTIONS,
+  actorOf,
+  readActionBody,
+  resultFor,
+  sendProductionError,
+} from "../../production-http";
 
 /**
  * POST /admin/lab-jobs/[id]/actions: record one step the lab took on a job.
@@ -26,9 +32,12 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
   const id = req.params.id;
   try {
     const lms = req.scope.resolve(LMS_MODULE) as LmsModuleService;
-    res.json(
-      await lms.applyProductionAction({ job_id: id, ...body, actor: { type: "user", id: actor } }),
-    );
+    const done = await lms.applyProductionAction({
+      job_id: id,
+      ...body,
+      actor: { type: "user", id: actor },
+    });
+    res.json(resultFor(req, done));
   } catch (err) {
     sendProductionError(res, err, "admin/lab-jobs/actions", id);
   }

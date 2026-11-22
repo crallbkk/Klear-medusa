@@ -4,7 +4,7 @@ import type {
 } from "@medusajs/framework";
 import { LMS_MODULE } from "../../../../modules/lms/service";
 import type LmsModuleService from "../../../../modules/lms/service";
-import { withoutPacket } from "../production-http";
+import { jobFor } from "../production-http";
 
 /**
  * GET /admin/lab-jobs/[id] — retrieve a single lab job by id, WITHOUT its
@@ -32,7 +32,7 @@ export async function GET(
       res.status(404).json({ error: "lab_job not found" });
       return;
     }
-    res.json({ job: withoutPacket(job as unknown as Record<string, unknown>) });
+    res.json({ job: jobFor(req, job as unknown as Record<string, unknown>) });
   } catch {
     res.status(404).json({ error: "lab_job not found" });
   }

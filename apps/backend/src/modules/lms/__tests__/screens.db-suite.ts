@@ -280,6 +280,35 @@ export function screensSuite(service: LmsModuleService): void {
     });
   });
 
+  describe("a person's idempotency key", () => {
+    it("cannot be one of the system's, so a job cannot be blocked with it", async () => {
+      // A job waiting for its prescription: the system will put it at
+      // ready under the key "ready:<job>". A key is unique across all jobs,
+      // so a note recorded under that key would stop it for good.
+      const waiting = await service.createFromBuild({
+        outcome: "pending_rx",
+        reason: "awaiting prescription",
+        snapshot: { job_ref: "klear-order_w", klear_order_id: "order_w" },
+      });
+      const id = waiting!.id;
+      for (const key of [`ready:${id}`, `cancel:${id}`, "cancelled:order_w", "has space 1", "semi;colon1"]) {
+        await expect(
+          service.applyProductionAction({
+            job_id: id,
+            action: "NOTE",
+            idempotency_key: key,
+            actor: USER,
+            detail: { text: "x" },
+          }),
+        ).rejects.toMatchObject({ code: "invalid_detail" });
+      }
+      expect(await service.listProductionEventsForJob(id)).toHaveLength(0);
+      // The system still can.
+      await service.updateJobFromBuild(id, ok("order_w"));
+      expect((await sql(`select stage from lab_job where id = $1`, [id]))[0].stage).toBe("ready");
+    });
+  });
+
   describe("a packet whose prescription was removed", () => {
     it("cannot be marked printed until it is rebuilt", async () => {
       const job = await service.createFromBuild(ok("order_a"));

@@ -9,7 +9,8 @@
 
 export type LabJob = {
   id: string;
-  order_id: string;
+  /** Absent for a lab account, which is shown the job and not the order. */
+  order_id?: string;
   status: string;
   last_error?: string | null;
   stage: string | null;
@@ -377,6 +378,13 @@ export function waited(since: string | Date | null | undefined, now: Date = new 
   const hours = Math.floor(minutes / 60);
   if (hours < 48) return `${hours} h`;
   return `${Math.floor(hours / 24)} d`;
+}
+
+/** What a job is called on the screens: by its order for ops, by itself
+ *  for a lab account (which is not given the order). */
+export function jobTitle(job: { id?: string; lab_job_id?: string; order_id?: string }): string {
+  if (job.order_id) return `Order …${shortId(job.order_id)}`;
+  return `Job …${shortId(job.id ?? job.lab_job_id ?? "")}`;
 }
 
 /** The short form of an order id for a list: its last eight characters. */

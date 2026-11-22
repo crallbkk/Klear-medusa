@@ -159,7 +159,9 @@ export async function buildLabJobPacket(
   if (!order) {
     return {
       outcome: "failed",
-      reason: `order ${orderId} not found`,
+      // No order id in the sentence: this reason is stored on the job, and
+      // an order id is not for everyone who can see a job (`jobFor`).
+      reason: "the order was not found",
       snapshot: { job_ref: jobRef, klear_order_id: orderId },
     };
   }

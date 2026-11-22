@@ -4,11 +4,16 @@
 import { GET as production } from "../[id]/production/route";
 import { GET as queue } from "../../lab-queue/route";
 import { GET as reports } from "../../lab-reports/route";
+import { GET as list } from "../route";
+import { GET as job } from "../[id]/route";
+import { POST as actions } from "../[id]/actions/route";
+import { POST as packet } from "../[id]/packet/route";
 import { POST as warrantyRemake } from "../[id]/warranty-remake/route";
 import { startWarrantyRemake } from "../../../../modules/lms/rebuild";
 import { ProductionError } from "../../../../modules/lms/production";
 import { LMS_MODULE } from "../../../../modules/lms/service";
 import { OVERDUE_AFTER_HOURS, OVERDUE_WAITING_HOURS } from "../../../../modules/lms/board";
+import { LAB_MAY_REACH } from "../../lab-gate";
 import { captureException } from "../../../../lib/observability/sentry";
 
 jest.mock("../../../../lib/observability/sentry", () => ({ captureException: jest.fn() }));
@@ -112,6 +117,40 @@ describe("GET /admin/lab-jobs/[id]/production", () => {
       "2026-11-21T05:00:00.000Z",
     ]);
     expect(JSON.stringify(body)).not.toMatch(/sph_right|packet_snapshot/);
+  });
+
+  it("offers a lab account the lab's steps and the packet, and none of the ops buttons", async () => {
+    const asLab = {
+      ...makeReq(lmsFor({ ...JOB, stage: "delivered", status: "queued", rx_redacted_at: new Date() })),
+      auth_context: { actor_id: "user_lab", actor_type: "user" },
+      // Set by the check in front of every admin route (`lab-gate.ts`).
+      klear_lab_account: true,
+    };
+    const res = makeRes();
+    await call(production, asLab, res);
+    expect(res.json.mock.calls[0][0].actions).toEqual({
+      lab: ["NOTE"],
+      ops: [],
+      packet: false,
+      retry: false,
+      rx_changed: false,
+      warranty_remake: false,
+    });
+
+    const working = makeRes();
+    await call(
+      production,
+      {
+        ...makeReq(lmsFor(JOB)),
+        auth_context: { actor_id: "user_lab", actor_type: "user" },
+      // Set by the check in front of every admin route (`lab-gate.ts`).
+      klear_lab_account: true,
+      },
+      working,
+    );
+    const { actions } = working.json.mock.calls[0][0];
+    expect(actions.lab.sort()).toEqual(["FRAME_DAMAGED", "LENS_ISSUED", "NOTE", "SENT_TO_LAB"]);
+    expect([actions.ops, actions.packet, actions.rx_changed]).toEqual([[], true, false]);
   });
 
   it("offers the invoice only while a quote is waiting for one", async () => {
@@ -280,6 +319,140 @@ describe("POST /admin/lab-jobs/[id]/warranty-remake", () => {
     await call(warrantyRemake, post(body), res);
     expect(res.status).toHaveBeenCalledWith(500);
     expect(JSON.stringify(res.json.mock.calls)).not.toMatch(/sph_right|Somchai/);
+  });
+});
+
+describe("what a lab account is shown of a job", () => {
+  // Medusa's storefront API answers GET /store/orders/<id> for anyone who
+  // presents an order id, with the customer's email, address and phone. So
+  // an order id must never reach a lab account, through any lab route.
+  const ROW = {
+    id: "labjob_01ABCDEFGH12345678",
+    order_id: "order_01SECRETORDERID0000000",
+    status: "queued",
+    // An older row: the builder used to name the order here.
+    last_error: "order order_01SECRETORDERID0000000 not found",
+    stage: "printed",
+    stage_since: new Date("2026-11-21T00:00:00Z"),
+    stage_version: 2,
+    event_seq: 5,
+    remake_count: 0,
+    on_hold: false,
+    hold_reason: null,
+    cut_question_pending: false,
+    next_issue_reason: "order",
+    provider_job_id: "prov_123",
+    provider_name: "somelab",
+    attempts: 3,
+    rx_redacted_at: null,
+    created_at: new Date("2026-11-20T00:00:00Z"),
+    updated_at: new Date("2026-11-21T00:00:00Z"),
+    packet_snapshot: { klear_order_id: "order_01SECRETORDERID0000000", prescription: { sph_right: -2.25 } },
+  };
+  const PACKET = {
+    job_ref: "klear-order_01SECRETORDERID0000000",
+    klear_order_id: "order_01SECRETORDERID0000000",
+    frame_sku: "KLR-1",
+    prescription: { sph_right: -2.25 },
+    customer: { name: "A B" },
+    // A field someone adds to the packet later.
+    internal_note: "order_01SECRETORDERID0000000",
+  };
+  const lms = {
+    listQueue: jest.fn().mockResolvedValue([ROW]),
+    listLabJobs: jest.fn().mockResolvedValue([ROW]),
+    listJobsByStatus: jest.fn().mockResolvedValue([ROW]),
+    retrieveLabJob: jest.fn().mockResolvedValue(ROW),
+    listProductionEventsForJob: jest.fn().mockResolvedValue([
+      { id: "e1", seq: 1, action: "READY", detail: {}, idempotency_key: "k", request_hash: "h" },
+    ]),
+    listLabCosts: jest.fn().mockResolvedValue([]),
+    listLabVendors: jest.fn().mockResolvedValue([]),
+    applyProductionAction: jest.fn().mockResolvedValue({
+      event: { id: "e2", detail: {}, idempotency_key: "screen-key-0001", request_hash: "abc" },
+      job: { id: ROW.id, order_id: ROW.order_id, stage: "printed", stage_version: 2 },
+      replayed: false,
+    }),
+    viewPacket: jest.fn().mockResolvedValue({
+      packet: PACKET,
+      job: { id: ROW.id, order_id: ROW.order_id, stage: "printed" },
+      as_of: ROW.updated_at,
+    }),
+    productionReport: jest.fn().mockResolvedValue({
+      from: "2026-08-31",
+      weeks: [],
+      jobs_truncated: false,
+      jobs: [{ lab_job_id: ROW.id, order_id: ROW.order_id, stage: "printed", remake_count: 0, lenses_issued: 2, lenses_returned: 0, unexplained: 0 }],
+    }),
+  };
+  const asLab = (body: object = {}) => ({
+    ...makeReq(lms),
+    params: { id: ROW.id },
+    body,
+    auth_context: { actor_id: "user_lab", actor_type: "user" },
+    klear_lab_account: true,
+  });
+  const asOps = (body: object = {}) => ({ ...makeReq(lms), params: { id: ROW.id }, body });
+  const everyLabRoute: Array<[string, unknown, object]> = [
+    ["queue", queue, {}],
+    ["list", list, {}],
+    ["job", job, {}],
+    ["production", production, {}],
+    ["actions", actions, { action: "NOTE", idempotency_key: "screen-key-0001", detail: { text: "t" } }],
+    ["packet", packet, { idempotency_key: "screen-key-0002" }],
+    ["reports", reports, {}],
+  ];
+
+  it("never includes the order's id, on any route a lab account can call", async () => {
+    for (const [name, handler, body] of everyLabRoute) {
+      const res = makeRes();
+      await call(handler, asLab(body), res);
+      const said = JSON.stringify(res.json.mock.calls);
+      expect([name, res.status.mock.calls.length]).toEqual([name, 0]);
+      expect([name, /order_01SECRET|SECRETORDERID/.test(said)]).toEqual([name, false]);
+      expect([name, /"order_id"|klear_order_id/.test(said)]).toEqual([name, false]);
+      // Nor the provider's reference, nor how often it was submitted.
+      expect([name, /prov_123|provider_job_id|"attempts"/.test(said)]).toEqual([name, false]);
+      // Nor a key: knowing one must not be worth anything.
+      expect([name, /idempotency_key|request_hash/.test(said)]).toEqual([name, false]);
+    }
+  });
+
+  it("covers every lab route a lab account can call (a new one must be added here)", () => {
+    // If a route is added to what a lab account may reach and not to the
+    // list above, this fails: an unchecked route is how an id gets out.
+    const labRoutes = LAB_MAY_REACH.filter(([, p]) => p.startsWith("/admin/lab-"));
+    expect(everyLabRoute).toHaveLength(labRoutes.length);
+  });
+
+  it("still gives a lab account what the bench needs", async () => {
+    const res = makeRes();
+    await call(production, asLab(), res);
+    const { job: shown } = res.json.mock.calls[0][0];
+    expect(shown).toMatchObject({ id: ROW.id, stage: "printed", stage_version: 2, event_seq: 5 });
+    expect(shown.updated_at).toEqual(ROW.updated_at);
+
+    const sheet = makeRes();
+    await call(packet, asLab({ idempotency_key: "screen-key-0003" }), sheet);
+    const seen = sheet.json.mock.calls[0][0];
+    // The reference on the sheet is the job's own.
+    expect(seen.packet.job_ref).toBe("lab-12345678");
+    expect(seen.packet.prescription).toEqual({ sph_right: -2.25 });
+    expect(seen.packet.customer).toEqual({ name: "A B" });
+    expect(seen.as_of).toEqual(ROW.updated_at);
+    // Named fields only: what the lab needs to make and box the glasses.
+    expect(Object.keys(seen.packet).sort()).toEqual(["customer", "frame_sku", "job_ref", "prescription"]);
+  });
+
+  it("gives ops the order, as before", async () => {
+    for (const [name, handler, body] of everyLabRoute) {
+      const res = makeRes();
+      await call(handler, asOps(body), res);
+      expect([name, JSON.stringify(res.json.mock.calls)]).toEqual([
+        name,
+        expect.stringContaining("order_01SECRETORDERID0000000"),
+      ]);
+    }
   });
 });
 

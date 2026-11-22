@@ -24,3 +24,7 @@ build
 !.yarn/versions
 
 .medusa
+
+# Schema snapshots a test run or a scratch database leaves in the modules'
+# migrations folders. The real one is .snapshot-<module>.json.
+src/modules/*/migrations/.snapshot-medusa*.json

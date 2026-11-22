@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { sdk } from "../../../lib/client";
-import { failureMessage, percent, shortId, stageLabel } from "../../../lib/lab";
+import { failureMessage, jobTitle, percent, stageLabel } from "../../../lib/lab";
 
 type Report = {
   from: string;
@@ -22,7 +22,7 @@ type Report = {
   jobs_truncated: boolean;
   jobs: Array<{
     lab_job_id: string;
-    order_id: string;
+    order_id?: string;
     stage: string | null;
     remake_count: number;
     lenses_issued: number;
@@ -171,8 +171,12 @@ const LabReportsPage = () => {
                 {data.jobs.map((j) => (
                   <Table.Row key={j.lab_job_id}>
                     <Table.Cell>
-                      <Link to={`/lab/${j.lab_job_id}`} title={j.order_id} className="text-ui-fg-interactive">
-                        …{shortId(j.order_id)}
+                      <Link
+                        to={`/lab/${j.lab_job_id}`}
+                        title={j.order_id ?? j.lab_job_id}
+                        className="text-ui-fg-interactive"
+                      >
+                        {jobTitle(j)}
                       </Link>
                     </Table.Cell>
                     <Table.Cell>{stageLabel(j.stage)}</Table.Cell>

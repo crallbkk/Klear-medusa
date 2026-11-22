@@ -12,6 +12,7 @@ import {
   ProductionWriteError,
 } from "../../../modules/lms/service";
 import { captureException } from "../../../lib/observability/sentry";
+import { isLabAccount } from "../lab-gate";
 
 /**
  * Permissions, in the words of Medusa's role module. They are declared on
@@ -222,6 +223,91 @@ export const NOT_BUILT: Record<string, string> = {
   failed: "the packet could not be built; see the job's last error",
   skip: "this order has no lenses to make",
 };
+
+/**
+ * A job as a LAB account sees it: these fields and no others. Above all
+ * not the order's id. Medusa's storefront API answers `GET
+ * /store/orders/<id>` for anyone who presents an order id, with the
+ * customer's email, address and phone, so an order id in a lab account's
+ * hands is that customer's details. The lab works by the job, not the
+ * order. Also left out: the provider's job id, and `last_error`, which is
+ * free text (older rows name the order in it, and a lab provider's
+ * rejection may echo the job's reference). The board's column already
+ * says "packet failed" or "waiting for prescription".
+ */
+const LAB_SEES = [
+  "id",
+  "status",
+  "stage",
+  "stage_since",
+  "stage_version",
+  "event_seq",
+  "remake_count",
+  "on_hold",
+  "hold_reason",
+  "cut_question_pending",
+  "next_issue_reason",
+  "rx_redacted_at",
+  "created_at",
+  "updated_at",
+  // Set by the queue route.
+  "column",
+  "overdue",
+] as const;
+
+/** A job for whoever is asking: as it is for ops, cut down for a lab
+ *  account (see `LAB_SEES`). Never the packet either way. */
+export function jobFor<T extends Record<string, unknown>>(
+  req: MedusaRequest,
+  job: T,
+): Record<string, unknown> {
+  const bare = withoutPacket(job);
+  if (!isLabAccount(req)) return bare;
+  const out: Record<string, unknown> = {};
+  for (const key of LAB_SEES) if (key in bare) out[key] = (bare as Record<string, unknown>)[key];
+  return out;
+}
+
+/**
+ * A packet for whoever is asking. A lab account gets it without the
+ * order's id: the reference printed on its sheet is the job's own.
+ */
+export function packetFor(
+  req: MedusaRequest,
+  jobId: string,
+  packet: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!isLabAccount(req)) return packet;
+  // Named fields only: a field added to the packet later is not shown to
+  // the lab until someone decides it should be.
+  const out: Record<string, unknown> = { job_ref: `lab-${jobId.slice(-8)}` };
+  for (const key of LAB_SEES_OF_PACKET) if (key in packet) out[key] = packet[key];
+  return out;
+}
+
+/** What the lab needs to make and box the glasses. */
+const LAB_SEES_OF_PACKET = [
+  "frame_sku",
+  "lens_type",
+  "lens_index",
+  "coating_addons",
+  "prescription",
+  "customer",
+  "submitted_at",
+] as const;
+
+/** What a recorded step answers with, for whoever is asking: the event
+ *  without its key, and the job as they may see it. */
+export function resultFor(
+  req: MedusaRequest,
+  done: { event: unknown; job: unknown; replayed: boolean },
+): Record<string, unknown> {
+  return {
+    event: publicEvent(done.event as Record<string, unknown>),
+    job: jobFor(req, done.job as Record<string, unknown>),
+    replayed: done.replayed,
+  };
+}
 
 /** A job as the queue and the job screen see it: never the packet. */
 export function withoutPacket<T extends Record<string, unknown>>(job: T): Omit<T, "packet_snapshot"> {

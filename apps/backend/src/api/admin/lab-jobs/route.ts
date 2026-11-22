@@ -4,7 +4,7 @@ import type {
 } from "@medusajs/framework";
 import { LMS_MODULE } from "../../../modules/lms/service";
 import type LmsModuleService from "../../../modules/lms/service";
-import { withoutPacket } from "./production-http";
+import { jobFor } from "./production-http";
 
 /**
  * GET /admin/lab-jobs — list lab jobs, optionally filtered by status.
@@ -66,7 +66,7 @@ export async function GET(
   }
 
   res.json({
-    jobs: jobs.map((job) => withoutPacket(job as unknown as Record<string, unknown>)),
+    jobs: jobs.map((job) => jobFor(req, job as unknown as Record<string, unknown>)),
     count: jobs.length,
   });
 }

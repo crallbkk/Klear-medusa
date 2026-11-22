@@ -1,7 +1,7 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework";
 import { LMS_MODULE } from "../../../../../modules/lms/service";
 import type LmsModuleService from "../../../../../modules/lms/service";
-import { actorOf, sendProductionError } from "../../production-http";
+import { actorOf, jobFor, packetFor, sendProductionError } from "../../production-http";
 
 /**
  * POST /admin/lab-jobs/[id]/packet: show the lab packet, which holds the
@@ -27,7 +27,12 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
   const id = req.params.id;
   try {
     const lms = req.scope.resolve(LMS_MODULE) as LmsModuleService;
-    res.json(await lms.viewPacket(id, actor, body.idempotency_key, body.printed === true));
+    const seen = await lms.viewPacket(id, actor, body.idempotency_key, body.printed === true);
+    res.json({
+      ...seen,
+      packet: packetFor(req, id, seen.packet as unknown as Record<string, unknown>),
+      job: jobFor(req, seen.job as unknown as Record<string, unknown>),
+    });
   } catch (err) {
     sendProductionError(res, err, "admin/lab-jobs/packet", id);
   }

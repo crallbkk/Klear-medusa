@@ -63,3 +63,15 @@ jobs:
           DB_USERNAME: postgres
           DB_PASSWORD: postgres
         run: npm run test:db
+
+      # Starts the whole backend on a scratch database, signs in as a lab
+      # account and calls every admin route: it must be refused on all of
+      # them except the lab's own (src/api/admin/lab-gate.ts).
+      - name: Lab account test (real server)
+        working-directory: apps/backend
+        env:
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_USERNAME: postgres
+          DB_PASSWORD: postgres
+        run: npm run test:integration:http

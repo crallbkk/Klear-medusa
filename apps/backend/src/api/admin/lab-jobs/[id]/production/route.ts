@@ -7,12 +7,13 @@ import {
   type PacketState,
 } from "../../../../../modules/lms/production";
 import { alsoOffered } from "../../../../../modules/lms/board";
+import { isLabAccount } from "../../../lab-gate";
 import {
   LAB_ACTIONS,
   OPS_ACTIONS,
+  jobFor,
   publicEvent,
   sendProductionError,
-  withoutPacket,
 } from "../../production-http";
 
 /**
@@ -45,14 +46,18 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
     const offered = offeredActions(job as unknown as JobState & PacketState).filter(
       (a) => a !== "LAB_INVOICED" || quoteOpen,
     );
+    const also = alsoOffered(job as unknown as Parameters<typeof alsoOffered>[0]);
     res.json({
-      job: withoutPacket(job as unknown as Record<string, unknown>),
+      job: jobFor(req, job as unknown as Record<string, unknown>),
       events: events.map((e) => publicEvent(e as unknown as Record<string, unknown>)),
       costs,
       actions: {
         lab: offered.filter((a) => LAB_ACTIONS.has(a)),
-        ops: offered.filter((a) => OPS_ACTIONS.has(a)),
-        ...alsoOffered(job as unknown as Parameters<typeof alsoOffered>[0]),
+        // A lab account cannot reach the ops routes (`lab-gate.ts`), so it
+        // is not shown their buttons. Looking at the packet stays.
+        ...(isLabAccount(req)
+          ? { ops: [], packet: also.packet, retry: false, rx_changed: false, warranty_remake: false }
+          : { ops: offered.filter((a) => OPS_ACTIONS.has(a)), ...also }),
       },
       vendors,
     });

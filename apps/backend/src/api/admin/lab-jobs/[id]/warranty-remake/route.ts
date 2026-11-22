@@ -1,7 +1,13 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework";
 import { startWarrantyRemake } from "../../../../../modules/lms/rebuild";
 import type { ProductionAction } from "../../../../../modules/lms/production";
-import { NOT_BUILT, actorOf, readActionBody, sendProductionError } from "../../production-http";
+import {
+  NOT_BUILT,
+  actorOf,
+  readActionBody,
+  resultFor,
+  sendProductionError,
+} from "../../production-http";
 
 const ONLY_REMAKE: ReadonlySet<ProductionAction> = new Set<ProductionAction>(["REMAKE_STARTED"]);
 
@@ -59,7 +65,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
       });
       return;
     }
-    res.json(done.result);
+    res.json(resultFor(req, done.result));
   } catch (err) {
     sendProductionError(res, err, "admin/lab-jobs/warranty-remake", id);
   }

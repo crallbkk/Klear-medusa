@@ -25,6 +25,7 @@ import {
   failureMessage,
   fieldsFor,
   formatBaht,
+  jobTitle,
   keyFor,
   newKey,
   packetIsCurrent,
@@ -55,7 +56,7 @@ type JobResponse = {
 type Eye = "right" | "left";
 type Packet = {
   job_ref: string;
-  klear_order_id: string;
+  klear_order_id?: string;
   frame_sku: string;
   lens_type: string;
   lens_index: number | null;
@@ -473,9 +474,9 @@ const JobScreen = ({ id }: { id: string }) => {
       <Container className="divide-y p-0">
         <div className="flex items-center justify-between px-6 py-4">
           <div>
-            <Heading>Order …{job.order_id.slice(-8)}</Heading>
+            <Heading>{jobTitle(job)}</Heading>
             <Text size="small" leading="compact" className="text-ui-fg-subtle">
-              {job.order_id}
+              {job.order_id ?? job.id}
             </Text>
           </div>
           <div className="flex items-center gap-2">

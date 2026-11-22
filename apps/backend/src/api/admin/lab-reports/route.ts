@@ -3,6 +3,7 @@ import { LMS_MODULE } from "../../../modules/lms/service";
 import type LmsModuleService from "../../../modules/lms/service";
 import { captureException } from "../../../lib/observability/sentry";
 import { errorKind } from "../lab-jobs/production-http";
+import { isLabAccount } from "../lab-gate";
 
 /**
  * GET /admin/lab-reports?weeks=N: the lab's report over the last N weeks
@@ -19,7 +20,13 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
       : 12;
   try {
     const lms = req.scope.resolve(LMS_MODULE) as LmsModuleService;
-    res.json(await lms.productionReport(weeks));
+    const report = await lms.productionReport(weeks);
+    // A lab account is not given order ids (see `jobFor`).
+    res.json(
+      isLabAccount(req)
+        ? { ...report, jobs: report.jobs.map(({ order_id: _order, ...job }) => job) }
+        : report,
+    );
   } catch (err) {
     // A database error's own text can hold values; report its kind only.
     const kind = errorKind(err);

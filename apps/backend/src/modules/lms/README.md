@@ -456,6 +456,115 @@ in `src/admin/lib/lab.ts` and is tested against the production rules.
     `1.25`. The warning beside free-text boxes is the only guard against a
     lens power typed there.
 
+## Lab accounts
+
+A lab account can use the lab screens and nothing else in Medusa Admin.
+This is the gate the design sets before any lab login exists (10.10 items
+6 and 7). The code is `src/api/admin/lab-gate.ts`.
+
+1. **How.** One check in front of every admin route (`/admin*`, after
+   Medusa's own sign-in check). An account that carries the lab mark is
+   answered 403 unless the request is on a short list: the queue, the
+   reports, a job, its history, its packet, the lab's steps, and "who am
+   I". Every other account passes through exactly as before.
+2. **Why not Medusa's role module.** It checks only routes that declare a
+   permission, and several of Medusa's own declare none, so it cannot
+   promise that a lab login is refused everywhere else. This check refuses
+   by default and needs nothing switched on. The `policies` entries on the
+   lab routes stay; they do nothing while that module is off.
+3. **The mark** is `klear_role: "lab"` in the USER's metadata. The check
+   reads it from the database for the signed-in user on every admin
+   request (kept for five seconds), not from the sign-in token. Set,
+   cleared and listed with:
+
+   ```bash
+   LAB_ACCOUNT=list npx medusa exec ./src/scripts/lab-account.ts
+   LAB_ACCOUNT_EMAIL=someone@example.com LAB_ACCOUNT=lab  npx medusa exec ./src/scripts/lab-account.ts
+   LAB_ACCOUNT_EMAIL=someone@example.com LAB_ACCOUNT=none npx medusa exec ./src/scripts/lab-account.ts
+   ```
+
+   1. It is felt within seconds, also by a session that was already open,
+      and it holds for every way that user can sign in.
+      The email is matched whatever its capitals. Medusa stores an email
+      as typed, so `Lab@x.com` and `lab@x.com` can be two users; both are
+      marked.
+   2. **An account is a full admin account until it is marked.** Create
+      the user with `npx medusa user`, mark it, and only then hand over
+      the password.
+   3. **Never invite a lab person from Settings.** An invited person sets
+      their own password and is a full admin from that moment, before
+      anyone can mark them. `LAB_ACCOUNT=list` shows every admin account
+      and which are lab; run it after adding anyone.
+   4. No admin route a lab account can reach changes a user, creates a
+      user or a key, or reads an invite. A secret API key is not a user
+      and is not confined: a key is full access and is never given to the
+      lab.
+   5. If the check cannot find out (the database does not answer), the
+      request is refused with 503 for everyone, not let through.
+4. **What a lab account is shown and can do.**
+   1. Not the ops steps: hold and release, a changed prescription, a
+      rebuild, a warranty remake. The job route does not offer a lab
+      account their buttons.
+   2. **Never an order's id.** Medusa's storefront API answers `GET
+      /store/orders/<id>` for anyone who presents an order id, with the
+      customer's email, address and phone. So every lab route cuts a job
+      down to a fixed list of fields for a lab account (`jobFor`,
+      `LAB_SEES` in `production-http.ts`), the packet's reference becomes
+      the job's own, and the report leaves the order out. The screens
+      title a job "Job …" for a lab account and "Order …" for ops.
+   3. The packet a lab account is shown still holds the customer's name,
+      phone and delivery address beside the prescription: the lab needs
+      them, and every look is recorded.
+   4. Not a job's `last_error` either. It is free text: older rows name
+      the order in it, and a lab provider's rejection could echo the job's
+      reference. The board's column already says "packet failed" or
+      "waiting for prescription". The packet builder no longer writes an
+      order id into a reason.
+   5. The packet is cut down to named fields for a lab account (frame,
+      lens, coatings, prescription, customer, when it was built). A field
+      added to the packet later is not shown to the lab until someone
+      adds it to that list.
+   6. **What ops types, the lab reads.** A hold reason, a note and a QC
+      reason are shown to the lab as written. Do not type an order number
+      or a customer's details into them.
+   7. A person's idempotency key may hold letters, digits, dot, dash and
+      underscore only. The system's own keys carry a colon
+      (`ready:<job>`); a key is unique across all jobs, so a person able
+      to use one of those could have stopped a job from ever being put at
+      ready.
+5. **Two requests are answered for the page.** Medusa's admin page asks
+   for the store's settings and the notification feed before it draws
+   anything, and treats a refusal as a crash. A lab account is given
+   neither: the check answers both itself with fixed, empty content, and
+   the real routes never run.
+6. **Two routes Medusa serves without its sign-in check** (which features
+   are on; accepting an invite). On those the check cannot see who is
+   calling. Accepting an invite needs the invite's secret token, which a
+   lab account cannot create or read. The tests fail if Medusa adds a
+   third.
+7. **The tests.** A unit test reads every admin route from Medusa's
+   installed files and from this project and asserts the rule
+   (`src/api/admin/__tests__/lab-gate.unit.spec.ts`). A second test starts
+   the whole backend on a scratch database, signs in as a lab account the
+   way a person does, and calls every one of those routes over HTTP
+   (`integration-tests/http/lab-gate.spec.ts`, `npm run
+   test:integration:http`, in CI). A route added by a Medusa upgrade, or
+   by us, is covered the day it appears.
+8. **Limits, stated plainly.**
+   1. The side menu still shows Orders, Products and the rest. Each opens
+      to an error for a lab account; nothing is shown. Hiding the entries
+      needs a lab-only page, which is not built.
+   2. This confines the admin API. Medusa's storefront API hands out an
+      order's details to anyone who presents its id (`GET
+      /store/orders/<id>`, no sign-in; a known gap in Medusa). That is
+      true for everyone, not only the lab, and is why a lab account is
+      never given an order id. Closing it for everyone means putting an
+      ownership check on that route, which first needs a look at what the
+      website's order-confirmation page relies on. Not done here.
+   3. The check protects against a lab account, not against an owner: an
+      account without the mark can do everything, as before, including
+      the ops routes.
+
 ## Release to Klear Operations
 
 1. **Windows** (`release.ts`). A window ends on a fixed weekday

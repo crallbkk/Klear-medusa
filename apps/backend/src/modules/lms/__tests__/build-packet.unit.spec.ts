@@ -627,7 +627,7 @@ describe("buildLabJobPacket — the order is gone", () => {
       new MedusaError(MedusaError.Types.NOT_FOUND, "Order with id: order_x was not found"),
     );
     const r = await buildLabJobPacket({ container: container as never, orderId: "order_x" });
-    expect(r).toMatchObject({ outcome: "failed", reason: "order order_x not found" });
+    expect(r).toMatchObject({ outcome: "failed", reason: "the order was not found" });
   });
 
   it("any other order-module error still throws (infra, retried)", async () => {

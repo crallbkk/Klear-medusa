@@ -1,5 +1,6 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework";
 import { applyChangedPrescription } from "../../../../../modules/lms/rebuild";
+import { PERSON_KEY } from "../../../../../modules/lms/service";
 import { NOT_BUILT, actorOf, sendProductionError, withoutPacket } from "../../production-http";
 
 /**
@@ -27,7 +28,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
   const actor = actorOf(req, res);
   if (!actor) return;
   const key = (req.body as { idempotency_key?: unknown } | undefined)?.idempotency_key;
-  if (typeof key !== "string" || key.length < 8 || key.length > 200) {
+  // Recorded by the system on the person's behalf, under the person's key,
+  // so the key is held to a person's shape here.
+  if (typeof key !== "string" || !PERSON_KEY.test(key)) {
     res.status(400).json({ type: "invalid_data", message: "idempotency_key is required" });
     return;
   }

@@ -42,6 +42,10 @@ export type LabJobStatusValue =
   | "cancelled"
   | "pending_rx";
 
+/** The shape of an idempotency key a person's request may carry. No colon:
+ *  that is how the system's own keys are told apart. */
+export const PERSON_KEY = /^[A-Za-z0-9._-]{8,200}$/;
+
 /** How far back a built job with no stage is still given one (by the
  *  migration's backfill and by `markStagelessJobsReady`). Older jobs predate
  *  production and nobody knows where their glasses are. */
@@ -907,6 +911,16 @@ class LmsModuleService extends MedusaService({
     }
     if (!actor || (actor.type !== "user" && actor.type !== "system") || !actor.id) {
       throw new ProductionError("invalid_detail", "the action must say who did it");
+    }
+    // The system's own keys are made from ids with a colon ("ready:<job>",
+    // "cancelled:<order>"). A person's key may not look like one: a key is
+    // unique across all jobs, so a person who used "ready:<job>" for a note
+    // would stop that job from ever being put at ready.
+    if (actor.type === "user" && !PERSON_KEY.test(key)) {
+      throw new ProductionError(
+        "invalid_detail",
+        "an idempotency key may hold letters, digits, dot, dash and underscore only",
+      );
     }
     if (actor.type === "user" && SYSTEM_ONLY_ACTIONS.has(action)) {
       throw new ProductionError(

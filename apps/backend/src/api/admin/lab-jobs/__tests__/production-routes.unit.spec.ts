@@ -212,7 +212,13 @@ describe("POST /admin/lab-jobs/[id]/actions", () => {
 
 describe("POST /admin/lab-jobs/[id]/ops-actions", () => {
   it("takes hold and release, and nothing else", async () => {
-    const lms = { applyProductionAction: jest.fn().mockResolvedValue({}) };
+    const lms = {
+      applyProductionAction: jest.fn().mockResolvedValue({
+        event: { id: "e1", idempotency_key: "key-0000001", request_hash: "h" },
+        job: { id: "labjob_1" },
+        replayed: false,
+      }),
+    };
     for (const [action, status] of [
       ["HOLD", undefined],
       ["RELEASE", undefined],

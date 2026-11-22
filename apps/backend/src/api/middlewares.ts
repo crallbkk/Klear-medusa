@@ -1,6 +1,7 @@
 import { defineMiddlewares } from "@medusajs/framework/http";
 import { sentryErrorHandler } from "../lib/observability/http-error-handler";
 import { requirePackedBeforeLabel } from "./admin/orders/require-packed";
+import { confineLabAccounts } from "./admin/lab-gate";
 import { LAB_ACT, LAB_OPS, LAB_READ } from "./admin/lab-jobs/production-http";
 
 /**
@@ -18,6 +19,9 @@ import { LAB_ACT, LAB_OPS, LAB_READ } from "./admin/lab-jobs/production-http";
 export default defineMiddlewares({
   errorHandler: sentryErrorHandler,
   routes: [
+    // A lab account can reach the lab's routes and nothing else under
+    // /admin. First in the list, every method. See `admin/lab-gate.ts`.
+    { matcher: "/admin*", middlewares: [confineLabAccounts] },
     {
       matcher: "/webhooks/shippop/*",
       methods: ["POST"],
