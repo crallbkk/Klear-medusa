@@ -3,6 +3,8 @@ import { sentryErrorHandler } from "../lib/observability/http-error-handler";
 import { requirePackedBeforeLabel } from "./admin/orders/require-packed";
 import { confineLabAccounts } from "./admin/lab-gate";
 import { LAB_ACT, LAB_OPS, LAB_READ } from "./admin/lab-jobs/production-http";
+import { attachCartBeforeEmail } from "./store/carts/cart-owner";
+import { refuseOrderTransfers, requireOrderOwner } from "./store/orders/own-order";
 
 /**
  * Custom HTTP config.
@@ -15,6 +17,11 @@ import { LAB_ACT, LAB_OPS, LAB_READ } from "./admin/lab-jobs/production-http";
  * - Booking a shipping label is refused while the order's lab job is not
  *   packed, when LMS_REQUIRE_PACKED_BEFORE_LABEL=true (see
  *   `admin/orders/require-packed.ts`).
+ * - `GET /store/orders/:id` answers only the order's owner (see
+ *   `store/orders/own-order.ts`).
+ * - A cart goes to an account only when its owner is the one signed in;
+ *   anyone else typing that account's email gets a guest cart (see
+ *   `store/carts/cart-owner.ts`).
  */
 export default defineMiddlewares({
   errorHandler: sentryErrorHandler,
@@ -22,6 +29,18 @@ export default defineMiddlewares({
     // A lab account can reach the lab's routes and nothing else under
     // /admin. First in the list, every method. See `admin/lab-gate.ts`.
     { matcher: "/admin*", middlewares: [confineLabAccounts] },
+    // One order is shown only to the signed-in customer who owns it.
+    // Medusa's own route shows it to anyone who has its id.
+    { matcher: "/store/orders/:id", methods: ["GET"], middlewares: [requireOrderOwner] },
+    // Medusa's order transfers hand the whole order to any signed-in
+    // customer. The website does not use them; they are switched off.
+    { matcher: "/store/orders/:id/transfer/*", middlewares: [refuseOrderTransfers] },
+    // Setting an email on a cart that has no customer yet: give it its
+    // customer first, so Medusa does not attach it to whichever account has
+    // that email. Project middlewares run after Medusa's body check and
+    // before Medusa's handler. Creating a cart is handled in
+    // `store/carts/route.ts`.
+    { matcher: "/store/carts/:id", methods: ["POST"], middlewares: [attachCartBeforeEmail] },
     {
       matcher: "/webhooks/shippop/*",
       methods: ["POST"],
