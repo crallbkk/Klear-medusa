@@ -16,6 +16,7 @@ import { releaseSuite } from "./release.db-suite";
 import { orderEventsSuite } from "./order-events.db-suite";
 import { screensSuite } from "./screens.db-suite";
 import { failedSaveSuite } from "./failed-save.db-suite";
+import { lensStockSuite } from "./lens-stock.db-suite";
 
 jest.setTimeout(120_000);
 
@@ -37,5 +38,6 @@ moduleIntegrationTestRunner<LmsModuleService>({
     orderEventsSuite(service);
     screensSuite(service);
     failedSaveSuite(service);
+    lensStockSuite(service);
   },
 });

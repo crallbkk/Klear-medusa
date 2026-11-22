@@ -447,8 +447,11 @@ in `src/admin/lib/lab.ts` and is tested against the production rules.
    print leaves the packet off the page, so paper cannot exist with only a
    view on record. A screenshot or a phone photo is outside what software
    can record.
-8. **Not built: lens stock on the job screen.** It needs the stock
-   snapshot from Klear Operations (the stock feed).
+8. **Not built: lens stock on the job screen.** The snapshot now arrives
+   and the live figures are computed (`lensStock`, see "Lens stock"
+   below), but a job cannot say which lens SKU it needs: no mapping from a
+   prescription to a lens SKU exists (known gap 1). Showing all 277 SKUs
+   on every job is a design choice nobody has made.
 9. **Not built: a person's name in the history.** It shows the admin user
    id. Looking a name up needs Medusa's user route, which a lab role is
    not meant to reach.
@@ -589,7 +592,9 @@ This is the gate the design sets before any lab login exists (10.10 items
    totals agree and reports any difference.
 4. **Feed** `GET /ops-feed/lab-releases?after=YYYY-MM-DD&limit=N`, bearer
    secret `KLEAR_OPS_FEED_SECRET` (at least 32 characters; unset means the
-   route answers 503). The cursor is a window's end date.
+   route answers 503). The cursor is a window's end date. The commerce
+   feed and the stock sync routes beside it are described in
+   `src/api/ops-feed/README.md`.
 5. **Limit, stated plainly.** At one or two jobs a week a window's totals
    can still point at one order. Weekly totals are much weaker evidence than
    a timestamped event, not none.
@@ -610,6 +615,39 @@ This is the gate the design sets before any lab login exists (10.10 items
 10. **Limit:** totals are 32-bit whole satang, about 21 million baht per lab
    per figure. Past that the release fails loudly every hour until the
    columns are widened.
+
+## Lens stock
+
+Klear Operations sends the lab system lens on-hand per SKU (contract 5,
+part 2) to `POST /ops-sync/lens-stock`, bearer secret
+`KLEAR_LENS_SNAPSHOT_SECRET` (see `src/api/ops-feed/README.md`).
+
+1. **The snapshot** is `lens_stock_snapshot`, one row per SKU with its
+   on-hand and `as_of`: the end of the last usage window Operations had
+   applied. Each snapshot replaces the table in one transaction
+   (`replaceLensSnapshot`). It is a copy, never a stock record, and nothing
+   is written back to Operations or to Medusa's inventory.
+2. **Refused**, with nothing changed: a snapshot older than the one held
+   (409), so a delayed retry cannot roll the view back; and an `as_of` that
+   is not a released window's end once usage exists on or before it (422),
+   because the figure and "used since" would then not meet; and an `as_of`
+   that is today or later in Bangkok (422 `not_yet_closed`, Bangkok's date
+   on the database clock). Without that last rule a future date passed
+   while no usage existed, was stored, and then refused every real snapshot
+   as older. The same `as_of` again is still a correction: it is always a
+   finished day, so a corrected figure for it is a real correction. An
+   empty snapshot is refused: an empty shelf is every SKU at zero.
+3. **The live figure** (`lensStock`) is the snapshot's on-hand plus the net
+   `lab_usage` entered after `as_of` (an issue is -1, an uncut lens put
+   back +1). A window takes usage by the date it was entered, so this is
+   exactly the usage Operations had not applied.
+4. **Privacy.** SKUs and quantities only, in both directions. The figure
+   is never tied to a job here.
+5. **Migration** `Migration20261123000100` adds the table. Written by hand
+   in the shape `medusa db:generate` writes (the generator did not finish
+   locally), with the module snapshot updated to match; the database tests
+   build the schema from the migration files and read the table through
+   Medusa's generated `listLensStockSnapshots`.
 
 Known gaps, to be closed with the parts above:
 

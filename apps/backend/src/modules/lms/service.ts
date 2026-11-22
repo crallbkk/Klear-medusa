@@ -8,6 +8,7 @@ import LabCost from "./models/lab-cost";
 import LabReleaseWindow from "./models/lab-release-window";
 import LabUsageRelease from "./models/lab-usage-release";
 import LabTotalDay from "./models/lab-total-day";
+import LensStockSnapshot from "./models/lens-stock-snapshot";
 import { addDays, dueWindows, releaseWeekday, type ReleaseWindow } from "./release";
 import { packetProblem, reportFrom } from "./board";
 import {
@@ -84,6 +85,36 @@ export class ProductionWriteError extends Error {
     this.code = code;
   }
 }
+
+/** A lens snapshot from Klear Operations that cannot be taken: it is older
+ *  than the one held, or its date is not one usage has been released up
+ *  to (so "issued since" would count some lenses twice or not at all). */
+export class LensSnapshotRefused extends Error {
+  readonly code: "older_than_stored" | "not_a_release" | "not_yet_closed";
+  constructor(code: "older_than_stored" | "not_a_release" | "not_yet_closed") {
+    super(
+      code === "older_than_stored"
+        ? "a newer lens snapshot is already held"
+        : code === "not_yet_closed"
+          ? "as_of must be a day that has already ended in Bangkok"
+          : "as_of must be the end of a released usage window",
+    );
+    this.name = "LensSnapshotRefused";
+    this.code = code;
+  }
+}
+
+export type LensStockRow = {
+  sku: string;
+  /** Operations' figure, as of `as_of`. */
+  on_hand_at_release: number;
+  as_of: string;
+  /** Net usage entered after `as_of`: issues count -1, an uncut lens put
+   *  back +1. */
+  used_since: number;
+  /** What the lab should find on the shelf now. */
+  available: number;
+};
 
 /** A second live job for the same order was refused by the unique index.
  *  Carries nothing of the row. */
@@ -354,6 +385,7 @@ class LmsModuleService extends MedusaService({
   LabReleaseWindow,
   LabUsageRelease,
   LabTotalDay,
+  LensStockSnapshot,
 }) {
   private readonly provider: ILabProvider = new UnimplementedLabProvider();
 
@@ -1493,6 +1525,93 @@ class LmsModuleService extends MedusaService({
           invoiced_to_date_satang,
         })),
     }));
+  }
+
+  /**
+   * Replace the lens snapshot with the one Klear Operations sent (contract
+   * 5, part 2): every SKU's on-hand as of `asOf`, the end of the last usage
+   * window it had applied. Returns how many SKUs are held.
+   *
+   * Refused (nothing changes) when `asOf` is today or later in Bangkok;
+   * when a snapshot with a later `asOf` is
+   * already held, so a delayed retry cannot roll the lab's view back; and
+   * when `asOf` is not a released window's end while usage dated on or
+   * before it exists, because then the figure and "used since" would not
+   * meet. The same `asOf` again replaces it (a correction).
+   *
+   * The table is a copy, so its rows are deleted outright and written
+   * again, in one transaction, under a lock that orders two snapshots.
+   */
+  async replaceLensSnapshot(asOf: string, lenses: Array<{ sku: string; on_hand: number }>): Promise<number> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return await (this as any).baseRepository_.transaction(async (em: Sql) => {
+      await em.execute(`select pg_advisory_xact_lock(hashtext('lens_stock_snapshot'))`);
+      // A day that has not ended cannot be what usage was released up to.
+      // Without this, a date in the future passed the check below while no
+      // usage existed, was stored, and then refused every real snapshot as
+      // older. Bangkok's date on the database's clock, the one clock every
+      // Medusa process shares.
+      const [clock] = await em.execute(
+        `select to_char((now() at time zone 'Asia/Bangkok')::date, 'YYYY-MM-DD') as "today"`,
+      );
+      if (!(asOf < String(clock.today))) throw new LensSnapshotRefused("not_yet_closed");
+      const [held] = await em.execute(
+        `select max("as_of") as "as_of" from "lens_stock_snapshot" where "deleted_at" is null`,
+      );
+      if (held?.as_of && String(held.as_of) > asOf) throw new LensSnapshotRefused("older_than_stored");
+      const [fits] = await em.execute(
+        `select exists (select 1 from "lab_release_window"
+                         where "window_end" = ? and "deleted_at" is null)
+             or not exists (select 1 from "lab_usage"
+                             where "entered_on" <= ? and "deleted_at" is null) as "ok"`,
+        [asOf, asOf],
+      );
+      if (!fits?.ok) throw new LensSnapshotRefused("not_a_release");
+      await em.execute(`delete from "lens_stock_snapshot"`);
+      // In slices, to stay well under Postgres' limit on bound values.
+      for (let i = 0; i < lenses.length; i += 500) {
+        const slice = lenses.slice(i, i + 500);
+        await em.execute(
+          `insert into "lens_stock_snapshot" ("id", "sku", "on_hand", "as_of")
+           values ${slice.map(() => "(?, ?, ?, ?)").join(", ")}`,
+          slice.flatMap((l) => [generateEntityId(undefined, "lenssnap"), l.sku, l.on_hand, asOf]),
+        );
+      }
+      return lenses.length;
+    });
+  }
+
+  /**
+   * The lab's live view of lens stock (design 10.4): each SKU in the
+   * snapshot, its figure, and that figure plus the usage entered after the
+   * snapshot's date. Usage is dated by when it was entered, and a window
+   * takes rows by that date, so "after the window's end" is exactly the
+   * usage Operations had not applied. `skus` narrows it; all when absent.
+   */
+  async lensStock(skus?: string[]): Promise<LensStockRow[]> {
+    if (skus && skus.length === 0) return [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return await (this as any).baseRepository_.transaction(async (em: Sql) => {
+      const rows = await em.execute(
+        `select s."sku", s."on_hand", s."as_of",
+                coalesce(sum(u."qty"), 0)::int as "used_since"
+           from "lens_stock_snapshot" s
+           left join "lab_usage" u
+             on u."sku" = s."sku" and u."entered_on" > s."as_of" and u."deleted_at" is null
+          where s."deleted_at" is null
+            ${skus ? `and s."sku" in (${skus.map(() => "?").join(", ")})` : ""}
+          group by s."sku", s."on_hand", s."as_of"
+          order by s."sku"`,
+        skus ?? [],
+      );
+      return rows.map((r) => ({
+        sku: String(r.sku),
+        on_hand_at_release: Number(r.on_hand),
+        as_of: String(r.as_of),
+        used_since: Number(r.used_since),
+        available: Number(r.on_hand) + Number(r.used_since),
+      }));
+    });
   }
 
   /**

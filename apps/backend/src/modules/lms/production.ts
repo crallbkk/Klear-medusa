@@ -161,8 +161,9 @@ export type Effect = {
 
 // Lens and frame SKUs as printed on the envelope or the frame bag. Same
 // pattern as Klear Operations' stock items, so a usage row can never carry a
-// string the stock ledger would refuse.
-const SKU = /^[A-Z0-9][A-Z0-9._+\-]{1,63}$/;
+// string the stock ledger would refuse. Also checks the SKUs of the lens
+// snapshot Operations sends (`api/ops-sync/lens-stock.ts`).
+export const SKU =/^[A-Z0-9][A-Z0-9._+\-]{1,63}$/;
 
 function text(detail: Record<string, unknown>, key: string, max = 500): string {
   const v = detail[key];

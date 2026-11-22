@@ -368,6 +368,9 @@ describe("ShippopFulfillmentService — Medusa fulfillment adapter", () => {
       purchase_id: 7777,
       courier_code: "FLE",
       status: "ready",
+      // The price Shippop charged at booking, for the commerce feed's
+      // quoted shipping cost (contract 1, fulfillments, field 5).
+      cost_thb: 32,
     });
     expect(result.labels?.[0].tracking_number).toBe("SP123");
     expect(result.labels?.[0].tracking_url).toContain("SP123");
