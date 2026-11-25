@@ -61,6 +61,13 @@ const RX_PATTERNS: readonly RegExp[] = [
   /ciphertext/i,
   /plaintext/i,
   /decrypted/i,
+  // Production actions (modules/lms/production.ts): a lens SKU encodes a
+  // power, and an action's `detail` holds SKUs and free text typed by the
+  // lab. Next to a job or order id either is health data.
+  /^lenses$/i,
+  /^sku$/i,
+  /^detail$/i,
+  /^hold_reason$/i,
 ];
 
 /** Secrets / credentials. `key_alias`'s VALUE (e.g. the literal constant
@@ -119,24 +126,6 @@ function isDenylistedKey(key: string): boolean {
   return DENYLIST_PATTERNS.some((re) => re.test(key));
 }
 
-/** True if a `key=value&...` query string has ANY denylisted param NAME. Used
- *  to redact `request.query_string` wholesale (values can't be cleaned in
- *  place without re-encoding). Tolerant of malformed strings. */
-function queryStringHasSensitiveParam(qs: string): boolean {
-  const raw = qs.startsWith("?") ? qs.slice(1) : qs;
-  return raw
-    .split("&")
-    .map((pair) => pair.split("=")[0] ?? "")
-    .map((k) => {
-      try {
-        return decodeURIComponent(k);
-      } catch {
-        return k;
-      }
-    })
-    .some((name) => name.length > 0 && isDenylistedKey(name));
-}
-
 const REDACTED = "[redacted]";
 /** Cap recursion so a pathological/cyclic object can't hang or crash the
  *  process inside `beforeSend` (which runs on the hot error path). */
@@ -168,8 +157,27 @@ export function scrub(
   return out;
 }
 
+/** An address without its query string or fragment. */
+function withoutQuery(address: string): string {
+  const cut = address.search(/[?#]/);
+  return cut === -1 ? address : address.slice(0, cut);
+}
+
+/** Breadcrumb data scrubbed by key, with no query string or fragment: the
+ *  SDK's `http.query` / `http.fragment` are dropped and a `url` is cut at
+ *  `?` or `#`. A console breadcrumb's message is free text and is left as
+ *  it is (only its `data` is cleaned). */
+function scrubBreadcrumbData(data: Record<string, unknown>): Record<string, unknown> {
+  const out = scrub(data) as Record<string, unknown>;
+  delete out["http.query"];
+  delete out["http.fragment"];
+  if (typeof out.url === "string") out.url = withoutQuery(out.url);
+  return out;
+}
+
 /** Structural subset of a Sentry request payload this scrubber touches. */
 interface ScrubbableRequest {
+  url?: unknown;
   data?: unknown;
   headers?: Record<string, unknown>;
   cookies?: unknown;
@@ -181,10 +189,17 @@ interface ScrubbableRequest {
  * with `Sentry.init({ beforeSend })`.
  *
  *   - `extra` / `contexts`: recursive key-based scrub.
- *   - `breadcrumbs[].data`: recursive key-based scrub per breadcrumb.
- *   - `request`: drop `cookies` wholesale (session material); scrub `data`
- *     and `headers` (an `authorization` header is caught by the secret
- *     pattern above).
+ *   - `breadcrumbs[].data`: recursive key-based scrub per breadcrumb, with
+ *     no query string or fragment (see `scrubBreadcrumbData`).
+ *   - `request`: drop `cookies` wholesale (session material) and the
+ *     `cookie` / `set-cookie` headers; drop `data` when it is text (request
+ *     bodies are never sent: a string has no keys to scrub, and `initSentry`
+ *     turns body capture off at the source); scrub `data` when it is an
+ *     object, and `headers` (an `authorization` header is caught by the
+ *     secret pattern above). No query string is sent: `query_string` is
+ *     dropped, and `url` and the `referer` header are cut at `?` or `#`
+ *     (a search box puts what was typed there, under a name no denylist
+ *     can know).
  *
  * `sendDefaultPii: false` (set at `Sentry.init` call sites) already stops the
  * SDK from attaching IP/user by default — this function is the backstop for
@@ -209,26 +224,29 @@ export function scrubSentryEvent<T extends SentryEvent>(event: T): T {
   }
   if (event.breadcrumbs) {
     event.breadcrumbs = event.breadcrumbs.map((b) =>
-      b?.data ? { ...b, data: scrub(b.data) as Record<string, unknown> } : b,
+      b?.data ? { ...b, data: scrubBreadcrumbData(b.data) } : b,
     );
   }
   if (event.request) {
     const req = event.request as ScrubbableRequest;
     delete req.cookies;
-    if (req.data !== undefined) {
+    if (typeof req.data === "string") {
+      delete req.data;
+    } else if (req.data !== undefined) {
       req.data = scrub(req.data);
     }
     if (req.headers && typeof req.headers === "object") {
-      req.headers = scrub(req.headers) as Record<string, unknown>;
+      const headers = scrub(req.headers) as Record<string, unknown>;
+      for (const name of Object.keys(headers)) {
+        if (/^(set-)?cookie$/i.test(name)) delete headers[name];
+        else if (/^referer$/i.test(name) && typeof headers[name] === "string") {
+          headers[name] = withoutQuery(headers[name] as string);
+        }
+      }
+      req.headers = headers;
     }
-    // `query_string` can carry denylisted params on a GET; if ANY param name
-    // is denylisted, redact the whole string (a param value can't be cleaned
-    // in place without re-encoding, and one sensitive param taints the query).
-    // Closes the gap where `ScrubbableRequest` declared `query_string` but the
-    // scrubber never touched it.
-    if (typeof req.query_string === "string" && queryStringHasSensitiveParam(req.query_string)) {
-      req.query_string = REDACTED;
-    }
+    delete req.query_string;
+    if (typeof req.url === "string") req.url = withoutQuery(req.url);
   }
   return event;
 }
@@ -238,7 +256,7 @@ export function scrubSentryEvent<T extends SentryEvent>(event: T): T {
  *  in the breadcrumb ring buffer and ride along on a LATER, unrelated error. */
 export function scrubBreadcrumb(breadcrumb: Breadcrumb): Breadcrumb {
   if (breadcrumb.data) {
-    breadcrumb.data = scrub(breadcrumb.data) as Record<string, unknown>;
+    breadcrumb.data = scrubBreadcrumbData(breadcrumb.data);
   }
   return breadcrumb;
 }
@@ -266,8 +284,26 @@ export function initSentry(): void {
     // Never let the SDK auto-attach IP / request cookies / etc. — the
     // scrubber above is the backstop, this is the first line of defense.
     sendDefaultPii: false,
-    beforeSend: (event) => scrubSentryEvent(event),
-    beforeBreadcrumb: (breadcrumb) => scrubBreadcrumb(breadcrumb),
+    // Request bodies are never recorded. The SDK's default Http integration
+    // keeps up to 10 kB of each incoming body whatever `sendDefaultPii` says;
+    // this instance replaces it (same name) with body capture off.
+    integrations: [Sentry.httpIntegration({ maxIncomingRequestBodySize: "none" })],
+    // If scrubbing fails, nothing is sent: returning null drops the event
+    // or breadcrumb (a throw here would make the SDK send its own event).
+    beforeSend: (event) => {
+      try {
+        return scrubSentryEvent(event);
+      } catch {
+        return null;
+      }
+    },
+    beforeBreadcrumb: (breadcrumb) => {
+      try {
+        return scrubBreadcrumb(breadcrumb);
+      } catch {
+        return null;
+      }
+    },
   });
 }
 
