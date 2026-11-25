@@ -44,7 +44,9 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
       lms.listLabVendors(),
     ]);
     // An invoice is entered against a quote that has none yet; with no such
-    // quote the writer refuses it, so the screen does not offer it.
+    // quote the writer refuses it, so the screen does not offer it. It is an
+    // ops step (`OPS_ACTIONS`): only a full admin records the lab's bill,
+    // so a lab account, given no ops steps below, is never offered it.
     const quoteOpen = (costs as Array<{ invoiced_satang: number | null }>).some(
       (c) => c.invoiced_satang === null || c.invoiced_satang === undefined,
     );

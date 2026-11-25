@@ -1,5 +1,5 @@
 import type { MedusaContainer } from "@medusajs/framework/types";
-import { LMS_MODULE } from "../modules/lms/service";
+import { LMS_MODULE, failureKind, reportableError } from "../modules/lms/service";
 import type LmsModuleService from "../modules/lms/service";
 import { captureException } from "../lib/observability/sentry";
 
@@ -29,10 +29,9 @@ export default async function releaseLabUsageJob(container: MedusaContainer): Pr
       );
     }
   } catch (err) {
-    console.error(
-      `[release-lab-usage] release failed: ${err instanceof Error ? err.message : "unknown"}`,
-    );
-    captureException(err, { tags: { job: "release-lab-usage", reason: "release_failed" } });
+    // A database error's own text can hold values; its kind only.
+    console.error(`[release-lab-usage] release failed: ${failureKind(err)}`);
+    captureException(reportableError(err, "release-lab-usage release"), { tags: { job: "release-lab-usage", reason: "release_failed" } });
     return;
   }
 
@@ -47,7 +46,9 @@ export default async function releaseLabUsageJob(container: MedusaContainer): Pr
       captureException(err, { tags: { job: "release-lab-usage", reason: "usage_drift" } });
     }
   } catch (err) {
-    captureException(err, { tags: { job: "release-lab-usage", reason: "drift_check_failed" } });
+    captureException(reportableError(err, "release-lab-usage drift check"), {
+      tags: { job: "release-lab-usage", reason: "drift_check_failed" },
+    });
   }
 }
 

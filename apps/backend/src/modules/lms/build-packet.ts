@@ -15,6 +15,7 @@ import {
   type LensType,
 } from "./types";
 import { captureException } from "../../lib/observability/sentry";
+import { errorKind } from "../../lib/observability/error-kind";
 import { thaiAddressLevels } from "../../lib/thai-address";
 
 /**
@@ -406,8 +407,10 @@ export async function buildLabJobPacket(
     } catch (err) {
       // NEVER put the packet/prescription/customer objects into `extra` here
       // — only opaque ids. The decrypted Rx, if any was partially read before
-      // the throw, must not ride along on this event.
-      captureException(err, {
+      // the throw, must not ride along on this event. Nor the error's own
+      // text: a parse error on the vault's answer quotes the start of the
+      // body, which for a decrypt is prescription data. Only its kind goes.
+      captureException(new Error(`build-packet decrypt failed: ${errorKind(err)}`), {
         tags: { module: "lms", fn: "build-packet", reason: "decrypt_failed" },
         extra: { order_id: orderId, job_ref: jobRef },
       });

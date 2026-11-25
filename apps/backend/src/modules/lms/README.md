@@ -265,7 +265,8 @@ packet builds, and moves from there only through
       the event (which names the quote, its lab and quoted amount), not in
       any log, Sentry event, report or feed, and a lab account is not sent
       it. A lab account cannot write a quote off: the step is an ops step
-      and the lab gate refuses that route.
+      and the lab gate refuses that route. Nor can it enter the invoice
+      that would reverse one (item 6).
    4. **An invoice after a write-off** is still taken and reverses the
       write-off in the same step: the quote counts as invoiced, the
       write-off stays on the quote as it was made, and the LAB_INVOICED
@@ -278,6 +279,15 @@ packet builds, and moves from there only through
       came back and is not written off, then work that came back and was
       written off, then work that never came back, oldest first within
       each. On a job with no write-off that is the choice it always made.
+   6. **Only a full admin enters an invoice** (owner's decision of
+      2026-11-25: a lab account never records an outside lab's bill or
+      writes one off; it still types the quoted price on SENT_TO_LAB). `LAB_INVOICED` is
+      an ops step, through `POST /admin/lab-jobs/:id/ops-actions` with
+      `detail: { invoiced_satang, lab_cost_id? }`. The lab's own route
+      refuses it (400) and the lab gate refuses a lab account the ops
+      route (403), so the job route does not offer a lab account "Enter
+      lab invoice". A lab account still sees the invoiced amount on the
+      quote.
 7. **Cancelling** sets `stage` and `status` to cancelled in one write.
    `cancelJob` goes through the writer.
 8. **A job the lab has started on is not rebuilt.** `updateJobFromBuild`
@@ -367,7 +377,7 @@ so it will be a button.
 | `GET /admin/lab-jobs/:id/production` | A job's state, history and outside-lab quotes, the steps it offers now, and the outside labs already used | `lab_job:read` |
 | `POST /admin/lab-jobs/:id/packet` | Shows the packet (the prescription) and records who looked, before it is returned | `lab_job:read` |
 | `POST /admin/lab-jobs/:id/actions` | Records one step the lab took | `lab_job:update` |
-| `POST /admin/lab-jobs/:id/ops-actions` | Hold and release; writing off a lab quote | `lab_job_ops:update` |
+| `POST /admin/lab-jobs/:id/ops-actions` | Hold and release; an outside lab's invoice; writing off a lab quote | `lab_job_ops:update` |
 | `POST /admin/lab-jobs/:id/rx-changed` | A changed prescription on a job in production | `lab_job_ops:update` |
 | `POST /admin/lab-jobs/:id/retry` | Rebuild a packet, as before | `lab_job_ops:update` |
 | `POST /admin/lab-jobs/:id/warranty-remake` | Fetch the prescription back into a labelled or delivered job's packet and start a remake | `lab_job_ops:update` |
@@ -544,8 +554,9 @@ This is the gate the design sets before any lab login exists (10.10 items
    5. If the check cannot find out (the database does not answer), the
       request is refused with 503 for everyone, not let through.
 4. **What a lab account is shown and can do.**
-   1. Not the ops steps: hold and release, writing off a lab quote, a
-      changed prescription, a rebuild, a warranty remake. The job route
+   1. Not the ops steps: hold and release, an outside lab's invoice,
+      writing off a lab quote, a changed prescription, a rebuild, a
+      warranty remake. The job route
       does not offer a lab account their buttons, and leaves a write-off's
       reason out of the quotes it shows one.
    2. **Never an order's id.** Medusa's storefront API answers `GET

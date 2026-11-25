@@ -317,6 +317,9 @@ const JobScreen = ({ id }: { id: string }) => {
     if (!data) return;
     const step: Step = {
       action,
+      // The route says which door each offered step uses: an ops step
+      // (hold, release, the lab's invoice) goes to `/ops-actions`, which a
+      // lab account is never offered and cannot reach.
       door: door ?? (data.actions.ops.includes(action) ? "ops-actions" : "actions"),
       stage_version: data.job.stage_version,
       event_seq: data.job.event_seq,

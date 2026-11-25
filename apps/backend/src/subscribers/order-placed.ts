@@ -1,6 +1,6 @@
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework";
 import { buildLabJobPacket } from "../modules/lms/build-packet";
-import { LMS_MODULE } from "../modules/lms/service";
+import { LMS_MODULE, failureKind, reportableError } from "../modules/lms/service";
 import type LmsModuleService from "../modules/lms/service";
 import type { BuildPacketResult } from "../modules/lms/types";
 import { captureException } from "../lib/observability/sentry";
@@ -51,7 +51,7 @@ export default async function orderPlacedHandler({
   } catch (err) {
     // Infra failure (e.g. the order module threw). Still record a durable
     // failed row so the order isn't silently missing from the lab queue.
-    captureException(err, {
+    captureException(reportableError(err, "order-placed build"), {
       tags: { subscriber: "order-placed", reason: "build_threw" },
       extra: { order_id: orderId },
     });
@@ -93,12 +93,8 @@ export default async function orderPlacedHandler({
       );
     }
   } catch (err) {
-    console.error(
-      `[order-placed] submitJob failed for ${job.id}: ${
-        err instanceof Error ? err.message : "unknown"
-      }`,
-    );
-    captureException(err, {
+    console.error(`[order-placed] submitJob failed for ${job.id}: ${failureKind(err)}`);
+    captureException(reportableError(err, "order-placed submit"), {
       tags: { subscriber: "order-placed", reason: "submit_failed" },
       extra: { order_id: orderId, lab_job_id: job.id },
     });

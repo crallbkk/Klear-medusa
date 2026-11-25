@@ -54,4 +54,24 @@ describe("release-lab-usage scheduled job", () => {
     await expect(run(lms)).resolves.toBeUndefined();
     expect(captureException).toHaveBeenCalledTimes(1);
   });
+
+  it("logs a failed release by its kind, never the error's own text", async () => {
+    const driverError = Object.assign(new Error("insert into lab_usage_release values ('LENS-SECRET-SKU')"), {
+      code: "23505",
+    });
+    const lms = {
+      releaseDueWindows: jest.fn().mockRejectedValue(driverError),
+      unreleasedUsageDrift: jest.fn(),
+    };
+    await run(lms);
+    const logged = JSON.stringify((console.error as jest.Mock).mock.calls);
+    expect(logged).not.toMatch(/SECRET|insert into/);
+    expect(logged).toContain("release failed: Error/23505");
+    // An exception's message is the one thing the Sentry scrubber cannot clean.
+    const sent = (captureException as jest.Mock).mock.calls
+      .map((c) => `${String(c[0]?.message)}\n${String(c[0]?.stack)}`)
+      .join("\n");
+    expect(captureException).toHaveBeenCalledTimes(1);
+    expect(sent).not.toMatch(/SECRET|insert into/);
+  });
 });

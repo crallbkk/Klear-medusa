@@ -211,7 +211,7 @@ describe("POST /admin/lab-jobs/[id]/actions", () => {
 });
 
 describe("POST /admin/lab-jobs/[id]/ops-actions", () => {
-  it("takes hold and release, and nothing else", async () => {
+  it("takes hold, release, a write-off and the lab's bill, and nothing else", async () => {
     const lms = {
       applyProductionAction: jest.fn().mockResolvedValue({
         event: { id: "e1", idempotency_key: "key-0000001", request_hash: "h" },
@@ -223,6 +223,7 @@ describe("POST /admin/lab-jobs/[id]/ops-actions", () => {
       ["HOLD", undefined],
       ["RELEASE", undefined],
       ["LAB_QUOTE_WRITTEN_OFF", undefined],
+      ["LAB_INVOICED", undefined],
       ["PRINTED", 400],
       ["CANCELLED", 400],
     ] as const) {
@@ -231,13 +232,57 @@ describe("POST /admin/lab-jobs/[id]/ops-actions", () => {
       if (status) expect(res.status).toHaveBeenCalledWith(status);
       else expect(res.status).not.toHaveBeenCalled();
     }
-    expect(lms.applyProductionAction).toHaveBeenCalledTimes(3);
+    expect(lms.applyProductionAction).toHaveBeenCalledTimes(4);
+  });
+
+  it("is the only door for the lab's bill: the lab's own route refuses it", async () => {
+    // Only a full admin records an outside lab's bill (owner, 2026-11-25). The lab gate
+    // keeps a lab account away from this route.
+    expect(OPS_ACTIONS.has("LAB_INVOICED")).toBe(true);
+    expect(LAB_ACTIONS.has("LAB_INVOICED")).toBe(false);
+    const refused = { applyProductionAction: jest.fn() };
+    const res = makeRes();
+    await call(
+      actions,
+      makeReq(refused, {
+        action: "LAB_INVOICED",
+        idempotency_key: "key-0000001",
+        detail: { invoiced_satang: 45000, lab_cost_id: "labcost_1" },
+      }),
+      res,
+    );
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(refused.applyProductionAction).not.toHaveBeenCalled();
+
+    // Through ops, the body reaches the writer as sent: the quote it names
+    // included.
+    const ok = { event: { id: "prodevt_1" }, job: { id: "labjob_1" }, replayed: false };
+    const taken = { applyProductionAction: jest.fn().mockResolvedValue(ok) };
+    const done = makeRes();
+    await call(
+      opsActions,
+      makeReq(taken, {
+        action: "LAB_INVOICED",
+        idempotency_key: "key-0000002",
+        expected_version: 3,
+        detail: { invoiced_satang: 45000, lab_cost_id: "labcost_1" },
+      }),
+      done,
+    );
+    expect(done.status).not.toHaveBeenCalled();
+    expect(taken.applyProductionAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "LAB_INVOICED",
+        expected_version: 3,
+        detail: { invoiced_satang: 45000, lab_cost_id: "labcost_1" },
+      }),
+    );
   });
 
   it("is the only door for a write-off: the lab's own route refuses it", async () => {
-    // A write-off is a judgement about money. The lab records an invoice
-    // (`/actions`); only an ordinary admin account writes a quote off, and
-    // the lab gate keeps a lab account away from this route.
+    // A write-off is a judgement about money, as is the lab's bill: only an
+    // ordinary admin account records either, and the lab gate keeps a lab
+    // account away from this route.
     expect(OPS_ACTIONS.has("LAB_QUOTE_WRITTEN_OFF")).toBe(true);
     expect(LAB_ACTIONS.has("LAB_QUOTE_WRITTEN_OFF")).toBe(false);
     const lms = { applyProductionAction: jest.fn() };

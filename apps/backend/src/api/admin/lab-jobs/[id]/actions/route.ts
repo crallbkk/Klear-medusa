@@ -21,7 +21,8 @@ import {
  * reloads. Answers `{ event, job, replayed }`; the job never includes the
  * packet.
  *
- * Hold and release are ops steps (`/ops-actions`). Label, delivery, cancel
+ * Hold, release, an outside lab's bill and a write-off are ops steps
+ * (`/ops-actions`). Label, delivery, cancel
  * and a changed prescription are recorded by the system, not here.
  */
 export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<void> {

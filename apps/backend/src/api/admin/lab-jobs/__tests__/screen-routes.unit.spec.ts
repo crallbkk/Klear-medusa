@@ -154,7 +154,7 @@ describe("GET /admin/lab-jobs/[id]/production", () => {
     expect([actions.ops, actions.packet, actions.rx_changed]).toEqual([[], true, false]);
   });
 
-  it("offers the invoice only while a quote is waiting for one", async () => {
+  it("offers the invoice to ops only while a quote is waiting for one", async () => {
     const open = { id: "c1", invoiced_satang: null };
     const paid = { id: "c2", invoiced_satang: 500 };
     for (const [costs, offered] of [
@@ -164,8 +164,26 @@ describe("GET /admin/lab-jobs/[id]/production", () => {
     ] as const) {
       const res = makeRes();
       await call(production, makeReq(lmsFor(JOB, [...costs])), res);
-      expect(res.json.mock.calls[0][0].actions.lab.includes("LAB_INVOICED")).toBe(offered);
+      const { actions } = res.json.mock.calls[0][0];
+      expect(actions.ops.includes("LAB_INVOICED")).toBe(offered);
+      expect(actions.lab).not.toContain("LAB_INVOICED");
     }
+  });
+
+  it("never offers a lab account the invoice: only a full admin records the lab's bill", async () => {
+    const res = makeRes();
+    await call(
+      production,
+      {
+        ...makeReq(lmsFor({ ...JOB, stage: "received_from_lab" }, [{ id: "c1", invoiced_satang: null }])),
+        // Set by the check in front of every admin route (`lab-gate.ts`).
+        klear_lab_account: true,
+      },
+      res,
+    );
+    const { actions } = res.json.mock.calls[0][0];
+    expect(actions.lab.length).toBeGreaterThan(0);
+    expect([...actions.lab, ...actions.ops]).not.toContain("LAB_INVOICED");
   });
 
   it("offers a write-off on each quote that is back and not invoiced, to ops only, never as a job-wide button", async () => {

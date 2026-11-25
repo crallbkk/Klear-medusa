@@ -323,6 +323,78 @@ medusaIntegrationTestRunner({
         expect(JSON.stringify(after.data)).not.toMatch(/Secretname|written_off_reason/);
       });
 
+      it("cannot record an outside lab's bill, which an ordinary admin account can", async () => {
+        // Only a full admin records an outside lab's bill (owner, 2026-11-25).
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const lms = getContainer().resolve(LMS_MODULE) as any;
+        const made = await lms.createFromBuild({
+          outcome: "ok",
+          packet: {
+            job_ref: "klear-order_invoice",
+            klear_order_id: "order_invoice",
+            frame_sku: "KLR-1",
+            lens_type: "non_prescription",
+            lens_index: null,
+            coating_addons: [],
+            prescription: null,
+            customer: {
+              name: "A B",
+              phone: "+66800000000",
+              delivery_address: { line1: "x", city: "c", province: "p", postal_code: "10110", country_code: "TH" },
+            },
+            submitted_at: new Date().toISOString(),
+          },
+        });
+        const id = made.id as string;
+        let step = 0;
+        for (const [action, detail] of [
+          ["PRINTED", undefined],
+          ["SENT_TO_LAB", { vendor: "Lab One", quoted_satang: 45000 }],
+          ["RECEIVED_FROM_LAB", undefined],
+        ] as const) {
+          const job = await lms.retrieveLabJob(id);
+          await lms.applyProductionAction({
+            job_id: id,
+            action,
+            idempotency_key: `http-inv-setup-${++step}`,
+            expected_version: job.stage_version,
+            actor: { type: "user", id: "user_setup" },
+            detail,
+          });
+        }
+        const [quote] = await lms.listLabCosts({ lab_job_id: id });
+        const body = async (k: string) => ({
+          action: "LAB_INVOICED",
+          idempotency_key: k,
+          expected_version: (await lms.retrieveLabJob(id)).stage_version,
+          detail: { invoiced_satang: 47000, lab_cost_id: quote.id },
+        });
+        const post = async (url: string, data: object, auth: { headers: Record<string, string> }) =>
+          api.request({ method: "POST", url, data, ...auth, validateStatus: () => true });
+
+        // The lab account: the lab's own route does not take the step, and
+        // the gate refuses it the ops route. It is not offered the button.
+        const byLabRoute = await post(`/admin/lab-jobs/${id}/actions`, await body("http-inv-lab-1"), lab);
+        expect(byLabRoute.status).toBe(400);
+        const byGate = await post(`/admin/lab-jobs/${id}/ops-actions`, await body("http-inv-lab-2"), lab);
+        expect([byGate.status, byGate.data?.message]).toEqual([403, REFUSAL]);
+        const labView = await call("GET", `/admin/lab-jobs/${id}/production`, lab);
+        expect(labView.status).toBe(200);
+        expect([...labView.data.actions.lab, ...labView.data.actions.ops]).not.toContain("LAB_INVOICED");
+        expect((await lms.listLabCosts({ lab_job_id: id }))[0].invoiced_satang).toBeNull();
+
+        // The owner is offered it with the ops steps and records it there.
+        const ownerView = await call("GET", `/admin/lab-jobs/${id}/production`, owner);
+        expect(ownerView.data.actions.ops).toContain("LAB_INVOICED");
+        expect(ownerView.data.actions.lab).not.toContain("LAB_INVOICED");
+        const first = await post(`/admin/lab-jobs/${id}/ops-actions`, await body("http-inv-owner-1"), owner);
+        expect([first.status, first.data.replayed]).toEqual([200, false]);
+        expect((await lms.listLabCosts({ lab_job_id: id }))[0].invoiced_satang).toBe(47000);
+        // The lab account sees the amount on the quote, as before.
+        const after = await call("GET", `/admin/lab-jobs/${id}/production`, lab);
+        expect(after.data.costs[0].invoiced_satang).toBe(47000);
+      });
+
       it("is refused, by this check, on every admin route except the ones listed for it", async () => {
         expect(ALL_ADMIN.length).toBeGreaterThan(250);
         const wrong: string[] = [];

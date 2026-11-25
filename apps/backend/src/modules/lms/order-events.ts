@@ -12,7 +12,7 @@ import type { MedusaContainer } from "@medusajs/framework/types";
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
 import { captureException, captureMessage } from "../../lib/observability/sentry";
 import { ProductionError, type ProductionAction } from "./production";
-import { LMS_MODULE, ProductionWriteError } from "./service";
+import { LMS_MODULE, ProductionWriteError, failureKind, reportableError } from "./service";
 import type LmsModuleService from "./service";
 
 export type OrderEventOutcome =
@@ -160,10 +160,8 @@ export async function recordOrderEventSafely(
       }
     }
   } catch (err) {
-    console.error(
-      `[lms] ${action} for order ${orderId} failed: ${err instanceof Error ? err.message : "unknown"}`,
-    );
-    captureException(err, {
+    console.error(`[lms] ${action} for order ${orderId} failed: ${failureKind(err)}`);
+    captureException(reportableError(err, `lms order event ${action}`), {
       tags: { module: "lms", reason: "order_event_failed", action },
       extra: { order_id: orderId },
     });

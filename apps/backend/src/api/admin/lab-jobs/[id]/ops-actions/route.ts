@@ -10,7 +10,8 @@ import {
 } from "../../production-http";
 
 /**
- * POST /admin/lab-jobs/[id]/ops-actions: put a job on hold or release it.
+ * POST /admin/lab-jobs/[id]/ops-actions: put a job on hold or release it,
+ * enter an outside lab's bill, or write off a quote it will never bill.
  * Same body and answer as `/actions`; needs the ops permission.
  */
 export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<void> {

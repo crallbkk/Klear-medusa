@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
 import { MedusaService, generateEntityId } from "@medusajs/framework/utils";
 import { captureException } from "../../lib/observability/sentry";
+import { errorKind } from "../../lib/observability/error-kind";
 import LabJob from "./models/lab-job";
 import ProductionEvent from "./models/production-event";
 import LabUsage from "./models/lab-usage";
@@ -85,6 +86,26 @@ export class ProductionWriteError extends Error {
     this.name = "ProductionWriteError";
     this.code = code;
   }
+}
+
+/**
+ * A failure, for a log line, as the routes word it: our own write error's
+ * text (built from codes only, see above), and for anything else its kind
+ * (`errorKind`), never its message.
+ */
+export function failureKind(err: unknown): string {
+  return err instanceof ProductionWriteError ? err.message : errorKind(err);
+}
+
+/**
+ * The error to hand to Sentry for a failure, as `sendProductionError` does:
+ * our own write error as it is, anything else replaced by a new error that
+ * names where it failed and its kind. An exception's message is the one
+ * thing the Sentry scrubber cannot clean, so a driver's own text never
+ * reaches it.
+ */
+export function reportableError(err: unknown, where: string): Error {
+  return err instanceof ProductionWriteError ? err : new Error(`${where} failed: ${failureKind(err)}`);
 }
 
 /** A lens snapshot from Klear Operations that cannot be taken: it is older
@@ -1442,12 +1463,8 @@ class LmsModuleService extends MedusaService({
       // stop the hand-off (the order-placed subscriber, the retry route, the
       // heal sweep) over a stage that `markStagelessJobsReady` sets on its
       // next pass anyway. The error holds ids only (see ProductionWriteError).
-      console.error(
-        `[lms] could not put lab job ${jobId} at ready: ${
-          err instanceof Error ? err.message : "unknown"
-        }`,
-      );
-      captureException(err, {
+      console.error(`[lms] could not put lab job ${jobId} at ready: ${failureKind(err)}`);
+      captureException(reportableError(err, "lms mark ready"), {
         tags: { module: "lms", reason: "mark_ready_failed" },
         extra: { lab_job_id: jobId },
       });

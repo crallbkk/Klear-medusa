@@ -1,6 +1,6 @@
 import type { MedusaContainer } from "@medusajs/framework/types";
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
-import { LMS_MODULE } from "../modules/lms/service";
+import { LMS_MODULE, failureKind, reportableError } from "../modules/lms/service";
 import type LmsModuleService from "../modules/lms/service";
 import {
   NO_ORDER_FACTS,
@@ -70,11 +70,9 @@ async function loadOrderFacts(
       // age. Nothing is blanked early; it is retried on the next run.
       failedBatches++;
       console.error(
-        `[redact-lab-job-rx] order delivery lookup failed for a batch of ${batch.length}: ${
-          err instanceof Error ? err.message : "unknown"
-        }`,
+        `[redact-lab-job-rx] order delivery lookup failed for a batch of ${batch.length}: ${failureKind(err)}`,
       );
-      captureException(err, {
+      captureException(reportableError(err, "redact-lab-job-rx order lookup"), {
         tags: { job: "redact-lab-job-rx", reason: "order_query_failed" },
         extra: { batch_size: batch.length },
       });
@@ -117,11 +115,9 @@ export default async function redactLabJobRxJob(
     } catch (err) {
       errored++;
       console.error(
-        `[redact-lab-job-rx] failed for job ${job.id} (order ${job.order_id}): ${
-          err instanceof Error ? err.message : "unknown"
-        }`,
+        `[redact-lab-job-rx] failed for job ${job.id} (order ${job.order_id}): ${failureKind(err)}`,
       );
-      captureException(err, {
+      captureException(reportableError(err, "redact-lab-job-rx redact"), {
         tags: { job: "redact-lab-job-rx", reason: "redact_failed" },
         extra: { lab_job_id: job.id, order_id: job.order_id },
       });

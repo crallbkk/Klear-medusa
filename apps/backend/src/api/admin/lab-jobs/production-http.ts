@@ -12,6 +12,7 @@ import {
   ProductionWriteError,
 } from "../../../modules/lms/service";
 import { captureException } from "../../../lib/observability/sentry";
+import { errorKind } from "../../../lib/observability/error-kind";
 import { isLabAccount } from "../lab-gate";
 
 /**
@@ -23,7 +24,7 @@ import { isLabAccount } from "../lab-gate";
  *   lab_job:read     see the queue, a job's history, and (logged) its packet
  *   lab_job:update   record the lab's own steps
  *   lab_job_ops:update  hold and release, a changed prescription, retry,
- *                       writing off a lab quote
+ *                       an outside lab's bill, writing off a lab quote
  */
 export const LAB_READ = { resource: "lab_job", operation: "read" };
 export const LAB_ACT = { resource: "lab_job", operation: "update" };
@@ -46,16 +47,18 @@ export const LAB_ACTIONS: ReadonlySet<ProductionAction> = new Set<ProductionActi
   "FRAME_DAMAGED",
   "LENS_RETURNED_UNUSED",
   "LENS_CUT_CONFIRMED",
-  "LAB_INVOICED",
   "NOTE",
 ]);
 
 /** What needs the ops permission, through `/ops-actions`. A lab account
- *  cannot reach that route (`lab-gate.ts`). Writing off a lab quote is a
- *  judgement about money, so it is here and not with the lab's invoice. */
+ *  cannot reach that route (`lab-gate.ts`). A lab account never records
+ *  an outside lab's bill or writes one off (owner, 2026-11-25): both are
+ *  here, not with the lab's steps. It still types the quoted price when it
+ *  sends work out (SENT_TO_LAB). */
 export const OPS_ACTIONS: ReadonlySet<ProductionAction> = new Set<ProductionAction>([
   "HOLD",
   "RELEASE",
+  "LAB_INVOICED",
   "LAB_QUOTE_WRITTEN_OFF",
 ]);
 
@@ -193,23 +196,9 @@ export function sendProductionError(
   res.status(500).json({ type: "unexpected_state", message: "the action could not be recorded; try again" });
 }
 
-/**
- * What kind of error this is, for a log line: its class name, its error
- * code and Medusa's error type, each only if it has the shape of one. Never
- * its message. The shapes are narrow on purpose: a class name is letters, a
- * code is a short run of capitals and digits (SQLSTATE, ECONNREFUSED), a
- * type is lower-case words. A lens SKU, a phone number or a field name with
- * a value fits none of them.
- */
-export function errorKind(err: unknown): string {
-  const e = err as { name?: unknown; code?: unknown; type?: unknown };
-  const parts = [
-    typeof e?.name === "string" && /^[A-Z][A-Za-z]{1,39}$/.test(e.name) ? e.name : null,
-    typeof e?.code === "string" && /^[A-Z0-9_]{1,12}$/.test(e.code) ? e.code : null,
-    typeof e?.type === "string" && /^[a-z_]{1,30}$/.test(e.type) ? e.type : null,
-  ].filter(Boolean);
-  return parts.join("/") || "unexpected error";
-}
+/** What kind of error this is, for a log line; never its message. Kept in
+ *  `lib/observability/error-kind.ts` so modules and jobs share it. */
+export { errorKind };
 
 /** An event as the job screen sees it. Not its idempotency key: knowing
  *  another person's key must not be worth anything, and showing it invites

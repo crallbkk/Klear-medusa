@@ -30,8 +30,9 @@ export const LAB_ROLE = "lab";
  * Two groups. The lab's own work: the queue, a job, its history, its
  * packet (every look recorded), the lab's steps, the reports. And what the
  * admin page itself asks for before it shows anything: who is signed in,
- * and which features are on. Not here on purpose: hold and release, a
- * changed prescription, a rebuild and a warranty remake (ops), and every
+ * and which features are on. Not here on purpose: hold and release, an
+ * outside lab's bill and a write-off, a changed prescription, a rebuild
+ * and a warranty remake (ops), and every
  * order, customer, product, user, key and setting route.
  */
 export const LAB_MAY_REACH: ReadonlyArray<readonly [method: string, path: string]> = [

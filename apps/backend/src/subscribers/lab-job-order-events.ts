@@ -1,6 +1,7 @@
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework";
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
 import { recordOrderEventSafely } from "../modules/lms/order-events";
+import { failureKind, reportableError } from "../modules/lms/service";
 import { captureException } from "../lib/observability/sentry";
 
 /**
@@ -66,12 +67,8 @@ export default async function labJobOrderEventsHandler({
         });
         orderId = (rows?.[0] as { order?: { id?: string } } | undefined)?.order?.id;
       } catch (err) {
-        console.error(
-          `[lms] could not find the order of fulfillment ${data.id}: ${
-            err instanceof Error ? err.message : "unknown"
-          }`,
-        );
-        captureException(err, {
+        console.error(`[lms] could not find the order of fulfillment ${data.id}: ${failureKind(err)}`);
+        captureException(reportableError(err, "lab-job-order-events fulfillment lookup"), {
           tags: { subscriber: "lab-job-order-events", reason: "fulfillment_query_failed" },
           extra: { fulfillment_id: data.id },
         });
