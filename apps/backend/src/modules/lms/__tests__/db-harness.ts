@@ -5,9 +5,7 @@
 //
 // Connection: DB_HOST / DB_PORT / DB_USERNAME / DB_PASSWORD, the same
 // variables @medusajs/test-utils reads. CI provides a Postgres service; for a
-// local run: `DB_HOST=localhost DB_PORT=5432 DB_USERNAME=postgres
-// DB_PASSWORD=postgres npm run test:db`, against any Postgres you may create
-// a database on.
+// local run see the "Database tests" section of the module README.
 
 import fs from "fs";
 import path from "path";

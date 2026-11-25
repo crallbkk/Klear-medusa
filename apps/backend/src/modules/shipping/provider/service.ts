@@ -69,6 +69,9 @@ export interface ShippopFulfillmentData extends Record<string, unknown> {
   courier_code: ThaiCarrier;
   label_html?: string;
   status: ShipmentStatus;
+  /** Shippop's price at booking, in baht. Absent on fulfillments booked
+   *  before it was stored. Read by the commerce feed. */
+  cost_thb?: number;
 }
 
 /** Static set of carriers we expose as fulfillment options. Mirrors ThaiCarrier. */
@@ -203,6 +206,10 @@ export class ShippopFulfillmentService extends AbstractFulfillmentProviderServic
       purchase_id: shipment.purchase_id,
       courier_code: shipment.carrier,
       status: shipment.status,
+      // The price Shippop charged for this booking. Kept so Klear
+      // Operations can read the quoted shipping cost from the commerce
+      // feed (contract 1); nothing else stores it.
+      cost_thb: shipment.cost_thb,
     };
 
     return {

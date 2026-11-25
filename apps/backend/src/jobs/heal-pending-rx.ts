@@ -2,6 +2,8 @@ import type { MedusaContainer } from "@medusajs/framework/types";
 import {
   LMS_MODULE,
   LabJobNotRebuildableError,
+  failureKind,
+  reportableError,
 } from "../modules/lms/service";
 import type LmsModuleService from "../modules/lms/service";
 import { rebuildAndSubmitJob } from "../modules/lms/rebuild";
@@ -29,6 +31,10 @@ import { captureException } from "../lib/observability/sentry";
  * metadata-change event. An immediate nudge (storefront → this heal path) is a
  * small additive follow-up if progression latency ever matters.
  *
+ * `pending_rx` also covers a job in production whose prescription changed
+ * and whose new packet is not stored yet (see `applyChangedPrescription`);
+ * the same rebuild finishes it.
+ *
  * Scope: `pending_rx` only. Genuinely `failed` jobs (bad signature, missing
  * address, tampering) are NOT swept — they need ops attention via
  * `/admin/lab-jobs` + the manual retry route, not silent auto-retry.
@@ -41,6 +47,18 @@ export default async function healPendingRxJob(
   // All of them, not a capped page: a capped oldest-first page would return
   // the same never-answered jobs every run and never reach newer ones.
   const pending = await lms.listAllJobIdsByStatus("pending_rx");
+
+  // Built jobs that have no production stage (a stage write that failed, or
+  // a job created by the previous deployment during a deploy) get one here.
+  try {
+    const staged = await lms.markStagelessJobsReady();
+    if (staged > 0) console.info(`[heal-pending-rx] put ${staged} built job(s) at ready`);
+  } catch (err) {
+    captureException(reportableError(err, "heal-pending-rx stage sweep"), {
+      tags: { job: "heal-pending-rx", reason: "stage_sweep_failed" },
+    });
+  }
+
   if (pending.length === 0) return;
 
   let healed = 0;
@@ -64,11 +82,9 @@ export default async function healPendingRxJob(
       // A genuine failure on ONE order must never abort the sweep of the rest.
       errored++;
       console.error(
-        `[heal-pending-rx] heal failed for job ${job.id} (order ${job.order_id}): ${
-          err instanceof Error ? err.message : "unknown"
-        }`,
+        `[heal-pending-rx] heal failed for job ${job.id} (order ${job.order_id}): ${failureKind(err)}`,
       );
-      captureException(err, {
+      captureException(reportableError(err, "heal-pending-rx rebuild"), {
         tags: { job: "heal-pending-rx", reason: "rebuild_failed" },
         extra: { lab_job_id: job.id, order_id: job.order_id },
       });

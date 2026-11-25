@@ -100,6 +100,11 @@ function makeService(provider?: {
     return matched;
   });
 
+  // Production writes go through a real transaction (covered by
+  // production.db.spec.ts); here only the call to the hook is asserted.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (service as any).markReadyForProduction = jest.fn(async () => undefined);
+
   return { service, rows };
 }
 
@@ -161,12 +166,18 @@ describe("LmsModuleService.createFromBuild", () => {
     expect(job!.status).toBe("queued");
     expect(job!.last_error).toBeNull();
     expect(job!.packet_snapshot).toEqual(PACKET);
+    // A built packet is ready for production.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((service as any).markReadyForProduction).toHaveBeenCalledWith(job!.id);
   });
 
   it("creates a pending_rx row carrying the reason", async () => {
     const { service } = makeService();
     const job = await service.createFromBuild(pendingResult);
     expect(job!.status).toBe("pending_rx");
+    // No packet yet, so no production stage.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((service as any).markReadyForProduction).not.toHaveBeenCalled();
     expect(job!.last_error).toMatch(/awaiting customer prescription/);
   });
 

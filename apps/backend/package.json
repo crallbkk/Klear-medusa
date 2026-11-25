@@ -29,6 +29,8 @@
     "@medusajs/dashboard": "2.14.2",
     "@medusajs/draft-order": "2.14.2",
     "@medusajs/framework": "2.14.2",
+    "@medusajs/icons": "2.14.2",
+    "@medusajs/js-sdk": "2.14.2",
     "@medusajs/medusa": "2.14.2",
     "@medusajs/ui": "4.1.9",
     "@sentry/node": "^10.67.0",

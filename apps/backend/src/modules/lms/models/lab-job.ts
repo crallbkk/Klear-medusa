@@ -48,6 +48,31 @@ const LabJob = model.define("lab_job", {
   // When the readable prescription in packet_snapshot was blanked. Null
   // while the snapshot may still hold one. A rebuild (retry) clears this.
   rx_redacted_at: model.dateTime().nullable(),
+  // When the readable prescription was put back to start a warranty
+  // remake. Null on a job that never had one. See `rx-retention.ts`.
+  rx_restored_at: model.dateTime().nullable(),
+
+  // ── Production (see production.ts) ─────────────────────────────────────
+  // Where the physical job is. Null until the packet is built. A cache of
+  // the latest stage-changing row in production_event, written in the same
+  // transaction as that row; never written anywhere else.
+  stage: model.text().nullable(),
+  stage_since: model.dateTime().nullable(),
+  // Bumped on every stage change. An action names the version it saw and is
+  // refused if the job has moved since (remake loops revisit stages, so the
+  // stage alone cannot tell).
+  stage_version: model.number().default(0),
+  // The sequence number of the job's latest production event.
+  event_seq: model.number().default(0),
+  remake_count: model.number().default(0),
+  on_hold: model.boolean().default(false),
+  hold_reason: model.text().nullable(),
+  // A lens was issued and the job was then cancelled or its prescription
+  // changed: someone must say whether the lens had been cut.
+  cut_question_pending: model.boolean().default(false),
+  // The reason the next lens issue is booked under: order,
+  // spoilage_replacement or remake.
+  next_issue_reason: model.text().default("order"),
 })
   // ── DO NOT REMOVE ──────────────────────────────────────────────────────
   // This partial unique index is idempotency-critical: it is what stops two

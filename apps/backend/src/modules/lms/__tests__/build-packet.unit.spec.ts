@@ -1,4 +1,10 @@
 import { buildLabJobPacket } from "../build-packet";
+import { captureException } from "../../../lib/observability/sentry";
+
+jest.mock("../../../lib/observability/sentry", () => ({
+  captureException: jest.fn(),
+  captureMessage: jest.fn(),
+}));
 import { PRESCRIPTION_MODULE } from "../../prescription/service";
 import {
   RX_METADATA_SECRET_ENV,
@@ -442,6 +448,29 @@ describe("buildLabJobPacket — failed", () => {
     expect(result.reason).toBe("prescription decrypt failed");
   });
 
+  it("reports a decrypt failure to Sentry by its kind, never the error's own text", async () => {
+    // A parse error on the vault's answer quotes the start of the body, which
+    // for a decrypt is prescription data.
+    const reported = captureException as jest.Mock;
+    reported.mockClear();
+    const { container } = makeContainer({
+      order: order(),
+      decryptImpl: async () => {
+        throw new SyntaxError('Unexpected token in JSON at position 9: {"sphere_od":-2.25');
+      },
+    });
+    const result = await buildLabJobPacket({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container: container as any,
+      orderId: "order_abc",
+    });
+    expect(result.outcome).toBe("failed");
+    expect(reported).toHaveBeenCalledTimes(1);
+    const sent = reported.mock.calls[0][0] as Error;
+    expect(sent.message).toBe("build-packet decrypt failed: SyntaxError");
+    expect(`${sent.message}\n${sent.stack}`).not.toMatch(/sphere|-2\.25/);
+  });
+
   it("fails when the shipping address has no phone", async () => {
     const { container } = makeContainer({
       order: order({ shipping: { ...SHIPPING, phone: "" } }),
@@ -627,7 +656,7 @@ describe("buildLabJobPacket — the order is gone", () => {
       new MedusaError(MedusaError.Types.NOT_FOUND, "Order with id: order_x was not found"),
     );
     const r = await buildLabJobPacket({ container: container as never, orderId: "order_x" });
-    expect(r).toMatchObject({ outcome: "failed", reason: "order order_x not found" });
+    expect(r).toMatchObject({ outcome: "failed", reason: "the order was not found" });
   });
 
   it("any other order-module error still throws (infra, retried)", async () => {

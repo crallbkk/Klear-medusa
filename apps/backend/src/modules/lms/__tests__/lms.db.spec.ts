@@ -11,7 +11,13 @@ import { moduleIntegrationTestRunner } from "@medusajs/test-utils";
 import type LmsModuleService from "../service";
 import { LMS_MODULE } from "../service";
 import { TEST_DB_NAME, resetDatabase } from "./db-harness";
+import { productionSuite } from "./production.db-suite";
+import { releaseSuite } from "./release.db-suite";
+import { orderEventsSuite } from "./order-events.db-suite";
+import { screensSuite } from "./screens.db-suite";
 import { failedSaveSuite } from "./failed-save.db-suite";
+import { lensStockSuite } from "./lens-stock.db-suite";
+import { writeOffSuite } from "./write-off.db-suite";
 
 jest.setTimeout(120_000);
 
@@ -28,6 +34,12 @@ moduleIntegrationTestRunner<LmsModuleService>({
     },
   },
   testSuite: ({ service }) => {
+    productionSuite(service);
+    releaseSuite(service);
+    orderEventsSuite(service);
+    screensSuite(service);
     failedSaveSuite(service);
+    lensStockSuite(service);
+    writeOffSuite(service);
   },
 });

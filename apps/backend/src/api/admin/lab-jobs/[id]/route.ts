@@ -4,9 +4,12 @@ import type {
 } from "@medusajs/framework";
 import { LMS_MODULE } from "../../../../modules/lms/service";
 import type LmsModuleService from "../../../../modules/lms/service";
+import { jobFor } from "../production-http";
 
 /**
- * GET /admin/lab-jobs/[id] — retrieve a single lab job by id.
+ * GET /admin/lab-jobs/[id] — retrieve a single lab job by id, WITHOUT its
+ * packet (the decrypted prescription). The packet is shown, one view at a
+ * time and recorded, by `POST /admin/lab-jobs/[id]/packet`.
  * Returns 404 if not found.
  *
  * POST /admin/lab-jobs/[id]/retry — implemented in a sibling route.
@@ -29,7 +32,7 @@ export async function GET(
       res.status(404).json({ error: "lab_job not found" });
       return;
     }
-    res.json({ job });
+    res.json({ job: jobFor(req, job as unknown as Record<string, unknown>) });
   } catch {
     res.status(404).json({ error: "lab_job not found" });
   }

@@ -114,6 +114,43 @@ describe("POST /admin/lab-jobs/[id]/retry", () => {
     expect(mockBuild).not.toHaveBeenCalled();
   });
 
+  it("409s a job the lab has started on, without building a packet", async () => {
+    const lms = makeLms({
+      retrieveLabJob: jest.fn().mockResolvedValue({
+        id: "labjob_1",
+        order_id: "order_1",
+        status: "queued",
+        stage: "printed",
+      }),
+    });
+    const res = makeRes();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await POST(makeReq(lms) as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(mockBuild).not.toHaveBeenCalled();
+    expect(lms.updateJobFromBuild).not.toHaveBeenCalled();
+  });
+
+  it("409s (not 500) when the job moves into production while the packet is being built", async () => {
+    const { LabJobNotRebuildableError } = jest.requireActual(
+      "../../../../modules/lms/service",
+    );
+    const lms = makeLms({
+      updateJobFromBuild: jest
+        .fn()
+        .mockRejectedValue(new LabJobNotRebuildableError("in production")),
+    });
+    mockBuild.mockResolvedValue({
+      outcome: "pending_rx",
+      reason: "x",
+      snapshot: { job_ref: "klear-order_1", klear_order_id: "order_1" },
+    } as BuildPacketResult);
+    const res = makeRes();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await POST(makeReq(lms) as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(409);
+  });
+
   it("409s a job whose submission claim is in flight (submitting)", async () => {
     const lms = makeLms({
       retrieveLabJob: jest
@@ -193,7 +230,9 @@ describe("POST /admin/lab-jobs/[id]/retry", () => {
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({
         outcome: "pending_rx",
-        reason: "still awaiting Rx",
+        // A fixed sentence, not the builder's own text (that stays in the
+        // job's last_error).
+        reason: "the prescription has not arrived yet",
       }),
     );
   });
@@ -266,7 +305,7 @@ describe("POST /admin/lab-jobs/[id]/retry", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await POST(makeReq(lms) as any, res as any);
     expect(res.status).toHaveBeenCalledWith(500);
-    expect(res.json.mock.calls[0][0].error).toMatch(/could not be saved \(database error 23502/);
+    expect(res.json.mock.calls[0][0].error).toMatch(/\(database error 23502, constraint lab_job_status_check\)/);
     // Reported as itself, so Sentry keeps where it came from.
     const last = (captureException as jest.Mock).mock.calls.at(-1);
     expect(last[0]).toBeInstanceOf(ProductionWriteError);

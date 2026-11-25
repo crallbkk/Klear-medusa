@@ -2,6 +2,9 @@ import orderPlacedHandler from "../order-placed";
 import { LMS_MODULE } from "../../modules/lms/service";
 import { buildLabJobPacket } from "../../modules/lms/build-packet";
 import type { BuildPacketResult, LabJobPacket } from "../../modules/lms/types";
+import { captureException } from "../../lib/observability/sentry";
+
+jest.mock("../../lib/observability/sentry", () => ({ captureException: jest.fn() }));
 
 jest.mock("../../modules/lms/build-packet", () => ({
   buildLabJobPacket: jest.fn(),
@@ -136,6 +139,27 @@ describe("order-placed subscriber", () => {
     // The reason is stored on the job: a fixed sentence, not the error's text.
     expect(JSON.stringify(created[0])).not.toMatch(/exploded/);
     expect(lms.submitJob).not.toHaveBeenCalled();
+  });
+
+  it("logs and reports a failure by its kind, never the error's own text", async () => {
+    const leaky = () =>
+      Object.assign(new Error("insert into lab_job values ('LENS-SECRET-SKU', 'Somchai Secretname')"), {
+        code: "23505",
+      });
+    // The build throws (a failed row is kept); on another order the build
+    // is fine and the submit throws.
+    mockBuild.mockRejectedValueOnce(leaky());
+    await runHandler(makeLms());
+    mockBuild.mockResolvedValueOnce({ outcome: "ok", packet: PACKET } as BuildPacketResult);
+    await runHandler(makeLms({ submitJob: jest.fn().mockRejectedValue(leaky()) }), "order_2");
+    const logged = JSON.stringify((console.error as jest.Mock).mock.calls);
+    const sent = (captureException as jest.Mock).mock.calls
+      .map((c) => `${String(c[0]?.message)}\n${String(c[0]?.stack)}`)
+      .join("\n");
+    expect(captureException).toHaveBeenCalledTimes(2);
+    expect(logged).not.toMatch(/SECRET|Secretname|insert into/);
+    expect(sent).not.toMatch(/SECRET|Secretname|insert into/);
+    expect(logged).toContain("Error/23505");
   });
 
   it("does nothing when the event has no order id", async () => {

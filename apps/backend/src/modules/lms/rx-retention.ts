@@ -5,9 +5,11 @@
  * to cut the lenses. The canonical copy (Supabase `prescriptions`) is
  * encrypted and deleted after two years; this copy had no end of life at all.
  * It is only needed while the job can still be made, so it is blanked once
- * that is over. A job that needs it again gets it from the encrypted record
- * through the retry (rebuild) path, which works for `queued`, `failed` and
- * `pending_rx` jobs only. A `submitted` job cannot be rebuilt, so blanking
+ * that is over. A job that needs it again gets it from the encrypted record:
+ * through the retry (rebuild) path before the lab has started, or, for a
+ * labelled or delivered job, when a warranty remake is started (the writer
+ * puts it back and stamps `rx_restored_at`). Both work only for a packet
+ * that is ours to rewrite. A `submitted` job cannot be rebuilt, so blanking
  * one is final: after it, what was sent to the lab is on record only at the
  * lab.
  *
@@ -50,6 +52,43 @@ export interface RxRetentionJob {
   created_at: Date | string;
   updated_at?: Date | string | null;
   rx_redacted_at?: Date | string | null;
+  /** When the prescription was put back to start a warranty remake. */
+  rx_restored_at?: Date | string | null;
+  /** Production: where the physical job is, and since when. Read only for
+   *  a job with `rx_restored_at`. Absent on jobs that predate production. */
+  stage?: string | null;
+  stage_since?: Date | string | null;
+}
+
+/**
+ * A prescription put back for a warranty remake: keep it, blank it, or (no
+ * answer) leave it to the ordinary rules.
+ *
+ * By the order alone such a job is due to be blanked the night after: the
+ * order was delivered long ago, and the job may be older than the backstop.
+ * `rx_restored_at` says exactly that the prescription was put back to start
+ * a warranty remake; the production writer sets it then and nothing else
+ * does. From there:
+ *
+ *   delivered again   kept for the usual days after THAT delivery, which
+ *                     the job records itself (its `delivered` stage)
+ *   still being made  kept for the same number of days after it was put
+ *                     back, and no longer: moving the job between stages
+ *                     does not extend it. A remake takes days, not months.
+ *   cancelled in the lab, or a stamp that cannot be read: the ordinary rules
+ */
+function restoredForRemake(job: RxRetentionJob, nowMs: number): "keep" | "blank" | null {
+  if (!job.rx_restored_at || job.stage === "cancelled") return null;
+  const restoredMs = new Date(job.rx_restored_at).getTime();
+  if (!Number.isFinite(restoredMs)) return null;
+  const keepMs = RX_REDACT_AFTER_DELIVERY_DAYS * DAY_MS;
+  if (job.stage === "delivered" && job.stage_since) {
+    const againMs = new Date(job.stage_since).getTime();
+    if (Number.isFinite(againMs) && againMs >= restoredMs) {
+      return nowMs - againMs >= keepMs ? "blank" : "keep";
+    }
+  }
+  return nowMs - restoredMs >= keepMs ? "blank" : "keep";
 }
 
 /** What the order says, as far as retention cares. */
@@ -101,6 +140,9 @@ export function rxRedactionReason(
   if (job.status === "cancelled" || order.cancelled) return "cancelled";
 
   const nowMs = now.getTime();
+  const restored = restoredForRemake(job, nowMs);
+  if (restored === "keep") return null;
+  if (restored === "blank") return "delivered";
   if (order.deliveredAt) {
     const deliveredMs = order.deliveredAt.getTime();
     if (

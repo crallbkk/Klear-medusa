@@ -210,6 +210,23 @@ describe("redact-lab-job-rx scheduled job", () => {
     );
   });
 
+  it("logs and reports a failure by its kind, never the error's own text", async () => {
+    const leaky = () =>
+      Object.assign(new Error("select ... where sku = 'LENS-SECRET-SKU'"), { code: "57014" });
+    const { lms, run } = setup([cand("a", { status: "cancelled" })], leaky());
+    lms.redactJobRx.mockRejectedValue(leaky());
+    await run();
+    const logged = errorSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    const sent = (captureException as jest.Mock).mock.calls
+      .map((c) => `${String(c[0]?.message)}\n${String(c[0]?.stack)}`)
+      .join("\n");
+    // The order lookup and the job's own write: both failed.
+    expect(captureException).toHaveBeenCalledTimes(2);
+    expect(logged).not.toMatch(/SECRET|select/);
+    expect(sent).not.toMatch(/SECRET|select/);
+    expect(logged).toContain("Error/57014");
+  });
+
   it("looks orders up in batches of 100, each order once", async () => {
     const many = Array.from({ length: 230 }, (_, i) => cand(`j${i}`));
     // Two candidate rows naming one order must not double the id.
