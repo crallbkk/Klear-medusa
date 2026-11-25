@@ -135,6 +135,7 @@ describe("GET /admin/lab-jobs/[id]/production", () => {
       retry: false,
       rx_changed: false,
       warranty_remake: false,
+      write_off: [],
     });
 
     const working = makeRes();
@@ -165,6 +166,51 @@ describe("GET /admin/lab-jobs/[id]/production", () => {
       await call(production, makeReq(lmsFor(JOB, [...costs])), res);
       expect(res.json.mock.calls[0][0].actions.lab.includes("LAB_INVOICED")).toBe(offered);
     }
+  });
+
+  it("offers a write-off on each quote that is back and not invoiced, to ops only, never as a job-wide button", async () => {
+    const at = "2026-11-20T03:00:00.000Z";
+    const costs = [
+      { id: "labcost_sent", vendor: "Lab One", quoted_satang: 100, received_at: null, invoiced_satang: null, written_off_at: null },
+      { id: "labcost_back", vendor: "Lab One", quoted_satang: 200, received_at: at, invoiced_satang: null, written_off_at: null },
+      { id: "labcost_paid", vendor: "Lab One", quoted_satang: 300, received_at: at, invoiced_satang: 300, invoiced_at: at, written_off_at: null },
+      {
+        id: "labcost_off",
+        vendor: "Lab One",
+        quoted_satang: 400,
+        received_at: at,
+        invoiced_satang: null,
+        written_off_at: at,
+        written_off_by: "user_ops",
+        written_off_reason: "Somchai Secretname's remake",
+      },
+    ];
+    const mounted = { ...JOB, stage: "mounted" };
+    const res = makeRes();
+    await call(production, makeReq(lmsFor(mounted, costs)), res);
+    const body = res.json.mock.calls[0][0];
+    expect(body.actions.write_off).toEqual(["labcost_back"]);
+    expect(body.actions.ops).not.toContain("LAB_QUOTE_WRITTEN_OFF");
+    expect(body.actions.lab).not.toContain("LAB_QUOTE_WRITTEN_OFF");
+    // Ops sees who wrote a quote off, when, and why.
+    expect(body.costs.find((c: { id: string }) => c.id === "labcost_off")).toMatchObject({
+      written_off_by: "user_ops",
+      written_off_reason: "Somchai Secretname's remake",
+    });
+    // A cancelled job's quote can still be written off: the lab may never bill it.
+    const cancelled = makeRes();
+    await call(production, makeReq(lmsFor({ ...JOB, stage: "cancelled", status: "cancelled" }, costs)), cancelled);
+    expect(cancelled.json.mock.calls[0][0].actions.write_off).toEqual(["labcost_back"]);
+
+    // A lab account is offered none, and is not shown the reason. (Who did
+    // it is in the history, as for every step.)
+    const lab = makeRes();
+    await call(production, { ...makeReq(lmsFor(mounted, costs)), klear_lab_account: true }, lab);
+    const labBody = lab.json.mock.calls[0][0];
+    expect(labBody.actions.write_off).toEqual([]);
+    expect(JSON.stringify(labBody)).not.toMatch(/Secretname|written_off_reason/);
+    // It still sees that the quote was written off, and when.
+    expect(labBody.costs.find((c: { id: string }) => c.id === "labcost_off").written_off_at).toBe(at);
   });
 
   it("offers release, not hold, on a held job, and the cut answers on an open question", async () => {
@@ -221,6 +267,7 @@ describe("GET /admin/lab-jobs/[id]/production", () => {
       retry: true,
       rx_changed: false,
       warranty_remake: false,
+      write_off: [],
     });
   });
 });

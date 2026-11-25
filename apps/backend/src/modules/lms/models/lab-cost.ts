@@ -7,6 +7,9 @@ import { model } from "@medusajs/framework/utils";
  *
  * Stays inside the lab system: a cost tied to a job never crosses to Klear
  * Operations. Only totals per vendor do.
+ *
+ * States (`quoteState` in production.ts): sent, back and not invoiced,
+ * written off, invoiced.
  */
 const LabCost = model
   .define("lab_cost", {
@@ -19,6 +22,14 @@ const LabCost = model
     received_at: model.dateTime().nullable(),
     invoiced_satang: model.number().nullable(),
     invoiced_at: model.dateTime().nullable(),
+    // A quote whose work came back and that the lab will never invoice (a
+    // remake it does not bill). Who wrote it off, when, and why. The reason
+    // is free text and may name a customer: it stays on this row, never in
+    // an event, a log line, a report or the feed to Operations. A later
+    // invoice reverses the write-off and leaves these as they were.
+    written_off_at: model.dateTime().nullable(),
+    written_off_by: model.text().nullable(),
+    written_off_reason: model.text().nullable(),
   })
   .indexes([{ name: "IDX_lab_cost_job", on: ["lab_job_id"] }]);
 

@@ -28,6 +28,7 @@ import {
   bangkokDate,
   decide,
   packetForbids,
+  writeOffRefusal,
   type JobState,
   type ProductionAction,
   type Stage,
@@ -278,6 +279,13 @@ export type LabJobQueueRow = Pick<LabJobRow, (typeof QUEUE_COLUMNS)[number]>;
 /** The most jobs the report lists. */
 const REPORT_JOBS = 200;
 
+// The report's two quote states, as SQL over `lab_cost c`. The same states
+// as `quoteState` in production.ts. The second takes the period's first
+// day as a parameter.
+const BACK_NOT_INVOICED = `(c."received_at" is not null and c."invoiced_satang" is null and c."written_off_at" is null)`;
+const WRITTEN_OFF_IN_PERIOD = `(c."written_off_at" is not null and c."invoiced_satang" is null
+  and (c."written_off_at" at time zone 'Asia/Bangkok')::date >= cast(? as date))`;
+
 /** The lab's report: counts per week and per job. No SKU, no packet. */
 export type ProductionReport = {
   /** The first day covered, a Monday in Bangkok. */
@@ -295,6 +303,17 @@ export type ProductionReport = {
     /** Replacement lenses per lens issued for an order; null with none issued. */
     spoilage_rate: number | null;
     remake_rate: number | null;
+  }>;
+  /** Outside-lab quotes per lab, grouped as the release groups them and
+   *  named by the lab's most recent spelling. `back_not_invoiced`: work back, invoice awaited, whatever its
+   *  age. `written_off`: written off within the period and not invoiced
+   *  since. Counts and quoted amounts only; never a reason. */
+  quotes: Array<{
+    vendor: string;
+    back_not_invoiced: number;
+    back_not_invoiced_satang: number;
+    written_off: number;
+    written_off_satang: number;
   }>;
   /** True when more jobs used a lens in the period than are listed. */
   jobs_truncated: boolean;
@@ -322,6 +341,7 @@ export type ReleasedWindow = {
     as_of: string;
     quoted_uninvoiced_satang: number;
     invoiced_to_date_satang: number;
+    written_off_satang: number;
   }>;
 };
 
@@ -967,6 +987,15 @@ class LmsModuleService extends MedusaService({
         "expected_version is required to move a job",
       );
     }
+    // A write-off is a judgement made on what the screen showed, so it is
+    // held to the job's version like a step that moves the job.
+    const versioned = isStageAction || action === "LAB_QUOTE_WRITTEN_OFF";
+    if (versioned && !isStageAction && actor.type === "user" && input.expected_version === undefined) {
+      throw new ProductionError(
+        "invalid_detail",
+        "expected_version is required to write off a lab quote",
+      );
+    }
     if (typeof actor.id !== "string" || typeof job_id !== "string") {
       throw new ProductionError("invalid_detail", "ids must be text");
     }
@@ -991,7 +1020,7 @@ class LmsModuleService extends MedusaService({
       .digest("hex");
 
     try {
-      return await this.recordProductionAction_(input, isStageAction, happenedAt, requestHash);
+      return await this.recordProductionAction_(input, versioned, happenedAt, requestHash);
     } catch (err) {
       if (err instanceof ProductionError) throw err;
       throw new ProductionWriteError(err);
@@ -1007,7 +1036,7 @@ class LmsModuleService extends MedusaService({
    */
   private async recordProductionAction_(
     input: ProductionActionInput,
-    isStageAction: boolean,
+    versioned: boolean,
     happenedAt: Date | null,
     requestHash: string,
   ): Promise<ProductionActionResult> {
@@ -1042,7 +1071,7 @@ class LmsModuleService extends MedusaService({
       }
 
       if (
-        isStageAction &&
+        versioned &&
         input.expected_version !== undefined &&
         input.expected_version !== job.stage_version
       ) {
@@ -1088,6 +1117,73 @@ class LmsModuleService extends MedusaService({
       };
       const effect = decide(state, action, input.detail ?? {});
 
+      // The quote a write-off or an invoice lands on, read before anything
+      // is written so the event can say which. Quotes are written only
+      // here, under the job's lock, so what is read stays true until the
+      // write below.
+      let writeOffTarget: { id: string } | null = null;
+      if (effect.write_off_cost) {
+        const [quote] = await em.execute(
+          `select "id", "vendor", "quoted_satang", "received_at", "invoiced_satang", "written_off_at"
+             from "lab_cost" where "id" = ? and "lab_job_id" = ? and "deleted_at" is null`,
+          [effect.write_off_cost.lab_cost_id, job_id],
+        );
+        if (!quote) throw new ProductionError("quote_not_found", "this job has no such lab quote");
+        const refusal = writeOffRefusal(quote);
+        if (refusal) throw refusal;
+        writeOffTarget = { id: String(quote.id) };
+        effect.detail = {
+          ...effect.detail,
+          vendor: String(quote.vendor),
+          quoted_satang: Number(quote.quoted_satang),
+        };
+      }
+      let invoiceTarget: string | null = null;
+      if (effect.invoice_cost?.lab_cost_id) {
+        // The quote the person named: this job's, and not invoiced yet.
+        const [quote] = await em.execute(
+          `select "id", "received_at", "invoiced_satang", "written_off_at"
+             from "lab_cost" where "id" = ? and "lab_job_id" = ? and "deleted_at" is null`,
+          [effect.invoice_cost.lab_cost_id, job_id],
+        );
+        if (!quote) throw new ProductionError("quote_not_found", "this job has no such lab quote");
+        if (quote.invoiced_satang !== null) {
+          throw new ProductionError("quote_invoiced", "the lab's invoice for this quote is already recorded");
+        }
+        invoiceTarget = String(quote.id);
+        if (quote.written_off_at) {
+          effect.detail = { ...effect.detail, reversed_write_off: true };
+        }
+      } else if (effect.invoice_cost) {
+        // No quote named. Work that came back and is not written off, then
+        // work that came back and was written off (the lab billed it after
+        // all), then work that never came back (a job re-sent after a
+        // changed prescription leaves the first quote open); oldest first
+        // within each. With no write-off on the job this is the order it
+        // always was.
+        const [quote] = await em.execute(
+          `select "id", "written_off_at" from "lab_cost"
+            where "lab_job_id" = ? and "invoiced_satang" is null and "deleted_at" is null
+            order by ("received_at" is null) asc, ("written_off_at" is not null) asc,
+                     "created_at" asc, "id" asc
+            limit 1`,
+          [job_id],
+        );
+        if (!quote) {
+          throw new ProductionError(
+            "not_allowed",
+            "this job has no lab quote waiting for an invoice",
+          );
+        }
+        invoiceTarget = String(quote.id);
+        // The invoice reverses the write-off in this same step. The
+        // write-off stays on the quote as it was made; the history says it
+        // was reversed, and on which quote.
+        if (quote.written_off_at) {
+          effect.detail = { ...effect.detail, lab_cost_id: invoiceTarget, reversed_write_off: true };
+        }
+      }
+
       // An action that records usage or touches a lab quote shares the
       // release's lock (the release takes the exclusive side): the release
       // waits for it, and it waits for a release in progress. The clock is
@@ -1098,7 +1194,8 @@ class LmsModuleService extends MedusaService({
         effect.return_lenses ||
         effect.open_cost ||
         effect.receive_cost ||
-        effect.invoice_cost
+        effect.invoice_cost ||
+        effect.write_off_cost
       ) {
         await em.execute(`select pg_advisory_xact_lock_shared(hashtext('lms_usage_release'))`);
       }
@@ -1288,22 +1385,35 @@ class LmsModuleService extends MedusaService({
           );
         }
       }
-      if (effect.invoice_cost) {
-        // A quote whose work came back before one whose work did not (a
-        // job re-sent after a changed prescription leaves the first quote
-        // open and unreceived); within that, oldest first.
+      if (effect.invoice_cost && invoiceTarget) {
         const invoiced = await em.execute(
           `update "lab_cost" set "invoiced_satang" = ?, "invoiced_at" = ?, "updated_at" = ?
-            where "id" = (select "id" from "lab_cost"
-                           where "lab_job_id" = ? and "invoiced_satang" is null and "deleted_at" is null
-                           order by ("received_at" is null) asc, "created_at" asc, "id" asc limit 1)
+            where "id" = ? and "invoiced_satang" is null and "deleted_at" is null
             returning "id"`,
-          [effect.invoice_cost.invoiced_satang, now, now, job_id],
+          [effect.invoice_cost.invoiced_satang, now, now, invoiceTarget],
         );
         if (invoiced.length !== 1) {
           throw new ProductionError(
-            "not_allowed",
-            "this job has no lab quote waiting for an invoice",
+            "conflict",
+            "the lab quote changed while the invoice was being recorded; try again",
+          );
+        }
+      }
+      if (effect.write_off_cost && writeOffTarget) {
+        // Who and when, and the reason, on the quote and nowhere else. The
+        // reason is never logged, reported or served to Operations.
+        const written = await em.execute(
+          `update "lab_cost"
+              set "written_off_at" = ?, "written_off_by" = ?, "written_off_reason" = ?, "updated_at" = ?
+            where "id" = ? and "received_at" is not null and "invoiced_satang" is null
+              and "written_off_at" is null and "deleted_at" is null
+            returning "id"`,
+          [now, actor.id, effect.write_off_cost.reason, now, writeOffTarget.id],
+        );
+        if (written.length !== 1) {
+          throw new ProductionError(
+            "conflict",
+            "the lab quote changed while the write-off was being recorded; try again",
           );
         }
       }
@@ -1434,19 +1544,26 @@ class LmsModuleService extends MedusaService({
         await em.execute(
           `insert into "lab_total_day"
              ("id", "vendor", "as_of", "quoted_uninvoiced_satang", "invoiced_to_date_satang",
-              "created_at", "updated_at")
+              "written_off_satang", "created_at", "updated_at")
            select 'labtot_' || replace(gen_random_uuid()::text, '-', ''), c."vendor_key", ?,
+                  -- Back, not invoiced and not written off, at the cutoff.
                   coalesce(sum(c."quoted_satang") filter (
                     where c."received_at" < ?::timestamptz
-                      and (c."invoiced_at" is null or c."invoiced_at" >= ?::timestamptz)), 0)::int,
+                      and (c."invoiced_at" is null or c."invoiced_at" >= ?::timestamptz)
+                      and (c."written_off_at" is null or c."written_off_at" >= ?::timestamptz)), 0)::int,
                   coalesce(sum(c."invoiced_satang") filter (
                     where c."invoiced_at" < ?::timestamptz), 0)::int,
+                  -- Written off and not invoiced since, at the cutoff: the
+                  -- quoted value Operations should stop expecting an invoice for.
+                  coalesce(sum(c."quoted_satang") filter (
+                    where c."written_off_at" < ?::timestamptz
+                      and (c."invoiced_at" is null or c."invoiced_at" >= ?::timestamptz)), 0)::int,
                   ?, ?
              from (select *, lower(btrim(regexp_replace("vendor", '\\s+', ' ', 'g'))) as "vendor_key"
                      from "lab_cost") c
             where c."deleted_at" is null and c."created_at" < ?::timestamptz
             group by c."vendor_key"`,
-          [w.window_end, cutoff, cutoff, cutoff, now, now, cutoff],
+          [w.window_end, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, now, now, cutoff],
         );
       }
       return windows;
@@ -1504,7 +1621,14 @@ class LmsModuleService extends MedusaService({
     const totals = (await this.listLabTotalDays(
       { as_of: ends },
       {
-        select: ["id", "vendor", "as_of", "quoted_uninvoiced_satang", "invoiced_to_date_satang"],
+        select: [
+          "id",
+          "vendor",
+          "as_of",
+          "quoted_uninvoiced_satang",
+          "invoiced_to_date_satang",
+          "written_off_satang",
+        ],
         take: null,
         order: { id: "ASC" },
       },
@@ -1517,13 +1641,16 @@ class LmsModuleService extends MedusaService({
         .map(({ id, sku, reason, net_qty }) => ({ id, sku, reason, net_qty })),
       lab_totals: totals
         .filter((t) => t.as_of === w.window_end)
-        .map(({ id, vendor, as_of, quoted_uninvoiced_satang, invoiced_to_date_satang }) => ({
-          id,
-          vendor,
-          as_of,
-          quoted_uninvoiced_satang,
-          invoiced_to_date_satang,
-        })),
+        .map(
+          ({ id, vendor, as_of, quoted_uninvoiced_satang, invoiced_to_date_satang, written_off_satang }) => ({
+            id,
+            vendor,
+            as_of,
+            quoted_uninvoiced_satang,
+            invoiced_to_date_satang,
+            written_off_satang,
+          }),
+        ),
     }));
   }
 
@@ -1735,6 +1862,21 @@ class LmsModuleService extends MedusaService({
           limit ${REPORT_JOBS + 1}`,
         [from],
       );
+      const quotes = await em.execute(
+        `select (array_agg(c."vendor" order by c."created_at" desc, c."id" desc))[1] as "vendor",
+                (count(*) filter (where ${BACK_NOT_INVOICED}))::int as "back_not_invoiced",
+                coalesce(sum(c."quoted_satang") filter (where ${BACK_NOT_INVOICED}), 0)::int
+                  as "back_not_invoiced_satang",
+                (count(*) filter (where ${WRITTEN_OFF_IN_PERIOD}))::int as "written_off",
+                coalesce(sum(c."quoted_satang") filter (where ${WRITTEN_OFF_IN_PERIOD}), 0)::int
+                  as "written_off_satang"
+           from (select *, lower(btrim(regexp_replace("vendor", '\\s+', ' ', 'g'))) as "vendor_key"
+                   from "lab_cost" where "deleted_at" is null) c
+          group by c."vendor_key"
+         having count(*) filter (where ${BACK_NOT_INVOICED} or ${WRITTEN_OFF_IN_PERIOD}) > 0
+          order by c."vendor_key"`,
+        [from, from, from],
+      );
 
       const byWeek = new Map<string, ProductionReport["weeks"][number]>();
       const week = (start: string) => {
@@ -1776,6 +1918,13 @@ class LmsModuleService extends MedusaService({
       return {
         from,
         weeks: [...byWeek.values()].sort((a, b) => (a.week_start < b.week_start ? 1 : -1)),
+        quotes: quotes.map((r) => ({
+          vendor: String(r.vendor),
+          back_not_invoiced: Number(r.back_not_invoiced),
+          back_not_invoiced_satang: Number(r.back_not_invoiced_satang),
+          written_off: Number(r.written_off),
+          written_off_satang: Number(r.written_off_satang),
+        })),
         jobs_truncated: jobs.length > REPORT_JOBS,
         jobs: jobs.slice(0, REPORT_JOBS).map((r) => {
           const lenses_issued = Number(r.lenses_issued);

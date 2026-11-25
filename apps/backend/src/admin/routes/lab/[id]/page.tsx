@@ -7,6 +7,7 @@ import {
   Hint,
   Input,
   Label,
+  Select,
   Table,
   Text,
   Textarea,
@@ -25,10 +26,13 @@ import {
   failureMessage,
   fieldsFor,
   formatBaht,
+  invoiceCandidates,
+  invoiceQuoteChoice,
   jobTitle,
   keyFor,
   newKey,
   packetIsCurrent,
+  quoteLabel,
   requestIdentity,
   stageLabel,
   waited,
@@ -49,6 +53,8 @@ type JobResponse = {
     retry: boolean;
     rx_changed: boolean;
     warranty_remake: boolean;
+    /** Quotes the writer would let this person write off. */
+    write_off: string[];
   };
   vendors: string[];
 };
@@ -307,15 +313,23 @@ const JobScreen = ({ id }: { id: string }) => {
     },
   });
 
-  const press = async (action: string, door?: Step["door"]) => {
+  const press = async (action: string, door?: Step["door"], values: Record<string, string> = {}) => {
     if (!data) return;
     const step: Step = {
       action,
       door: door ?? (data.actions.ops.includes(action) ? "ops-actions" : "actions"),
       stage_version: data.job.stage_version,
       event_seq: data.job.event_seq,
-      values: {},
+      // Values the person does not type (the quote a write-off is for) are
+      // part of the request's identity, so another quote is another key.
+      values,
     };
+    if (action === "LAB_INVOICED") {
+      // The invoice names its quote. With one waiting it is that one; with
+      // several the form asks which.
+      const { lab_cost_id } = invoiceQuoteChoice("", invoiceCandidates(data.costs));
+      step.values = { ...step.values, lab_cost_id };
+    }
     if (fieldsFor(action).length > 0) {
       setForm(step);
       return;
@@ -335,6 +349,14 @@ const JobScreen = ({ id }: { id: string }) => {
 
   const submitForm = () => {
     if (!form) return;
+    if (
+      form.action === "LAB_INVOICED" &&
+      !form.values.lab_cost_id &&
+      invoiceQuoteChoice("", invoiceCandidates(data?.costs ?? [])).ask
+    ) {
+      setForm({ ...form, problem: "Choose the quote this invoice is for." });
+      return;
+    }
     const built = buildDetail(form.action, form.values);
     if (!built.ok) {
       setForm({ ...form, problem: built.message });
@@ -342,6 +364,15 @@ const JobScreen = ({ id }: { id: string }) => {
     }
     record.mutate({ ...form, detail: built.detail });
   };
+
+  // An open invoice form follows the quotes still waiting: they change when
+  // the job is re-read (someone else entered an invoice meanwhile).
+  useEffect(() => {
+    if (!form || form.action !== "LAB_INVOICED" || !data) return;
+    const chosen = form.values.lab_cost_id ?? "";
+    const { lab_cost_id } = invoiceQuoteChoice(chosen, invoiceCandidates(data.costs));
+    if (lab_cost_id !== chosen) setForm({ ...form, values: { ...form.values, lab_cost_id } });
+  }, [data, form]);
 
   // The packet is held in this screen's memory only, never in the query
   // cache, and is dropped when the screen closes or the packet stops being
@@ -631,6 +662,7 @@ const JobScreen = ({ id }: { id: string }) => {
                 <Table.HeaderCell className="text-right">Quoted</Table.HeaderCell>
                 <Table.HeaderCell className="text-right">Invoiced</Table.HeaderCell>
                 <Table.HeaderCell className="text-right">Difference</Table.HeaderCell>
+                <Table.HeaderCell>Written off</Table.HeaderCell>
               </Table.Row>
             </Table.Header>
             <Table.Body>
@@ -654,6 +686,33 @@ const JobScreen = ({ id }: { id: string }) => {
                         </Badge>
                       ) : (
                         formatBaht(diff)
+                      )}
+                    </Table.Cell>
+                    <Table.Cell>
+                      {c.written_off_at ? (
+                        <div className="flex flex-col">
+                          <Text size="small" leading="compact">
+                            {c.invoiced_satang === null ? "Written off" : "Written off, then invoiced"}{" "}
+                            {new Date(c.written_off_at).toLocaleDateString()}
+                            {c.written_off_by ? ` by ${c.written_off_by}` : ""}
+                          </Text>
+                          {c.written_off_reason ? (
+                            <Text size="small" leading="compact" className="text-ui-fg-subtle">
+                              {c.written_off_reason}
+                            </Text>
+                          ) : null}
+                        </div>
+                      ) : actions.write_off.includes(c.id) ? (
+                        <Button
+                          size="small"
+                          variant="secondary"
+                          disabled={busy}
+                          onClick={() => press("LAB_QUOTE_WRITTEN_OFF", "ops-actions", { lab_cost_id: c.id })}
+                        >
+                          {actionLabel("LAB_QUOTE_WRITTEN_OFF")}
+                        </Button>
+                      ) : (
+                        ""
                       )}
                     </Table.Cell>
                   </Table.Row>
@@ -701,6 +760,31 @@ const JobScreen = ({ id }: { id: string }) => {
             <Drawer.Description>Recorded in the job's history against your account.</Drawer.Description>
           </Drawer.Header>
           <Drawer.Body className="flex flex-col gap-4">
+            {form?.action === "LAB_INVOICED" &&
+            invoiceQuoteChoice(form.values.lab_cost_id ?? "", invoiceCandidates(costs)).ask ? (
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="lab-field-quote" size="small" weight="plus">
+                  Quote this invoice is for
+                </Label>
+                <Select
+                  value={form.values.lab_cost_id ?? ""}
+                  onValueChange={(v) =>
+                    setForm({ ...form, problem: undefined, values: { ...form.values, lab_cost_id: v } })
+                  }
+                >
+                  <Select.Trigger id="lab-field-quote">
+                    <Select.Value placeholder="Choose a quote" />
+                  </Select.Trigger>
+                  <Select.Content>
+                    {invoiceCandidates(costs).map((c) => (
+                      <Select.Item key={c.id} value={c.id}>
+                        {quoteLabel(c)}
+                      </Select.Item>
+                    ))}
+                  </Select.Content>
+                </Select>
+              </div>
+            ) : null}
             {form
               ? fieldsFor(form.action).map((field) => (
                   <FieldInput

@@ -8,6 +8,10 @@ import {
   failureMessage,
   formatBaht,
   fieldsFor,
+  invoiceCandidates,
+  invoiceQuoteChoice,
+  quoteLabel,
+  type LabCost,
   keyFor,
   newKey,
   NO_ANSWER,
@@ -63,6 +67,11 @@ const TYPED: Record<string, { values: Record<string, string>; on: JobState }> = 
   NOTE: { values: { text: "called the lab" }, on: state("edged") },
   HOLD: { values: { reason: "customer asked" }, on: state("edged") },
   RELEASE: { values: {}, on: state("edged", { on_hold: true }) },
+  // The quote is chosen on the screen (its row's button), not typed.
+  LAB_QUOTE_WRITTEN_OFF: {
+    values: { lab_cost_id: "labcost_01ABC", reason: "remake, not billed" },
+    on: state("cancelled"),
+  },
 };
 
 describe("a step's form becomes a request the production rules accept", () => {
@@ -113,6 +122,19 @@ describe("a step's form becomes a request the production rules accept", () => {
       detail: { sku: "KLR-1", reason: "hinge" },
     });
     expect(buildDetail("PACKED", { stray: "x" })).toEqual({ ok: true, detail: undefined });
+    // An invoice names its quote when the screen knows which one it is for.
+    expect(buildDetail("LAB_INVOICED", { invoiced: "1300", lab_cost_id: "labcost_01B" })).toEqual({
+      ok: true,
+      detail: { invoiced_satang: 130000, lab_cost_id: "labcost_01B" },
+    });
+    expect(buildDetail("LAB_INVOICED", { invoiced: "1300", lab_cost_id: "" })).toEqual({
+      ok: true,
+      detail: { invoiced_satang: 130000 },
+    });
+    expect(buildDetail("LAB_QUOTE_WRITTEN_OFF", TYPED.LAB_QUOTE_WRITTEN_OFF.values)).toEqual({
+      ok: true,
+      detail: { lab_cost_id: "labcost_01ABC", reason: "remake, not billed" },
+    });
   });
 
   it("names the field that is wrong instead of sending it", () => {
@@ -135,6 +157,61 @@ describe("a step's form becomes a request the production rules accept", () => {
     expect(wrong("NOTE", { text: "x".repeat(2000) })).toBe("sent");
     expect(wrong("NOTE", { text: "x".repeat(2001) })).toBe("text");
     expect(wrong("HOLD", {})).toBe("reason");
+    // A write-off's reason is short; the writer caps it at 300.
+    const quote = { lab_cost_id: "labcost_1" };
+    expect(wrong("LAB_QUOTE_WRITTEN_OFF", { ...quote, reason: "x".repeat(300) })).toBe("sent");
+    expect(wrong("LAB_QUOTE_WRITTEN_OFF", { ...quote, reason: "x".repeat(301) })).toBe("reason");
+    expect(wrong("LAB_QUOTE_WRITTEN_OFF", { ...quote, reason: "  " })).toBe("reason");
+    expect(wrong("LAB_QUOTE_WRITTEN_OFF", { reason: "remake" })).toBe("lab_cost_id");
+  });
+});
+
+describe("which quote an invoice is for", () => {
+  const at = "2026-11-20T03:00:00.000Z";
+  const cost = (over: Partial<LabCost>): LabCost => ({
+    id: "labcost_x",
+    vendor: "Lab One",
+    quoted_satang: 45000,
+    expected_on: null,
+    received_at: null,
+    invoiced_satang: null,
+    invoiced_at: null,
+    written_off_at: null,
+    ...over,
+  });
+
+  it("lists the quotes still waiting for an invoice, a written-off one included", () => {
+    const costs = [
+      cost({ id: "labcost_sent" }),
+      cost({ id: "labcost_paid", received_at: at, invoiced_satang: 1, invoiced_at: at }),
+      cost({ id: "labcost_off", received_at: at, written_off_at: at }),
+    ];
+    expect(invoiceCandidates(costs).map((c) => c.id)).toEqual(["labcost_sent", "labcost_off"]);
+  });
+
+  it("keeps the invoice form's quote in step with the quotes still waiting", () => {
+    const a = cost({ id: "labcost_a" });
+    const b = cost({ id: "labcost_b", received_at: at });
+    // Two waiting: the person chooses; a choice still waiting is kept.
+    expect(invoiceQuoteChoice("", [a, b])).toEqual({ lab_cost_id: "", ask: true });
+    expect(invoiceQuoteChoice("labcost_b", [a, b])).toEqual({ lab_cost_id: "labcost_b", ask: true });
+    // One of them was invoiced elsewhere while the form was open: the one
+    // left is the quote, nothing to choose.
+    expect(invoiceQuoteChoice("", [a])).toEqual({ lab_cost_id: "labcost_a", ask: false });
+    expect(invoiceQuoteChoice("labcost_b", [a])).toEqual({ lab_cost_id: "labcost_a", ask: false });
+    // A choice that is no longer waiting is cleared.
+    const c = cost({ id: "labcost_c" });
+    expect(invoiceQuoteChoice("labcost_b", [a, c])).toEqual({ lab_cost_id: "", ask: true });
+    // None left: nothing to name (the writer then refuses the invoice).
+    expect(invoiceQuoteChoice("labcost_a", [])).toEqual({ lab_cost_id: "", ask: false });
+  });
+
+  it("names each so a person can tell them apart", () => {
+    expect(quoteLabel(cost({}))).toBe("Lab One · quoted 450.00 · not back yet");
+    expect(quoteLabel(cost({ received_at: at }))).toBe("Lab One · quoted 450.00 · back");
+    expect(quoteLabel(cost({ received_at: at, written_off_at: at }))).toBe(
+      "Lab One · quoted 450.00 · written off",
+    );
   });
 });
 
@@ -248,6 +325,18 @@ describe("small things the screens show", () => {
       "frame KLR_1 swapped",
     );
     expect(eventSummary({ action: "QC_FAILED", detail: { reason: "axis_off" } })).toBe("axis_off");
+    expect(
+      eventSummary({
+        action: "LAB_QUOTE_WRITTEN_OFF",
+        detail: { lab_cost_id: "labcost_1", vendor: "Lab", quoted_satang: 45000 },
+      }),
+    ).toBe("Lab · quoted 450.00");
+    expect(
+      eventSummary({
+        action: "LAB_INVOICED",
+        detail: { invoiced_satang: 45000, lab_cost_id: "labcost_1", reversed_write_off: true },
+      }),
+    ).toBe("invoiced 450.00 · write-off reversed");
   });
 
   it("warns beside every box a person can type free text into", () => {

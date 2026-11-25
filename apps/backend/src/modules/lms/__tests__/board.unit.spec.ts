@@ -43,6 +43,7 @@ const GOOD: Partial<Record<ProductionAction, Record<string, unknown>>> = {
   LENS_RETURNED_UNUSED: { lenses: ["LENS-A"] },
   HOLD: { reason: "r" },
   LAB_INVOICED: { invoiced_satang: 1 },
+  LAB_QUOTE_WRITTEN_OFF: { lab_cost_id: "labcost_1", reason: "r" },
   NOTE: { text: "t" },
 };
 

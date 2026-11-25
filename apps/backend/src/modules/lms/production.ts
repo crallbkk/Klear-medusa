@@ -76,6 +76,7 @@ export const NOTE_ACTIONS = [
   "PACKET_VIEWED",
   "PACKET_PRINTED",
   "LAB_INVOICED",
+  "LAB_QUOTE_WRITTEN_OFF",
   "NOTE",
 ] as const;
 export const ACTIONS = [...STAGE_ACTIONS, ...NOTE_ACTIONS] as const;
@@ -106,7 +107,12 @@ export type ProductionErrorCode =
   | "invalid_detail" // the action's details are missing or malformed
   | "conflict" // someone else changed the job; re-read and try again
   | "not_found"
-  | "key_reused"; // the idempotency key belongs to a different action
+  | "key_reused" // the idempotency key belongs to a different action
+  // Writing off a lab quote (see `writeOffRefusal`):
+  | "quote_not_found" // no such quote on this job
+  | "quote_not_back" // the work has not come back from the lab
+  | "quote_invoiced" // the lab's invoice is recorded
+  | "quote_written_off"; // already written off
 
 export class ProductionError extends Error {
   readonly code: ProductionErrorCode;
@@ -143,8 +149,13 @@ export type Effect = {
   open_cost?: { vendor: string; quoted_satang: number; expected_on: string | null };
   /** RECEIVED_FROM_LAB: the open quote's work has come back. */
   receive_cost?: true;
-  /** LAB_INVOICED: the amount on the lab's invoice for this job. */
-  invoice_cost?: { invoiced_satang: number };
+  /** LAB_INVOICED: the amount on the lab's invoice for this job, and the
+   *  quote it is for when the person said which. */
+  invoice_cost?: { invoiced_satang: number; lab_cost_id?: string };
+  /** LAB_QUOTE_WRITTEN_OFF: the quote the lab will never invoice, and why.
+   *  The reason is stored on the quote only, never on the event: staff may
+   *  type a customer's name into it. */
+  write_off_cost?: { lab_cost_id: string; reason: string };
   /** LENS_RETURNED_UNUSED: the SKUs the operator is putting back on the
    *  shelf. The service checks each was issued on this job and not already
    *  returned; the rules cannot see earlier events. */
@@ -170,10 +181,22 @@ function text(detail: Record<string, unknown>, key: string, max = 500): string {
   if (typeof v !== "string" || v.trim() === "") {
     throw new ProductionError("invalid_detail", `"${key}" is required`);
   }
-  if (v.length > max) {
+  // Measured as stored: white space around the text does not count.
+  const trimmed = v.trim();
+  if (trimmed.length > max) {
     throw new ProductionError("invalid_detail", `"${key}" is longer than ${max} characters`);
   }
-  return v.trim();
+  return trimmed;
+}
+
+/** A lab quote's id from `detail`, or null when the key is absent. */
+function quoteId(detail: Record<string, unknown>, required: boolean): string | null {
+  const id = detail.lab_cost_id;
+  if (id === undefined && !required) return null;
+  if (typeof id !== "string" || !LAB_COST_ID.test(id)) {
+    throw new ProductionError("invalid_detail", `"lab_cost_id" must name one of this job's lab quotes`);
+  }
+  return id;
 }
 
 function sku(value: unknown, what: string): string {
@@ -210,6 +233,53 @@ function dateOrNull(detail: Record<string, unknown>, key: string): string | null
     throw new ProductionError("invalid_detail", `"${key}" must be a real date, YYYY-MM-DD`);
   }
   return v as string;
+}
+
+/** The longest reason a write-off takes. */
+export const WRITE_OFF_REASON_MAX = 300;
+
+/** A lab quote's id, as `generateEntityId` makes it. */
+const LAB_COST_ID = /^labcost_[A-Za-z0-9]{1,64}$/;
+
+/** The part of a lab quote (`lab_cost`) the rules read. */
+export type QuoteState = {
+  received_at: Date | string | null;
+  invoiced_satang: number | null;
+  written_off_at: Date | string | null;
+};
+
+/**
+ * Where an outside lab's quote stands:
+ *   sent               the work is at the lab
+ *   back_not_invoiced  the work came back; the lab's invoice is awaited
+ *   written_off        came back, and the lab will never invoice it
+ *   invoiced           the invoice is recorded (also one entered before the
+ *                      work was marked back, and one that came after a
+ *                      write-off: the invoice reverses it)
+ */
+export function quoteState(q: QuoteState): "sent" | "back_not_invoiced" | "written_off" | "invoiced" {
+  if (q.invoiced_satang !== null && q.invoiced_satang !== undefined) return "invoiced";
+  if (!q.received_at) return "sent";
+  return q.written_off_at ? "written_off" : "back_not_invoiced";
+}
+
+/**
+ * Why a quote cannot be written off, or null when it can. Only a quote
+ * that is back and not invoiced can. The writer asks this of the quote it
+ * has read under the job's lock; the job screen asks it of each quote it
+ * shows, so it offers the step exactly when the writer takes it.
+ */
+export function writeOffRefusal(q: QuoteState): ProductionError | null {
+  switch (quoteState(q)) {
+    case "back_not_invoiced":
+      return null;
+    case "sent":
+      return new ProductionError("quote_not_back", "the work on this quote has not come back from the lab");
+    case "invoiced":
+      return new ProductionError("quote_invoiced", "the lab's invoice for this quote is already recorded");
+    case "written_off":
+      return new ProductionError("quote_written_off", "this quote is already written off");
+  }
 }
 
 function refuse(action: ProductionAction, job: JobState): never {
@@ -458,7 +528,27 @@ export function decide(
 
     case "LAB_INVOICED": {
       const invoiced_satang = satang(detail, "invoiced_satang");
-      return { ...none, invoice_cost: { invoiced_satang }, detail: { invoiced_satang } };
+      // Optional: with several quotes open the person says which one the
+      // invoice is for; without it the writer chooses (see the service).
+      const id = quoteId(detail, false);
+      return id
+        ? {
+            ...none,
+            invoice_cost: { invoiced_satang, lab_cost_id: id },
+            detail: { invoiced_satang, lab_cost_id: id },
+          }
+        : { ...none, invoice_cost: { invoiced_satang }, detail: { invoiced_satang } };
+    }
+
+    case "LAB_QUOTE_WRITTEN_OFF": {
+      // Whether the quote can be written off is the quote's state
+      // (`writeOffRefusal`), read by the writer under the lock. A job's
+      // stage does not decide it: a cancelled job's lab work can come back
+      // and never be billed. A job never put into production has no quote.
+      if (job.stage === null) refuse(action, job);
+      const id = quoteId(detail, true) as string;
+      const reason = text(detail, "reason", WRITE_OFF_REASON_MAX);
+      return { ...none, write_off_cost: { lab_cost_id: id, reason }, detail: { lab_cost_id: id } };
     }
 
     case "NOTE":
@@ -478,6 +568,7 @@ const SAMPLE_DETAIL: Partial<Record<ProductionAction, Record<string, unknown>>> 
   LENS_RETURNED_UNUSED: { lenses: ["SAMPLE"] },
   HOLD: { reason: "sample" },
   LAB_INVOICED: { invoiced_satang: 0 },
+  LAB_QUOTE_WRITTEN_OFF: { lab_cost_id: "labcost_SAMPLE", reason: "sample" },
   NOTE: { text: "sample" },
 };
 
@@ -548,8 +639,9 @@ export function packetForbids(
 
 /** Would the writer accept this action on the job as it stands, given good
  *  details? True for system actions too; who may record it is not asked.
- *  (Two things only the database knows are not asked either: whether a lab
- *  quote is waiting for an invoice, and which lenses were issued.) */
+ *  (Three things only the database knows are not asked either: whether a
+ *  lab quote is waiting for an invoice, whether a quote can be written off
+ *  (`writeOffRefusal`), and which lenses were issued.) */
 export function wouldAccept(job: JobState & PacketState, action: ProductionAction): boolean {
   if (packetForbids(job, action) !== null) return false;
   try {

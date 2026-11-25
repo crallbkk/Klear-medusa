@@ -380,6 +380,7 @@ export function releaseSuite(service: LmsModuleService): void {
               "invoiced_to_date_satang",
               "quoted_uninvoiced_satang",
               "vendor",
+              "written_off_satang",
             ]);
           }
         }

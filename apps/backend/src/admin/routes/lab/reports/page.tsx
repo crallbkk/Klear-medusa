@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { sdk } from "../../../lib/client";
-import { failureMessage, jobTitle, percent, stageLabel } from "../../../lib/lab";
+import { failureMessage, formatBaht, jobTitle, percent, stageLabel } from "../../../lib/lab";
 
 type Report = {
   from: string;
@@ -18,6 +18,13 @@ type Report = {
     remakes_started: number;
     spoilage_rate: number | null;
     remake_rate: number | null;
+  }>;
+  quotes: Array<{
+    vendor: string;
+    back_not_invoiced: number;
+    back_not_invoiced_satang: number;
+    written_off: number;
+    written_off_satang: number;
   }>;
   jobs_truncated: boolean;
   jobs: Array<{
@@ -130,6 +137,49 @@ const LabReportsPage = () => {
                     <Table.Cell className="text-right">{w.frames_spoiled}</Table.Cell>
                     <Table.Cell className="text-right">{w.qc_failed}</Table.Cell>
                     <Table.Cell className="text-right">{w.remakes_started}</Table.Cell>
+                  </Table.Row>
+                ))}
+              </Table.Body>
+            </Table>
+          )}
+        </Container>
+      ) : null}
+
+      {data ? (
+        <Container className="divide-y p-0">
+          <div className="px-6 py-4">
+            <Heading level="h2">Outside lab quotes</Heading>
+            <Text size="small" leading="compact" className="text-ui-fg-subtle">
+              Back, not invoiced: work that came back and whose invoice is still awaited, however old. Written off:
+              quotes written off in this period because the lab will not invoice them, and not invoiced since. Quoted
+              amounts, in baht.
+            </Text>
+          </div>
+          {data.quotes.length === 0 ? (
+            <div className="px-6 py-4">
+              <Text size="small" className="text-ui-fg-subtle">
+                No quote is waiting for an invoice, and none was written off in this period.
+              </Text>
+            </div>
+          ) : (
+            <Table>
+              <Table.Header>
+                <Table.Row>
+                  <Table.HeaderCell>Lab</Table.HeaderCell>
+                  <Table.HeaderCell className="text-right">Back, not invoiced</Table.HeaderCell>
+                  <Table.HeaderCell className="text-right">Quoted</Table.HeaderCell>
+                  <Table.HeaderCell className="text-right">Written off</Table.HeaderCell>
+                  <Table.HeaderCell className="text-right">Quoted</Table.HeaderCell>
+                </Table.Row>
+              </Table.Header>
+              <Table.Body>
+                {data.quotes.map((q) => (
+                  <Table.Row key={q.vendor}>
+                    <Table.Cell>{q.vendor}</Table.Cell>
+                    <Table.Cell className="text-right">{q.back_not_invoiced}</Table.Cell>
+                    <Table.Cell className="text-right">{formatBaht(q.back_not_invoiced_satang)}</Table.Cell>
+                    <Table.Cell className="text-right">{q.written_off}</Table.Cell>
+                    <Table.Cell className="text-right">{formatBaht(q.written_off_satang)}</Table.Cell>
                   </Table.Row>
                 ))}
               </Table.Body>

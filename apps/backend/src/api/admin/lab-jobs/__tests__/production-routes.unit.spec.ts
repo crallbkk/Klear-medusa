@@ -222,6 +222,7 @@ describe("POST /admin/lab-jobs/[id]/ops-actions", () => {
     for (const [action, status] of [
       ["HOLD", undefined],
       ["RELEASE", undefined],
+      ["LAB_QUOTE_WRITTEN_OFF", undefined],
       ["PRINTED", 400],
       ["CANCELLED", 400],
     ] as const) {
@@ -230,7 +231,74 @@ describe("POST /admin/lab-jobs/[id]/ops-actions", () => {
       if (status) expect(res.status).toHaveBeenCalledWith(status);
       else expect(res.status).not.toHaveBeenCalled();
     }
-    expect(lms.applyProductionAction).toHaveBeenCalledTimes(2);
+    expect(lms.applyProductionAction).toHaveBeenCalledTimes(3);
+  });
+
+  it("is the only door for a write-off: the lab's own route refuses it", async () => {
+    // A write-off is a judgement about money. The lab records an invoice
+    // (`/actions`); only an ordinary admin account writes a quote off, and
+    // the lab gate keeps a lab account away from this route.
+    expect(OPS_ACTIONS.has("LAB_QUOTE_WRITTEN_OFF")).toBe(true);
+    expect(LAB_ACTIONS.has("LAB_QUOTE_WRITTEN_OFF")).toBe(false);
+    const lms = { applyProductionAction: jest.fn() };
+    const res = makeRes();
+    await call(
+      actions,
+      makeReq(lms, {
+        action: "LAB_QUOTE_WRITTEN_OFF",
+        idempotency_key: "key-0000001",
+        detail: { lab_cost_id: "labcost_1", reason: "x" },
+      }),
+      res,
+    );
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(lms.applyProductionAction).not.toHaveBeenCalled();
+  });
+
+  it("answers each write-off refusal with its own code, and never echoes the reason on a fault", async () => {
+    for (const [code, status] of [
+      ["quote_not_found", 404],
+      ["quote_not_back", 409],
+      ["quote_invoiced", 409],
+      ["quote_written_off", 409],
+    ] as const) {
+      const lms = {
+        applyProductionAction: jest.fn().mockRejectedValue(new ProductionError(code, "a plain sentence")),
+      };
+      const res = makeRes();
+      await call(
+        opsActions,
+        makeReq(lms, {
+          action: "LAB_QUOTE_WRITTEN_OFF",
+          idempotency_key: "key-0000001",
+          detail: { lab_cost_id: "labcost_1", reason: "Somchai Secretname asked" },
+        }),
+        res,
+      );
+      expect([code, res.status.mock.calls[0]?.[0]]).toEqual([code, status]);
+      expect(res.json).toHaveBeenCalledWith({ type: code, message: "a plain sentence" });
+    }
+    // A database failure whose own text holds the reason, as a driver's does.
+    const driverError = Object.assign(
+      new Error(`forced failure: Remake for Somchai Secretname, the lab does not bill it`),
+      { code: "P0001" },
+    );
+    expect(driverError.message).toMatch(/Secretname/);
+    const lms = { applyProductionAction: jest.fn().mockRejectedValue(new ProductionWriteError(driverError)) };
+    const res = makeRes();
+    await call(
+      opsActions,
+      makeReq(lms, {
+        action: "LAB_QUOTE_WRITTEN_OFF",
+        idempotency_key: "key-0000001",
+        detail: { lab_cost_id: "labcost_1", reason: "Somchai Secretname asked" },
+      }),
+      res,
+    );
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(sent(res)).not.toMatch(/Secretname/);
+    expect(reported()).not.toMatch(/Secretname/);
+    expect(JSON.stringify((console.error as jest.Mock).mock.calls)).not.toMatch(/Secretname/);
   });
 });
 

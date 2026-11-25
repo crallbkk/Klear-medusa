@@ -242,6 +242,87 @@ medusaIntegrationTestRunner({
         expect(JSON.stringify((await call("GET", "/admin/lab-queue", owner)).data)).toContain(ORDER);
       });
 
+      it("cannot write off a lab quote, which an ordinary admin account can", async () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const lms = getContainer().resolve(LMS_MODULE) as any;
+        const made = await lms.createFromBuild({
+          outcome: "ok",
+          packet: {
+            job_ref: "klear-order_writeoff",
+            klear_order_id: "order_writeoff",
+            frame_sku: "KLR-1",
+            lens_type: "non_prescription",
+            lens_index: null,
+            coating_addons: [],
+            prescription: null,
+            customer: {
+              name: "A B",
+              phone: "+66800000000",
+              delivery_address: { line1: "x", city: "c", province: "p", postal_code: "10110", country_code: "TH" },
+            },
+            submitted_at: new Date().toISOString(),
+          },
+        });
+        const id = made.id as string;
+        let step = 0;
+        for (const [action, detail] of [
+          ["PRINTED", undefined],
+          ["SENT_TO_LAB", { vendor: "Lab One", quoted_satang: 45000 }],
+          ["RECEIVED_FROM_LAB", undefined],
+        ] as const) {
+          const job = await lms.retrieveLabJob(id);
+          await lms.applyProductionAction({
+            job_id: id,
+            action,
+            idempotency_key: `http-wo-setup-${++step}`,
+            expected_version: job.stage_version,
+            actor: { type: "user", id: "user_setup" },
+            detail,
+          });
+        }
+        const [quote] = await lms.listLabCosts({ lab_job_id: id });
+        const REASON = "Somchai Secretname's remake, not billed";
+        const body = async (k: string) => ({
+          action: "LAB_QUOTE_WRITTEN_OFF",
+          idempotency_key: k,
+          expected_version: (await lms.retrieveLabJob(id)).stage_version,
+          detail: { lab_cost_id: quote.id, reason: REASON },
+        });
+        const post = async (url: string, data: object, auth: { headers: Record<string, string> }) =>
+          api.request({ method: "POST", url, data, ...auth, validateStatus: () => true });
+
+        // The lab account: refused by the gate on the ops route, and the
+        // lab's own route does not take the step at all.
+        const byGate = await post(`/admin/lab-jobs/${id}/ops-actions`, await body("http-wo-lab-1"), lab);
+        expect([byGate.status, byGate.data?.message]).toEqual([403, REFUSAL]);
+        const byLabRoute = await post(`/admin/lab-jobs/${id}/actions`, await body("http-wo-lab-2"), lab);
+        expect(byLabRoute.status).toBe(400);
+        const labView = await call("GET", `/admin/lab-jobs/${id}/production`, lab);
+        expect(labView.data.actions.write_off).toEqual([]);
+        expect((await lms.listLabCosts({ lab_job_id: id }))[0].written_off_at).toBeNull();
+
+        // The owner is offered it on that quote, records it, and a repeat is a replay.
+        const ownerView = await call("GET", `/admin/lab-jobs/${id}/production`, owner);
+        expect(ownerView.data.actions.write_off).toEqual([quote.id]);
+        const first = await post(`/admin/lab-jobs/${id}/ops-actions`, await body("http-wo-owner-1"), owner);
+        expect([first.status, first.data.replayed]).toEqual([200, false]);
+        const again = await post(`/admin/lab-jobs/${id}/ops-actions`, await body("http-wo-owner-1"), owner);
+        expect([again.status, again.data.replayed]).toEqual([200, true]);
+        const twice = await post(`/admin/lab-jobs/${id}/ops-actions`, await body("http-wo-owner-2"), owner);
+        expect([twice.status, twice.data.type]).toEqual([409, "quote_written_off"]);
+        const me = (await call("GET", "/admin/users/me", owner)).data.user;
+        expect((await lms.listLabCosts({ lab_job_id: id }))[0]).toMatchObject({
+          written_off_by: me.id,
+          written_off_reason: REASON,
+        });
+        expect(JSON.stringify(first.data)).not.toMatch(/Secretname/);
+        // The lab account sees that it was written off, never why. (Who did
+        // it is in the history, as for every step.)
+        const after = await call("GET", `/admin/lab-jobs/${id}/production`, lab);
+        expect(after.data.costs[0].written_off_at).not.toBeNull();
+        expect(JSON.stringify(after.data)).not.toMatch(/Secretname|written_off_reason/);
+      });
+
       it("is refused, by this check, on every admin route except the ones listed for it", async () => {
         expect(ALL_ADMIN.length).toBeGreaterThan(250);
         const wrong: string[] = [];

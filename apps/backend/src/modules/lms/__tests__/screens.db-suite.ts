@@ -220,8 +220,14 @@ export function screensSuite(service: LmsModuleService): void {
     };
     // Refusals that depend on rows the offer cannot see from the job alone:
     // a lab quote (the route adds that check itself) and which lenses were
-    // issued. Everything else must agree exactly.
-    const NEEDS_OTHER_ROWS = new Set(["LAB_INVOICED", "RECEIVED_FROM_LAB", "LENS_RETURNED_UNUSED"]);
+    // issued. Everything else must agree exactly. A write-off is offered per
+    // quote; `write-off.db-suite.ts` walks it against the writer.
+    const NEEDS_OTHER_ROWS = new Set([
+      "LAB_INVOICED",
+      "RECEIVED_FROM_LAB",
+      "LENS_RETURNED_UNUSED",
+      "LAB_QUOTE_WRITTEN_OFF",
+    ]);
 
     it("offers a step exactly when the writer records it, across stages and packet states", async () => {
       const made = await service.createFromBuild(ok("order_walk"));
@@ -760,6 +766,7 @@ export function screensSuite(service: LmsModuleService): void {
       expect(await service.productionReport(12, NOW)).toEqual({
         from: expect.any(String),
         weeks: [],
+        quotes: [],
         jobs: [],
         jobs_truncated: false,
       });

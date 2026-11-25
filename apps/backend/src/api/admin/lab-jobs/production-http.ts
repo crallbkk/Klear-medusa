@@ -22,7 +22,8 @@ import { isLabAccount } from "../lab-gate";
  *
  *   lab_job:read     see the queue, a job's history, and (logged) its packet
  *   lab_job:update   record the lab's own steps
- *   lab_job_ops:update  hold and release, a changed prescription, retry
+ *   lab_job_ops:update  hold and release, a changed prescription, retry,
+ *                       writing off a lab quote
  */
 export const LAB_READ = { resource: "lab_job", operation: "read" };
 export const LAB_ACT = { resource: "lab_job", operation: "update" };
@@ -49,10 +50,13 @@ export const LAB_ACTIONS: ReadonlySet<ProductionAction> = new Set<ProductionActi
   "NOTE",
 ]);
 
-/** What needs the ops permission, through `/ops-actions`. */
+/** What needs the ops permission, through `/ops-actions`. A lab account
+ *  cannot reach that route (`lab-gate.ts`). Writing off a lab quote is a
+ *  judgement about money, so it is here and not with the lab's invoice. */
 export const OPS_ACTIONS: ReadonlySet<ProductionAction> = new Set<ProductionAction>([
   "HOLD",
   "RELEASE",
+  "LAB_QUOTE_WRITTEN_OFF",
 ]);
 
 for (const a of [...LAB_ACTIONS, ...OPS_ACTIONS]) {
@@ -142,6 +146,10 @@ const STATUS: Record<string, number> = {
   not_allowed: 409,
   key_reused: 409,
   invalid_detail: 400,
+  quote_not_found: 404,
+  quote_not_back: 409,
+  quote_invoiced: 409,
+  quote_written_off: 409,
 };
 
 /**

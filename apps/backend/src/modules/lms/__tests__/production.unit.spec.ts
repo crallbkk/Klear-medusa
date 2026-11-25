@@ -3,10 +3,14 @@ import {
   STAGES,
   STAGE_ACTIONS,
   ProductionError,
+  WRITE_OFF_REASON_MAX,
   bangkokDate,
   decide,
+  quoteState,
+  writeOffRefusal,
   type JobState,
   type ProductionAction,
+  type QuoteState,
   type Stage,
 } from "../production";
 
@@ -87,7 +91,113 @@ describe("production rules: the transition table", () => {
 
   it("covers every action the module declares", () => {
     expect(Object.keys(TABLE).sort()).toEqual([...STAGE_ACTIONS].sort());
-    expect(ACTIONS.length).toBe(STAGE_ACTIONS.length + 9);
+    expect(ACTIONS.length).toBe(STAGE_ACTIONS.length + 10);
+  });
+});
+
+describe("production rules: writing off a lab quote", () => {
+  const good = { lab_cost_id: "labcost_01ABC", reason: "  remake, the lab does not bill it  " };
+
+  it("names the quote and keeps the reason off the event", () => {
+    const effect = decide(job("mounted"), "LAB_QUOTE_WRITTEN_OFF", good);
+    expect(effect.to_stage).toBeUndefined();
+    expect(effect.patch).toEqual({});
+    expect(effect.usage).toEqual([]);
+    expect(effect.write_off_cost).toEqual({
+      lab_cost_id: "labcost_01ABC",
+      reason: "remake, the lab does not bill it",
+    });
+    // The reason is about the quote and is stored on it, not in the
+    // history a lab account reads.
+    expect(effect.detail).toEqual({ lab_cost_id: "labcost_01ABC" });
+    expect(JSON.stringify(effect.detail)).not.toMatch(/remake/);
+  });
+
+  it("is possible at any stage once the job is in production, cancelled and on hold included", () => {
+    for (const stage of STAGES) {
+      expect(() => decide(job(stage), "LAB_QUOTE_WRITTEN_OFF", good)).not.toThrow();
+    }
+    expect(() => decide(job("edged", { on_hold: true }), "LAB_QUOTE_WRITTEN_OFF", good)).not.toThrow();
+    expect(() => decide(job(null), "LAB_QUOTE_WRITTEN_OFF", good)).toThrow(ProductionError);
+  });
+
+  it("needs a quote and a reason that is short, trimmed and not empty", () => {
+    for (const bad of [
+      { reason: "x" },
+      { lab_cost_id: "", reason: "x" },
+      { lab_cost_id: 42, reason: "x" },
+      { lab_cost_id: "labjob_01ABC", reason: "x" },
+      { lab_cost_id: "labcost_01ABC" },
+      { lab_cost_id: "labcost_01ABC", reason: "   " },
+      { lab_cost_id: "labcost_01ABC", reason: 7 },
+      { lab_cost_id: "labcost_01ABC", reason: "x".repeat(WRITE_OFF_REASON_MAX + 1) },
+    ]) {
+      let caught: unknown;
+      try {
+        decide(job("mounted"), "LAB_QUOTE_WRITTEN_OFF", bad);
+      } catch (err) {
+        caught = err;
+      }
+      expect([bad, (caught as ProductionError)?.code]).toEqual([bad, "invalid_detail"]);
+    }
+    expect(() =>
+      decide(job("mounted"), "LAB_QUOTE_WRITTEN_OFF", {
+        lab_cost_id: "labcost_01ABC",
+        reason: "x".repeat(WRITE_OFF_REASON_MAX),
+      }),
+    ).not.toThrow();
+  });
+
+  it("measures the reason after trimming it", () => {
+    const padded = `  ${"x".repeat(WRITE_OFF_REASON_MAX)}  `;
+    expect(
+      decide(job("mounted"), "LAB_QUOTE_WRITTEN_OFF", { lab_cost_id: "labcost_1", reason: padded }).write_off_cost
+        ?.reason,
+    ).toBe("x".repeat(WRITE_OFF_REASON_MAX));
+    expect(() =>
+      decide(job("mounted"), "LAB_QUOTE_WRITTEN_OFF", {
+        lab_cost_id: "labcost_1",
+        reason: ` ${"x".repeat(WRITE_OFF_REASON_MAX + 1)} `,
+      }),
+    ).toThrow(ProductionError);
+    // Every free-text field is measured the same way.
+    expect(decide(job("ready"), "NOTE", { text: ` ${"n".repeat(2000)} ` }).detail).toEqual({
+      text: "n".repeat(2000),
+    });
+    expect(decide(job("mounted"), "QC_FAILED", { reason: ` ${"q".repeat(500)} ` }).detail).toEqual({
+      reason: "q".repeat(500),
+    });
+  });
+
+  it("allows it only from 'back, not invoiced', and says why not otherwise", () => {
+    const at = new Date("2026-11-20T03:00:00Z");
+    const q = (over: Partial<QuoteState>): QuoteState => ({
+      received_at: null,
+      invoiced_satang: null,
+      written_off_at: null,
+      ...over,
+    });
+    expect(quoteState(q({}))).toBe("sent");
+    expect(quoteState(q({ received_at: at }))).toBe("back_not_invoiced");
+    expect(quoteState(q({ received_at: at, written_off_at: at }))).toBe("written_off");
+    expect(quoteState(q({ received_at: at, invoiced_satang: 0 }))).toBe("invoiced");
+    // An invoice entered before the work was marked back.
+    expect(quoteState(q({ invoiced_satang: 100 }))).toBe("invoiced");
+    // An invoice that came after a write-off reversed it.
+    expect(quoteState(q({ received_at: at, written_off_at: at, invoiced_satang: 100 }))).toBe("invoiced");
+
+    expect(writeOffRefusal(q({ received_at: at }))).toBeNull();
+    for (const [quote, code] of [
+      [q({}), "quote_not_back"],
+      [q({ received_at: at, invoiced_satang: 100 }), "quote_invoiced"],
+      [q({ invoiced_satang: 100 }), "quote_invoiced"],
+      [q({ received_at: at, written_off_at: at }), "quote_written_off"],
+      [q({ received_at: at, written_off_at: at, invoiced_satang: 1 }), "quote_invoiced"],
+    ] as const) {
+      const refusal = writeOffRefusal(quote);
+      expect(refusal).toBeInstanceOf(ProductionError);
+      expect([quote, refusal?.code]).toEqual([quote, code]);
+    }
   });
 });
 
@@ -222,6 +332,27 @@ describe("production rules: an open cut-or-uncut question", () => {
   });
 });
 
+describe("production rules: a lab invoice", () => {
+  it("may name the quote it is for, and otherwise leaves the choice to the writer", () => {
+    expect(decide(job("mounted"), "LAB_INVOICED", { invoiced_satang: 100 })).toMatchObject({
+      invoice_cost: { invoiced_satang: 100 },
+      detail: { invoiced_satang: 100 },
+    });
+    expect(decide(job("mounted"), "LAB_INVOICED", { invoiced_satang: 100 }).invoice_cost?.lab_cost_id).toBeUndefined();
+    expect(
+      decide(job("mounted"), "LAB_INVOICED", { invoiced_satang: 100, lab_cost_id: "labcost_01B" }),
+    ).toMatchObject({
+      invoice_cost: { invoiced_satang: 100, lab_cost_id: "labcost_01B" },
+      detail: { invoiced_satang: 100, lab_cost_id: "labcost_01B" },
+    });
+    for (const lab_cost_id of ["", "labjob_1", 7, null]) {
+      expect(() => decide(job("mounted"), "LAB_INVOICED", { invoiced_satang: 1, lab_cost_id })).toThrow(
+        ProductionError,
+      );
+    }
+  });
+});
+
 describe("production rules: a job on hold", () => {
   it("refuses every step a person takes that moves the job, until it is released", () => {
     for (const [action, t] of Object.entries(TABLE) as [ProductionAction, (typeof TABLE)["READY"]][]) {
@@ -241,6 +372,9 @@ describe("production rules: a job on hold", () => {
   it("still takes a note, a broken frame, a lab invoice and the release itself", () => {
     const held = job("edged", { on_hold: true });
     expect(() => decide(held, "NOTE", { text: "t" })).not.toThrow();
+    expect(() =>
+      decide(held, "LAB_QUOTE_WRITTEN_OFF", { lab_cost_id: "labcost_1", reason: "r" }),
+    ).not.toThrow();
     expect(() => decide(held, "FRAME_DAMAGED", { sku: "KLR-1", reason: "r" })).not.toThrow();
     expect(() => decide(held, "LAB_INVOICED", { invoiced_satang: 1 })).not.toThrow();
     expect(decide(held, "RELEASE").patch).toEqual({ on_hold: false, hold_reason: null });

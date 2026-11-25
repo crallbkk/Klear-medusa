@@ -243,7 +243,41 @@ packet builds, and moves from there only through
 5. **Lens and frame usage** is `lab_usage`, one row per piece, with the
    reason operations books it under (`order`, `spoilage_replacement`,
    `remake`, `spoilage`, `return_unused`).
-6. **An outside lab's quote** is `lab_cost`, one row per send.
+6. **An outside lab's quote** is `lab_cost`, one row per send. Its states
+   (`quoteState` in `production.ts`): sent, back and not invoiced, written
+   off, invoiced.
+   1. **Written off** (`LAB_QUOTE_WRITTEN_OFF`, owner's decision of
+      2026-11-21): a quote whose work came back and that the lab will never
+      invoice (a remake it does not bill). Recorded through the writer like
+      every other step, through `POST /admin/lab-jobs/:id/ops-actions` with
+      `detail: { lab_cost_id, reason }` and `expected_version`. The pure
+      rule `writeOffRefusal` allows it only from "back, not invoiced" and
+      refuses with `quote_not_back`, `quote_invoiced` or
+      `quote_written_off` (409), or `quote_not_found` (404) for a quote
+      that is not this job's. A repeated key answers as a replay.
+   2. It does not depend on the job's stage: a cancelled or held job's lab
+      work can come back and never be billed. It needs a stage (a job never
+      in production has no quote).
+   3. **Who, when and why** are on the quote (`written_off_by`,
+      `written_off_at`, `written_off_reason`). The reason is free text,
+      1 to 300 characters once trimmed (every free-text field is measured
+      after trimming), and may name a customer: it is not on
+      the event (which names the quote, its lab and quoted amount), not in
+      any log, Sentry event, report or feed, and a lab account is not sent
+      it. A lab account cannot write a quote off: the step is an ops step
+      and the lab gate refuses that route.
+   4. **An invoice after a write-off** is still taken and reverses the
+      write-off in the same step: the quote counts as invoiced, the
+      write-off stays on the quote as it was made, and the LAB_INVOICED
+      event says `reversed_write_off` and which quote. There is no other
+      undo, as there is none for an invoice.
+   5. **An invoice may name its quote** (`detail.lab_cost_id`, optional):
+      this job's, not deleted, not invoiced yet (`quote_not_found`,
+      `quote_invoiced`). The job screen names it, and asks which when more
+      than one quote is waiting. Without a name the writer takes work that
+      came back and is not written off, then work that came back and was
+      written off, then work that never came back, oldest first within
+      each. On a job with no write-off that is the choice it always made.
 7. **Cancelling** sets `stage` and `status` to cancelled in one write.
    `cancelJob` goes through the writer.
 8. **A job the lab has started on is not rebuilt.** `updateJobFromBuild`
@@ -333,7 +367,7 @@ so it will be a button.
 | `GET /admin/lab-jobs/:id/production` | A job's state, history and outside-lab quotes, the steps it offers now, and the outside labs already used | `lab_job:read` |
 | `POST /admin/lab-jobs/:id/packet` | Shows the packet (the prescription) and records who looked, before it is returned | `lab_job:read` |
 | `POST /admin/lab-jobs/:id/actions` | Records one step the lab took | `lab_job:update` |
-| `POST /admin/lab-jobs/:id/ops-actions` | Hold and release | `lab_job_ops:update` |
+| `POST /admin/lab-jobs/:id/ops-actions` | Hold and release; writing off a lab quote | `lab_job_ops:update` |
 | `POST /admin/lab-jobs/:id/rx-changed` | A changed prescription on a job in production | `lab_job_ops:update` |
 | `POST /admin/lab-jobs/:id/retry` | Rebuild a packet, as before | `lab_job_ops:update` |
 | `POST /admin/lab-jobs/:id/warranty-remake` | Fetch the prescription back into a labelled or delivered job's packet and start a remake | `lab_job_ops:update` |
@@ -402,7 +436,12 @@ in `src/admin/lib/lab.ts` and is tested against the production rules.
 2. **Two things the offer cannot know from the job alone:** whether a lab
    quote exists or is waiting for an invoice (the job route checks the
    quotes for the invoice) and which lenses were issued (the writer
-   refuses a lens that was not).
+   refuses a lens that was not). A write-off is offered on each quote, not
+   on the job: `actions.write_off` lists the quotes `writeOffRefusal`
+   allows, for ops accounts only, and the job screen puts a "Write off"
+   button on that quote's row, asking for the reason. A written-off quote
+   shows when and by whom (and, for ops, why). A database test walks the
+   quote states against the writer (`write-off.db-suite.ts`).
    1. **A warranty remake after the prescription was removed.** The
       readable prescription is blanked from a packet 60 days after
       delivery (the customer's stored, encrypted prescription is kept for
@@ -505,9 +544,10 @@ This is the gate the design sets before any lab login exists (10.10 items
    5. If the check cannot find out (the database does not answer), the
       request is refused with 503 for everyone, not let through.
 4. **What a lab account is shown and can do.**
-   1. Not the ops steps: hold and release, a changed prescription, a
-      rebuild, a warranty remake. The job route does not offer a lab
-      account their buttons.
+   1. Not the ops steps: hold and release, writing off a lab quote, a
+      changed prescription, a rebuild, a warranty remake. The job route
+      does not offer a lab account their buttons, and leaves a write-off's
+      reason out of the quotes it shows one.
    2. **Never an order's id.** Medusa's storefront API answers `GET
       /store/orders/<id>` for anyone who presents an order id, with the
       customer's email, address and phone. So every lab route cuts a job
@@ -582,8 +622,14 @@ This is the gate the design sets before any lab login exists (10.10 items
    job). For each window that has ended in Bangkok and is not yet released,
    in one transaction: a marker row (`lab_release_window`, also for an empty
    window), totals per SKU and reason (`lab_usage_release`), and totals per
-   outside lab as of the window's last day (`lab_total_day`). Written once,
-   insert-only.
+   outside lab as of the window's last day (`lab_total_day`): quoted value
+   back and not invoiced (`quoted_uninvoiced_satang`), invoiced to date
+   (`invoiced_to_date_satang`), and quoted value written off and not
+   invoiced since (`written_off_satang`). A written-off quote leaves the
+   first and is counted in the third from the day it was written off, so
+   Operations stops expecting its invoice; a later invoice moves it to the
+   second. Windows released before write-offs existed carry 0. Written
+   once, insert-only.
 3. **A row belongs to the window in which it was entered**, not the one in
    which the work was done (`lab_usage.entered_on`). The writer and the
    release share a lock, and the writer dates a row after the last released
@@ -604,12 +650,19 @@ This is the gate the design sets before any lab login exists (10.10 items
 7. **Lab names.** Totals are grouped by the lab's name in lower case with
    white space collapsed, and that is the name served. A fixed list of labs
    chosen on the screen is the real fix and comes with the screens.
-8. **Open:** a quote whose work came back and is never invoiced (a remake
-   the lab does not bill) stays in "back and not invoiced" for good. It
-   needs a "written off" action or a decision that it should.
+8. **Written off.** A quote whose work came back and is never invoiced (a
+   remake the lab does not bill) is written off (Production, item 6.1),
+   which takes it out of "back and not invoiced". The lab report
+   (`GET /admin/lab-reports`) counts quotes per lab (grouped as the
+   release groups them, named by the lab's most recent spelling): back and
+   not invoiced
+   (count and quoted amount, whatever their age) and written off in the
+   period and not invoiced since (count and quoted amount). Migration
+   `Migration20261123000200` adds the columns, written by hand in the shape
+   `db:generate` writes, with the module snapshot updated to match.
 9. **Lab totals assume one clock.** Usage dates are protected against a
    process whose clock runs behind the releasing one; a lab quote's
-   timestamps are not. With two processes whose clocks differ, a receipt or
+   timestamps (a write-off's included) are not. With two processes whose clocks differ, a receipt or
    invoice written just after a release can be missing from that window's
    total. The next window's total includes it (totals are cumulative).
 10. **Limit:** totals are 32-bit whole satang, about 21 million baht per lab

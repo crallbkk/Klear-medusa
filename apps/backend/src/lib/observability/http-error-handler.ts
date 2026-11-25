@@ -19,9 +19,11 @@ const coreErrorHandler = errorHandler();
  * answers (validation, not found, conflicts) are the caller's problem and are
  * not reported.
  *
- * PDPA: only the method and the matched route pattern go to Sentry, never
- * the body, query or headers. The error itself still passes through the
- * scrubber in `sentry.ts`.
+ * PDPA: this handler adds only the method and the matched route pattern (as
+ * tags). The request data the SDK attaches to the event is cleaned by
+ * `sentry.ts`: no body, no query string (the address and the referer are
+ * cut at `?` or `#`), no cookies, and the other headers scrubbed by name.
+ * The error itself passes through the same scrubber.
  */
 export const sentryErrorHandler: MedusaErrorHandlerFunction = (
   err: unknown,

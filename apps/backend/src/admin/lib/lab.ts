@@ -49,7 +49,40 @@ export type LabCost = {
   received_at: string | null;
   invoiced_satang: number | null;
   invoiced_at: string | null;
+  /** Written off: the lab will never invoice it. A later invoice reverses
+   *  that and leaves these set. */
+  written_off_at?: string | null;
+  written_off_by?: string | null;
+  /** For ops only; a lab account is not sent it. */
+  written_off_reason?: string | null;
 };
+
+/** The quotes an invoice could be for: every one not invoiced yet (a
+ *  written-off one included: an invoice reverses the write-off). */
+export function invoiceCandidates(costs: LabCost[]): LabCost[] {
+  return costs.filter((c) => c.invoiced_satang === null || c.invoiced_satang === undefined);
+}
+
+/**
+ * The quote an open invoice form names, given what was chosen and the
+ * quotes still waiting (they can change while the form is open: another
+ * person invoices one). One left: that one. A choice no longer waiting:
+ * cleared. `ask`: whether the form shows the choice (more than one left).
+ */
+export function invoiceQuoteChoice(
+  chosen: string,
+  candidates: LabCost[],
+): { lab_cost_id: string; ask: boolean } {
+  if (candidates.length === 1) return { lab_cost_id: candidates[0].id, ask: false };
+  const still = candidates.some((c) => c.id === chosen);
+  return { lab_cost_id: still ? chosen : "", ask: candidates.length > 1 };
+}
+
+/** A quote as a choice in a list: its lab, its quoted price, where it stands. */
+export function quoteLabel(c: LabCost): string {
+  const where = !c.received_at ? "not back yet" : c.written_off_at ? "written off" : "back";
+  return `${c.vendor} · quoted ${formatBaht(c.quoted_satang)} · ${where}`;
+}
 
 /** Shown beside every free-text box (module README, known gap 5). */
 export const NO_PRESCRIPTION_HERE =
@@ -120,6 +153,7 @@ export const ACTION_LABEL: Record<string, string> = {
   LENS_RETURNED_UNUSED: "Lens went back uncut",
   LENS_CUT_CONFIRMED: "Lens was cut",
   LAB_INVOICED: "Enter lab invoice",
+  LAB_QUOTE_WRITTEN_OFF: "Write off",
   NOTE: "Add note",
   HOLD: "Put on hold",
   RELEASE: "Release hold",
@@ -188,6 +222,14 @@ export const ACTION_FIELDS: Record<string, ActionField[]> = {
     reason("What happened to the frame"),
   ],
   LAB_INVOICED: [{ name: "invoiced", label: "Amount on the lab's invoice (baht)", kind: "baht", required: true }],
+  // The quote is the row the button was pressed on (`lab_cost_id` in the
+  // form's values), not something typed.
+  LAB_QUOTE_WRITTEN_OFF: [
+    {
+      ...reason("Why the lab will not invoice this"),
+      help: `Kept on the quote. If the lab's invoice comes after all, entering it reverses the write-off. ${NO_PRESCRIPTION_HERE}`,
+    },
+  ],
   NOTE: [{ ...reason("Note"), name: "text" }],
   HOLD: [reason("Why the job is held")],
 };
@@ -290,7 +332,9 @@ export function buildDetail(action: string, values: Record<string, string>): Bui
         detail[field.name] = typed.replace(/\s+/g, " ");
         break;
       case "text": {
-        const max = action === "NOTE" ? 2000 : 500;
+        // The writer's limits: a note 2000, a write-off's reason 300
+        // (WRITE_OFF_REASON_MAX), any other reason 500.
+        const max = action === "NOTE" ? 2000 : action === "LAB_QUOTE_WRITTEN_OFF" ? 300 : 500;
         if (typed.length > max) return bad(`${field.label}: at most ${max} characters.`);
         detail[field.name] = typed;
         break;
@@ -298,6 +342,15 @@ export function buildDetail(action: string, values: Record<string, string>): Bui
     }
   }
   if (fields.some((f) => f.name.startsWith("lens_"))) detail.lenses = lenses;
+  // An invoice names its quote when the screen knows which one it is for.
+  if (action === "LAB_INVOICED" && (values.lab_cost_id ?? "").trim() !== "") {
+    detail.lab_cost_id = values.lab_cost_id.trim();
+  }
+  if (action === "LAB_QUOTE_WRITTEN_OFF") {
+    const quote = (values.lab_cost_id ?? "").trim();
+    if (quote === "") return { ok: false, field: "lab_cost_id", message: "Choose the quote to write off." };
+    detail.lab_cost_id = quote;
+  }
   return { ok: true, detail };
 }
 
@@ -410,6 +463,7 @@ export function eventSummary(event: Pick<LabEvent, "action" | "detail">): string
   if (typeof d.invoiced_satang === "number") parts.push(`invoiced ${formatBaht(d.invoiced_satang)}`);
   if (typeof d.expected_on === "string") parts.push(`expected ${d.expected_on}`);
   if (d.warranty === true) parts.push("warranty");
+  if (d.reversed_write_off === true) parts.push("write-off reversed");
   for (const key of ["reason", "cause", "text"]) {
     if (typeof d[key] !== "string") continue;
     // "reason" on a lens issue is the booking reason, a fixed word such as

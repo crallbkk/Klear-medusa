@@ -16,8 +16,14 @@ import { authorizeOpsFeed } from "../auth";
  *                  usage:      [ { id, sku, reason, net_qty } ],
  *                  lab_totals: [ { id, vendor, as_of,
  *                                  quoted_uninvoiced_satang,
- *                                  invoiced_to_date_satang } ] } ],
+ *                                  invoiced_to_date_satang,
+ *                                  written_off_satang } ] } ],
  *     next_after }
+ *
+ * `written_off_satang` is the quoted value the lab will not invoice (written
+ * off, and not invoiced since) as of that day; it is no longer in
+ * `quoted_uninvoiced_satang`. 0 in windows released before write-offs
+ * existed. Never the reason, nor who wrote it off.
  *
  * The cursor is the last window's end date; pass it back as `after`.
  * Released windows never change, so re-reading is always safe.
