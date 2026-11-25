@@ -202,20 +202,91 @@ describe("scrubSentryEvent — full-event backstop", () => {
     expect(out.request.data.phone).toBe("[redacted]");
   });
 
-  it("redacts request.query_string wholesale when any param name is sensitive, leaves opaque ones", () => {
-    const sensitive = {
-      request: { query_string: "order_id=order_1&email=leak%40example.com" },
+  it("never sends a query string, in the query, the address or the referer", () => {
+    // A search box puts what was typed (a customer's name) in the query,
+    // under a name (`q`) no denylist can know.
+    const event = {
+      request: {
+        url: "https://api.example/admin/customers?q=Somchai%20Secretname#Secretname",
+        query_string: "q=Somchai%20Secretname&order_id=order_1",
+        headers: {
+          Referer: "https://admin.example/app/customers?q=Somchai+Secretname#top",
+          "x-request-id": "req_1",
+        },
+      },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
-    expect(scrubSentryEvent(sensitive).request.query_string).toBe("[redacted]");
+    const out = scrubSentryEvent(event);
+    expect(out.request.query_string).toBeUndefined();
+    expect(out.request.url).toBe("https://api.example/admin/customers");
+    expect(out.request.headers.Referer).toBe("https://admin.example/app/customers");
+    expect(out.request.headers["x-request-id"]).toBe("req_1");
+    expect(JSON.stringify(out)).not.toMatch(/Secretname/);
+    // A fragment alone is cut too, and an address with neither is kept.
+    expect(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      scrubSentryEvent({ request: { url: "https://x/a#Secretname", headers: { referer: "https://x/b" } } } as any)
+        .request,
+    ).toEqual({ url: "https://x/a", headers: { referer: "https://x/b" } });
+  });
 
-    const opaque = {
-      request: { query_string: "order_id=order_1&status=shipped" },
+  it("drops a breadcrumb's query and fragment, and cuts its address at ? or #", () => {
+    const event = {
+      breadcrumbs: [
+        {
+          category: "http",
+          data: {
+            url: "https://api.example/admin/customers?q=Somchai#Secretname",
+            "http.query": "?q=Somchai%20Secretname",
+            "http.fragment": "#Secretname",
+            method: "GET",
+            status_code: 500,
+          },
+        },
+      ],
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
-    expect(scrubSentryEvent(opaque).request.query_string).toBe(
-      "order_id=order_1&status=shipped",
-    );
+    const crumb = scrubSentryEvent(event).breadcrumbs[0];
+    expect(crumb.data).toEqual({ url: "https://api.example/admin/customers", method: "GET", status_code: 500 });
+    const single = scrubBreadcrumb({
+      category: "http",
+      data: { url: "https://x/y?q=Somchai%20Secretname", "http.query": "q=Secretname" },
+    });
+    expect(single.data).toEqual({ url: "https://x/y" });
+  });
+
+  it("never sends a request body that arrives as text", () => {
+    // The SDK records a request body as the raw string it read. A key-based
+    // scrub cannot clean a string, so the body is not sent at all.
+    const body = JSON.stringify({
+      action: "LAB_QUOTE_WRITTEN_OFF",
+      detail: { lab_cost_id: "labcost_1", reason: "Somchai Secretname asked" },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const event = { request: { url: "http://x/admin/lab-jobs/labjob_1/ops-actions", data: body } } as any;
+    const out = scrubSentryEvent(event);
+    expect(out.request.data).toBeUndefined();
+    expect(out.request.url).toBe("http://x/admin/lab-jobs/labjob_1/ops-actions");
+    expect(JSON.stringify(out)).not.toMatch(/Secretname/);
+    // Any text body, JSON or not.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(scrubSentryEvent({ request: { data: "text=Secretname" } } as any).request.data).toBeUndefined();
+  });
+
+  it("never sends the session cookie inside the request headers", () => {
+    const event = {
+      request: {
+        headers: {
+          cookie: "connect.sid=s%3Asecret-session-value",
+          "set-cookie": "connect.sid=s%3Asecret-session-value",
+          "x-request-id": "req_1",
+        },
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+    const out = scrubSentryEvent(event);
+    expect(out.request.headers["x-request-id"]).toBe("req_1");
+    expect(JSON.stringify(out)).not.toMatch(/secret-session-value/);
   });
 
   it("no-ops cleanly on an event with no extra/contexts/breadcrumbs/request", () => {
@@ -270,6 +341,47 @@ describe("initSentry — dormant-until-DSN", () => {
     expect(options.sendDefaultPii).toBe(false);
     expect(typeof options.beforeSend).toBe("function");
     expect(typeof options.beforeBreadcrumb).toBe("function");
+  });
+
+  it("never records request bodies: the Http integration is set up with body capture off", () => {
+    process.env.SENTRY_DSN = "https://fake@o0.ingest.sentry.io/0";
+    const initSpy = jest.spyOn(Sentry, "init").mockImplementation(() => undefined as never);
+    const httpSpy = jest.spyOn(Sentry, "httpIntegration");
+
+    initSentry();
+
+    expect(httpSpy).toHaveBeenCalledWith(expect.objectContaining({ maxIncomingRequestBodySize: "none" }));
+    const options = initSpy.mock.calls[0][0] as { integrations?: Array<{ name: string }> };
+    // Passed as a list, so it replaces the SDK's default instance of the
+    // same name (which records bodies up to 10 kB).
+    expect(Array.isArray(options.integrations)).toBe(true);
+    expect(options.integrations!.map((i) => i.name)).toContain("Http");
+    expect(options.integrations).toContain(httpSpy.mock.results[0].value);
+  });
+
+  it("sends nothing when the scrubber fails, rather than the event as it was", () => {
+    process.env.SENTRY_DSN = "https://fake@o0.ingest.sentry.io/0";
+    const initSpy = jest.spyOn(Sentry, "init").mockImplementation(() => undefined as never);
+    initSentry();
+    const options = initSpy.mock.calls[0][0] as {
+      beforeSend: (event: unknown) => unknown;
+      beforeBreadcrumb: (breadcrumb: unknown) => unknown;
+    };
+    // A value whose reading throws makes the scrubber throw.
+    const throwing = {
+      get boom(): unknown {
+        throw new Error("cannot read");
+      },
+    };
+    expect(() => scrubSentryEvent({ extra: throwing } as never)).toThrow();
+    expect(options.beforeSend({ extra: throwing })).toBeNull();
+    expect(() => scrubBreadcrumb({ data: throwing } as never)).toThrow();
+    expect(options.beforeBreadcrumb({ category: "x", data: throwing })).toBeNull();
+    // And the ordinary case still goes through.
+    expect(options.beforeBreadcrumb({ category: "x", data: { order_id: "o1" } })).toEqual({
+      category: "x",
+      data: { order_id: "o1" },
+    });
   });
 
   it("wires beforeSend to the scrubber — a leaked Rx field never reaches Sentry.init's caller-visible event", () => {
