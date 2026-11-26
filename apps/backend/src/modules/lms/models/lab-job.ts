@@ -73,6 +73,28 @@ const LabJob = model.define("lab_job", {
   // The reason the next lens issue is booked under: order,
   // spoilage_replacement or remake.
   next_issue_reason: model.text().default("order"),
+  // Warranty remakes started after the glasses were labelled or delivered.
+  warranty_remakes: model.number().default(0),
+
+  // ── What the Website shows (contract 6, see projection.ts) ─────────────
+  // The Website state of the latest stage that has one, its sequence (the
+  // stage_version it was reached at) and when it happened. Written by the
+  // production writer in the same transaction as the stage, never elsewhere.
+  projection_state: model.text().nullable(),
+  projection_seq: model.number().default(0),
+  projection_at: model.dateTime().nullable(),
+  // When this server recorded that state (its own clock; projection_at can
+  // be a back-dated paper-log time). The 30-day give-up counts from here.
+  projection_recorded_at: model.dateTime().nullable(),
+  // The highest sequence the Website has taken. Below projection_seq means
+  // the latest state is still to be sent (the heal sweep sends it again).
+  projection_sent_seq: model.number().default(0),
+  // When the latest state was last sent and not taken; how many of those
+  // answers said the Website does not know the order yet; and when sending
+  // it was given up (reported once). All three reset with a new state.
+  projection_attempted_at: model.dateTime().nullable(),
+  projection_not_ready_count: model.number().default(0),
+  projection_gave_up_at: model.dateTime().nullable(),
 })
   // ── DO NOT REMOVE ──────────────────────────────────────────────────────
   // This partial unique index is idempotency-critical: it is what stops two

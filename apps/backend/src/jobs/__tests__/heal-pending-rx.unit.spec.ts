@@ -2,9 +2,13 @@ import healPendingRxJob from "../heal-pending-rx";
 import { LMS_MODULE, LabJobNotRebuildableError } from "../../modules/lms/service";
 import { rebuildAndSubmitJob } from "../../modules/lms/rebuild";
 import { captureException } from "../../lib/observability/sentry";
+import { resendUnacknowledgedProjections } from "../../modules/lms/projection-sender";
 
 jest.mock("../../lib/observability/sentry", () => ({ captureException: jest.fn() }));
 
+jest.mock("../../modules/lms/projection-sender", () => ({
+  resendUnacknowledgedProjections: jest.fn().mockResolvedValue({ tried: 0, acknowledged: 0, not_acknowledged: 0, gave_up: 0 }),
+}));
 jest.mock("../../modules/lms/rebuild", () => ({
   rebuildAndSubmitJob: jest.fn(),
 }));
@@ -153,5 +157,19 @@ describe("heal-pending-rx scheduled job", () => {
       String(c[0]).includes("heal failed"),
     );
     expect(errorCalls).toHaveLength(0);
+  });
+});
+
+describe("heal-pending-rx: the Website re-send", () => {
+  it("runs after the prescription heal, every pass", async () => {
+    const lms = makeLms([{ id: "job_a", order_id: "order_a" }]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockRebuild.mockResolvedValue({ buildOutcome: "ok", job: {}, submit: {} } as any);
+    await runJob(lms);
+    const resend = resendUnacknowledgedProjections as jest.Mock;
+    expect(resend).toHaveBeenCalledTimes(1);
+    expect(mockRebuild.mock.invocationCallOrder[0]).toBeLessThan(resend.mock.invocationCallOrder[0]);
+    await runJob(makeLms([]));
+    expect(resend).toHaveBeenCalledTimes(2);
   });
 });

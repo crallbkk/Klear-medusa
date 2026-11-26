@@ -18,6 +18,7 @@ import { screensSuite } from "./screens.db-suite";
 import { failedSaveSuite } from "./failed-save.db-suite";
 import { lensStockSuite } from "./lens-stock.db-suite";
 import { writeOffSuite } from "./write-off.db-suite";
+import { projectionSuite } from "./projection.db-suite";
 
 jest.setTimeout(120_000);
 
@@ -41,5 +42,6 @@ moduleIntegrationTestRunner<LmsModuleService>({
     failedSaveSuite(service);
     lensStockSuite(service);
     writeOffSuite(service);
+    projectionSuite(service);
   },
 });

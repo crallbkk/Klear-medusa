@@ -1,0 +1,79 @@
+{
+  "contract": "order-cancel-v1",
+  "request": {
+    "method": "POST",
+    "path": "/order-cancel/{medusa_order_id}",
+    "authorization": "Bearer <KLEAR_ORDER_CANCEL_SECRET>",
+    "body": null
+  },
+  "valid_order_ids": ["order_01KFIXTURECANCEL0001", "order_01SYNTHETICCANCELFIXTURE2"],
+  "invalid_order_ids": [
+    "pending_cart_completion:cart_01KFIXTURE",
+    "cart_01KFIXTURE",
+    "order_",
+    "order_01K/../admin",
+    "ORDER_01KFIXTURE"
+  ],
+  "responses": [
+    {
+      "name": "cancelled",
+      "status": 200,
+      "body": { "order_id": "order_01KFIXTURECANCEL0001", "outcome": "cancelled" },
+      "website": "cancelled"
+    },
+    {
+      "name": "already cancelled",
+      "status": 200,
+      "body": { "order_id": "order_01KFIXTURECANCEL0001", "outcome": "already_cancelled" },
+      "website": "cancelled"
+    },
+    {
+      "name": "refused, a label is booked",
+      "status": 409,
+      "body": { "order_id": "order_01KFIXTURECANCEL0001", "outcome": "refused", "reason": "fulfilled" },
+      "website": "return_required"
+    },
+    {
+      "name": "refused, the order is completed",
+      "status": 409,
+      "body": { "order_id": "order_01KFIXTURECANCEL0001", "outcome": "refused", "reason": "completed" },
+      "website": "return_required"
+    },
+    {
+      "name": "refused, another status",
+      "status": 409,
+      "body": { "order_id": "order_01KFIXTURECANCEL0001", "outcome": "refused", "reason": "not_cancellable" },
+      "website": "return_required"
+    },
+    {
+      "name": "no such order",
+      "status": 404,
+      "body": { "order_id": "order_01KFIXTURECANCEL0001", "outcome": "not_found" },
+      "website": "not_found"
+    },
+    {
+      "name": "not an order id",
+      "status": 400,
+      "body": { "outcome": "invalid_order_id" },
+      "website": "unavailable"
+    },
+    {
+      "name": "wrong secret",
+      "status": 401,
+      "body": { "error": "unauthorized" },
+      "website": "unavailable"
+    },
+    {
+      "name": "secret not set on Medusa",
+      "status": 503,
+      "body": { "error": "not configured" },
+      "website": "unavailable"
+    },
+    {
+      "name": "Medusa failed",
+      "status": 500,
+      "body": { "order_id": "order_01KFIXTURECANCEL0001", "outcome": "error" },
+      "website": "unavailable"
+    }
+  ]
+}

@@ -21,6 +21,8 @@ import {
 } from "./types";
 import { UnimplementedLabProvider } from "./providers/_unimplemented";
 import { isSubmissionInFlight } from "./rx-retention";
+import { projectedState, type ProjectionColumns } from "./projection";
+import { deliverProjection } from "./projection-sender";
 import {
   ACTIONS,
   STAGE_ACTIONS,
@@ -36,6 +38,10 @@ import {
 } from "./production";
 
 export const LMS_MODULE = "lms";
+
+/** How many "not ready" answers a state gets before it is given up on: a day
+ *  of half-hourly sweeps. */
+export const PROJECTION_NOT_READY_MAX = 48;
 
 export type LabJobStatusValue =
   | "queued"
@@ -259,6 +265,8 @@ export type ProductionActionResult = {
   job: LabJobProductionState;
   /** True when the key had been used: nothing was written this time. */
   replayed: boolean;
+  /** True when the action gave the Website a new state to show. */
+  projected?: boolean;
 };
 
 /** Stages at which the lab still has work on a job. */
@@ -1040,12 +1048,17 @@ class LmsModuleService extends MedusaService({
       .update(stableJson({ detail: detailIn, happened_at: happenedAt?.toISOString() ?? null }))
       .digest("hex");
 
+    let result: ProductionActionResult;
     try {
-      return await this.recordProductionAction_(input, versioned, happenedAt, requestHash);
+      result = await this.recordProductionAction_(input, versioned, happenedAt, requestHash);
     } catch (err) {
       if (err instanceof ProductionError) throw err;
       throw new ProductionWriteError(err);
     }
+    // Committed. Tell the Website the new state (contract 6) without making
+    // the lab wait for it: a send that fails is sent again by the sweep.
+    if (result.projected) void deliverProjection(this, job_id);
+    return result;
   }
 
   /**
@@ -1231,6 +1244,26 @@ class LmsModuleService extends MedusaService({
           `"stage_version" = "stage_version" + 1`,
         );
         params.push(effect.to_stage, now);
+      }
+      // A warranty remake (after the glasses were labelled or delivered).
+      const warrantyRemake = action === "REMAKE_STARTED" && effect.detail.warranty === true;
+      if (warrantyRemake) sets.push(`"warranty_remakes" = "warranty_remakes" + 1`);
+      // What the Website shows (contract 6): the state of this stage, its
+      // sequence (the version the job reaches now: "stage_version" + 1 is
+      // read from the row before this update) and when it happened.
+      const projected = effect.to_stage ? projectedState(effect.to_stage, action, warrantyRemake) : null;
+      if (projected) {
+        // A new state to send: its delivery starts afresh.
+        sets.push(
+          `"projection_state" = ?`,
+          `"projection_seq" = "stage_version" + 1`,
+          `"projection_at" = ?`,
+          `"projection_recorded_at" = ?`,
+          `"projection_attempted_at" = null`,
+          `"projection_not_ready_count" = 0`,
+          `"projection_gave_up_at" = null`,
+        );
+        params.push(projected, happenedAt ?? now, now);
       }
       for (const column of PATCHABLE) {
         if (column in effect.patch) {
@@ -1439,8 +1472,95 @@ class LmsModuleService extends MedusaService({
         }
       }
 
-      return { event, job: productionState(updated[0]), replayed: false };
+      return { event, job: productionState(updated[0]), replayed: false, projected: projected !== null };
     });
+  }
+
+  // ── What the Website shows (contract 6, see projection.ts) ─────────────
+
+  /** A job's projection columns, or null if there is no such job. */
+  async getProjection(jobId: string): Promise<
+    | (ProjectionColumns & { id: string; projection_sent_seq: number })
+    | null
+  > {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return await (this as any).baseRepository_.transaction(async (em: Sql) => {
+      const [row] = await em.execute(
+        `select "id", "order_id", "projection_state", "projection_seq", "projection_at",
+                "projection_sent_seq", "warranty_remakes"
+           from "lab_job" where "id" = ? and "deleted_at" is null`,
+        [jobId],
+      );
+      return row ?? null;
+    });
+  }
+
+  /** The Website has taken `sequence`. Never lowered: a late answer to an
+   *  older send changes nothing. Not a production write: no stage, no event. */
+  async markProjectionDelivered(jobId: string, sequence: number): Promise<void> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (this as any).baseRepository_.transaction(async (em: Sql) => {
+      await em.execute(
+        `update "lab_job" set "projection_sent_seq" = greatest("projection_sent_seq", ?)
+          where "id" = ? and "deleted_at" is null`,
+        [sequence, jobId],
+      );
+    });
+  }
+
+  /** A send the Website did not take. `notReady`: it answered that it does
+   *  not know the order yet. */
+  async markProjectionAttempt(jobId: string, notReady: boolean): Promise<void> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (this as any).baseRepository_.transaction(async (em: Sql) => {
+      await em.execute(
+        `update "lab_job" set "projection_attempted_at" = now(),
+                "projection_not_ready_count" = "projection_not_ready_count" + ?
+          where "id" = ? and "deleted_at" is null`,
+        [notReady ? 1 : 0, jobId],
+      );
+    });
+  }
+
+  /**
+   * Jobs whose latest state the Website has not taken: never-tried first,
+   * then the ones tried longest ago, 200 a run. Left out: a state older than
+   * 30 days, one the Website has called "not ready" PROJECTION_NOT_READY_MAX
+   * times, and one already given up (see `giveUpProjections`).
+   */
+  async listUnsentProjections(limit = 200): Promise<Array<{ id: string }>> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return await (this as any).baseRepository_.transaction(async (em: Sql) =>
+      em.execute(
+        `select "id" from "lab_job"
+          where "deleted_at" is null and "projection_seq" > "projection_sent_seq"
+            and "projection_gave_up_at" is null
+            and "projection_recorded_at" > now() - interval '30 days'
+            and "projection_not_ready_count" < ?
+          order by "projection_attempted_at" asc nulls first, "projection_at" asc, "id" asc
+          limit ?`,
+        [PROJECTION_NOT_READY_MAX, limit],
+      ),
+    );
+  }
+
+  /**
+   * Mark as given up, once, the jobs whose latest state will no longer be
+   * sent (older than 30 days, or "not ready" too often), and return them so
+   * the caller can report each. Only ids leave this method.
+   */
+  async giveUpProjections(): Promise<Array<{ id: string; order_id: string }>> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return await (this as any).baseRepository_.transaction(async (em: Sql) =>
+      em.execute(
+        `update "lab_job" set "projection_gave_up_at" = now()
+          where "deleted_at" is null and "projection_seq" > "projection_sent_seq"
+            and "projection_gave_up_at" is null
+            and ("projection_recorded_at" <= now() - interval '30 days' or "projection_not_ready_count" >= ?)
+          returning "id", "order_id"`,
+        [PROJECTION_NOT_READY_MAX],
+      ),
+    );
   }
 
   /**
