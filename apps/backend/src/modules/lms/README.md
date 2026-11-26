@@ -758,6 +758,51 @@ Known gaps, to be closed with the parts above:
 8. The database tests import `pg`, which this package does not declare; it
    resolves through the workspace's hoisted install.
 
+## What the Website shows (contract 6) and order cancel (contract 7)
+
+The customer sees the order's production state on the Website. The
+production writer records, in the same transaction as the stage, the Website
+state of the new stage (`projection.ts`: ready → `pending_lab`, printed →
+`sent_to_lab` or, after REMAKE_STARTED, `remake_required`, lens issued to
+mounted → `in_production`, QC → `qc_pass` / `qc_fail`, packed → `assembled`;
+labelled, delivered and cancelled are not sent), its sequence (the job's
+`stage_version`), its own time and `warranty_remakes`, in the `projection_*`
+columns of `lab_job`. After the commit `projection-sender.ts` posts it to
+`{KLEAR_STOREFRONT_URL}/api/webhooks/order-projection` with
+`KLEAR_PROJECTION_SECRET`, without making the lab wait. The Website's
+"applied" or "ignored" raises `projection_sent_seq`; anything else leaves it,
+and the heal sweep (`jobs/heal-pending-rx.ts`) sends the latest state again,
+for 30 days. No prescription, power, packet, operator or cost is sent: the
+message has five fields. LMS never reads Website state.
+
+The Website cancels an unfulfilled order through `POST /order-cancel/:id`
+(`api/order-cancel/`, its own `KLEAR_ORDER_CANCEL_SECRET`) before it refunds;
+Medusa's `order.canceled` then moves the job to `cancelled` through the
+subscriber above. A shipping label refuses the cancel (409 `fulfilled`).
+
+Fixtures both sides test against: `apps/backend/contracts/*.json`.
+
+A remake after a QC failure is shown to the customer as `in_production`;
+only a warranty remake (after the glasses were labelled or delivered) is
+`remake_required`. The sweep sends again within a time budget, the jobs tried
+longest ago first; it stops after 30 days, or after 48 "not ready" answers,
+and reports each state it gives up on (`projection_given_up`).
+
+The cancel route reads the order again after cancelling: a shipping label
+booked meanwhile makes the answer a refusal (409 `fulfilled`), reported as
+`label_booked_during_cancel`, so the Website does not refund.
+
+**Deploy order (contracts 6 and 7).**
+0. Before anything: confirm that no two Klear secrets share a value, on Railway (`KLEAR_OPS_FEED_SECRET`, `KLEAR_STOCK_SYNC_SECRET`, `KLEAR_LENS_SNAPSHOT_SECRET`, `KLEAR_ORDER_CANCEL_SECRET`, `KLEAR_PROJECTION_SECRET`, `KLEAR_CARRIER_WEBHOOK_SECRET`, `KLEAR_RX_METADATA_SECRET`) and on Vercel (the list in the Website's `src/lib/security/distinct-secret.ts`). From this release a route whose secret equals another one is closed (503): the live carrier, feed and stock routes included. The carrier route reports it as `secret_shared`; Medusa logs it by variable name.
+1. Medusa first: its migration runs at boot, the `/order-cancel/:id` route goes live, and both `KLEAR_ORDER_CANCEL_SECRET` and `KLEAR_PROJECTION_SECRET` are set on Railway (each different from every other Klear secret).
+2. Apply Website migration 0036 (`order_lab_projections`, `apply_order_projection`, `hold_carrier_event`).
+3. Set the same two secrets on Vercel.
+4. Smoke-test: `POST {MEDUSA_BACKEND_URL}/order-cancel/order_01SYNTHETICDEPLOYCHECK00` with `Authorization: Bearer <KLEAR_ORDER_CANCEL_SECRET>` must answer 404 `{"outcome":"not_found"}` (503 means the secret is unset, short or shared; 401 means the two sides differ).
+5. Deploy the Website.
+
+Why this order: the Website fails closed. Deployed before Medusa's route and secret are live, every customer cancel and every refund before shipping answers 503 and moves no money until Medusa catches up. Medusa first costs nothing: projections it cannot deliver are kept and re-sent by the heal sweep.
+
+
 ## Database tests
 
 All database suites run from one file, `__tests__/lms.db.spec.ts` (each

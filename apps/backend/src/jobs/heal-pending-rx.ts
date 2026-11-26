@@ -7,6 +7,7 @@ import {
 } from "../modules/lms/service";
 import type LmsModuleService from "../modules/lms/service";
 import { rebuildAndSubmitJob } from "../modules/lms/rebuild";
+import { resendUnacknowledgedProjections } from "../modules/lms/projection-sender";
 import { captureException } from "../lib/observability/sentry";
 
 /**
@@ -59,6 +60,29 @@ export default async function healPendingRxJob(
     });
   }
 
+  await healPending(container, pending);
+
+  // Then the production state the Website has not taken (contract 6), sent
+  // again within a time budget, after the prescription heal so a slow
+  // Website never delays a lab packet. Nothing when sending is not set up.
+  try {
+    const sent = await resendUnacknowledgedProjections(lms);
+    if (sent.tried > 0 || sent.gave_up > 0) {
+      console.info(
+        `[heal-pending-rx] re-sent ${sent.tried} order state(s) to the Website: ${sent.acknowledged} taken, ${sent.not_acknowledged} to try again, ${sent.gave_up} given up`,
+      );
+    }
+  } catch (err) {
+    captureException(reportableError(err, "heal-pending-rx projection re-send"), {
+      tags: { job: "heal-pending-rx", reason: "projection_resend_failed" },
+    });
+  }
+}
+
+async function healPending(
+  container: MedusaContainer,
+  pending: Array<{ id: string; order_id: string }>,
+): Promise<void> {
   if (pending.length === 0) return;
 
   let healed = 0;

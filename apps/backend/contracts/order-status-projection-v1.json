@@ -1,0 +1,140 @@
+{
+  "contract": "order-status-projection-v1",
+  "request": {
+    "method": "POST",
+    "path": "/api/webhooks/order-projection",
+    "authorization": "Bearer <KLEAR_PROJECTION_SECRET>",
+    "fields": ["medusa_order_id", "state", "sequence", "occurred_at", "warranty_cycle"]
+  },
+  "mapping": [
+    { "stage": "ready", "via": null, "state": "pending_lab" },
+    { "stage": "printed", "via": null, "state": "sent_to_lab" },
+    { "stage": "printed", "via": "LENS_SPOILED", "state": "sent_to_lab" },
+    { "stage": "printed", "via": "REMAKE_STARTED", "warranty": false, "state": "in_production" },
+    { "stage": "printed", "via": "REMAKE_STARTED", "warranty": true, "state": "remake_required" },
+    { "stage": "lens_issued", "via": null, "state": "in_production" },
+    { "stage": "sent_to_lab", "via": null, "state": "in_production" },
+    { "stage": "received_from_lab", "via": null, "state": "in_production" },
+    { "stage": "edged", "via": null, "state": "in_production" },
+    { "stage": "mounted", "via": null, "state": "in_production" },
+    { "stage": "qc_passed", "via": null, "state": "qc_pass" },
+    { "stage": "qc_failed", "via": null, "state": "qc_fail" },
+    { "stage": "packed", "via": null, "state": "assembled" }
+  ],
+  "not_projected": ["labelled", "delivered", "cancelled"],
+  "valid_messages": [
+    {
+      "name": "first state",
+      "body": {
+        "medusa_order_id": "order_01KFIXTUREPROJECTION0001",
+        "state": "pending_lab",
+        "sequence": 1,
+        "occurred_at": "2026-11-25T02:00:00.000Z",
+        "warranty_cycle": 0
+      }
+    },
+    {
+      "name": "in production",
+      "body": {
+        "medusa_order_id": "order_01KFIXTUREPROJECTION0001",
+        "state": "in_production",
+        "sequence": 3,
+        "occurred_at": "2026-11-25T03:00:00.000Z",
+        "warranty_cycle": 0
+      }
+    },
+    {
+      "name": "boxed",
+      "body": {
+        "medusa_order_id": "order_01KFIXTUREPROJECTION0001",
+        "state": "assembled",
+        "sequence": 7,
+        "occurred_at": "2026-11-25T06:00:00.000Z",
+        "warranty_cycle": 0
+      }
+    },
+    {
+      "name": "warranty remake after delivery",
+      "body": {
+        "medusa_order_id": "order_01KFIXTUREPROJECTION0001",
+        "state": "remake_required",
+        "sequence": 10,
+        "occurred_at": "2026-12-20T02:00:00.000Z",
+        "warranty_cycle": 1
+      }
+    }
+  ],
+  "invalid_messages": [
+    {
+      "name": "no sequence",
+      "body": {
+        "medusa_order_id": "order_01KFIXTUREPROJECTION0001",
+        "state": "in_production",
+        "occurred_at": "2026-11-25T03:00:00.000Z",
+        "warranty_cycle": 0
+      }
+    },
+    {
+      "name": "sequence zero",
+      "body": {
+        "medusa_order_id": "order_01KFIXTUREPROJECTION0001",
+        "state": "in_production",
+        "sequence": 0,
+        "occurred_at": "2026-11-25T03:00:00.000Z",
+        "warranty_cycle": 0
+      }
+    },
+    {
+      "name": "a state the lab does not send",
+      "body": {
+        "medusa_order_id": "order_01KFIXTUREPROJECTION0001",
+        "state": "shipped",
+        "sequence": 8,
+        "occurred_at": "2026-11-25T03:00:00.000Z",
+        "warranty_cycle": 0
+      }
+    },
+    {
+      "name": "a placeholder id",
+      "body": {
+        "medusa_order_id": "pending_cart_completion:cart_01KFIXTURE",
+        "state": "in_production",
+        "sequence": 3,
+        "occurred_at": "2026-11-25T03:00:00.000Z",
+        "warranty_cycle": 0
+      }
+    },
+    {
+      "name": "a time that is not a time",
+      "body": {
+        "medusa_order_id": "order_01KFIXTUREPROJECTION0001",
+        "state": "in_production",
+        "sequence": 3,
+        "occurred_at": "yesterday",
+        "warranty_cycle": 0
+      }
+    },
+    {
+      "name": "an extra field",
+      "body": {
+        "medusa_order_id": "order_01KFIXTUREPROJECTION0001",
+        "state": "in_production",
+        "sequence": 3,
+        "occurred_at": "2026-11-25T03:00:00.000Z",
+        "warranty_cycle": 0,
+        "prescription": { "od_sphere": -2.25 }
+      }
+    }
+  ],
+  "responses": [
+    { "name": "applied", "status": 200, "body": { "ok": true, "outcome": "applied" }, "acknowledged": true },
+    { "name": "ignored stale", "status": 200, "body": { "ok": true, "outcome": "ignored", "reason": "stale" }, "acknowledged": true },
+    { "name": "ignored closed", "status": 200, "body": { "ok": true, "outcome": "ignored", "reason": "closed" }, "acknowledged": true },
+    { "name": "ignored shipped", "status": 200, "body": { "ok": true, "outcome": "ignored", "reason": "shipped" }, "acknowledged": true },
+    { "name": "ignored same state", "status": 200, "body": { "ok": true, "outcome": "ignored", "reason": "same_state" }, "acknowledged": true },
+    { "name": "not ready", "status": 409, "body": { "ok": false, "outcome": "not_ready" }, "acknowledged": false },
+    { "name": "invalid", "status": 400, "body": { "ok": false, "error": "invalid body" }, "acknowledged": false },
+    { "name": "unauthorized", "status": 401, "body": { "ok": false, "error": "unauthorized" }, "acknowledged": false },
+    { "name": "unavailable", "status": 503, "body": { "ok": false, "error": "service unavailable" }, "acknowledged": false }
+  ]
+}

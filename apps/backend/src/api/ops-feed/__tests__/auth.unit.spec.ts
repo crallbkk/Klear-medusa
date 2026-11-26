@@ -81,3 +81,81 @@ describe("the three Operations secrets", () => {
     expect(ask("KLEAR_OPS_FEED_SECRET", OWN.KLEAR_OPS_FEED_SECRET).ok).toBe(true);
   });
 });
+
+describe("every route secret against every other Klear secret this server holds", () => {
+  const ROUTES = [
+    "KLEAR_OPS_FEED_SECRET",
+    "KLEAR_STOCK_SYNC_SECRET",
+    "KLEAR_LENS_SNAPSHOT_SECRET",
+    "KLEAR_ORDER_CANCEL_SECRET",
+  ] as const;
+  // Secrets this server sends or uses itself, never accepts on a route.
+  const OTHERS = ["KLEAR_PROJECTION_SECRET", "KLEAR_CARRIER_WEBHOOK_SECRET", "KLEAR_RX_METADATA_SECRET"] as const;
+  const ALL = [...ROUTES, ...OTHERS];
+  const value = (i: number) => String.fromCharCode(100 + i).repeat(40);
+  const saved = ALL.map((v) => process.env[v]);
+  const setAll = () => ALL.forEach((v, i) => (process.env[v] = value(i)));
+  afterAll(() => {
+    ALL.forEach((v, i) => {
+      if (saved[i] === undefined) delete process.env[v];
+      else process.env[v] = saved[i];
+    });
+  });
+
+  const askRoute = (variable: (typeof ROUTES)[number], secret: string) => {
+    const res = makeRes();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ok = authorizeBearer({ headers: { authorization: `Bearer ${secret}` } } as any, res as any, variable);
+    return { ok, status: res.status.mock.calls[0]?.[0] };
+  };
+
+  it("opens each route for its own secret when all differ", () => {
+    setAll();
+    ROUTES.forEach((v) => expect([v, askRoute(v, value(ALL.indexOf(v))).ok]).toEqual([v, true]));
+  });
+
+  it("closes a route whose secret equals any other one, for every pair", () => {
+    for (const route of ROUTES) {
+      for (const other of ALL) {
+        if (other === route) continue;
+        setAll();
+        process.env[other] = value(ALL.indexOf(route));
+        const r = askRoute(route, value(ALL.indexOf(route)));
+        expect([route, other, r.ok, r.status]).toEqual([route, other, false, 503]);
+      }
+    }
+  });
+});
+
+describe("the log line for two secrets that hold the same value", () => {
+  const saved = { ...process.env };
+  afterAll(() => {
+    process.env = { ...saved };
+  });
+  const logFor = (other: string) => {
+    process.env.KLEAR_OPS_FEED_SECRET = "q".repeat(40);
+    process.env.KLEAR_STOCK_SYNC_SECRET = "r".repeat(40);
+    process.env.KLEAR_LENS_SNAPSHOT_SECRET = "s".repeat(40);
+    process.env.KLEAR_ORDER_CANCEL_SECRET = "t".repeat(40);
+    process.env.KLEAR_PROJECTION_SECRET = "u".repeat(40);
+    process.env[other] = "q".repeat(40);
+    const logged = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const res = { status: jest.fn(), json: jest.fn() };
+      res.status.mockReturnValue(res);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      authorizeBearer({ headers: { authorization: "Bearer x" } } as any, res as any, "KLEAR_OPS_FEED_SECRET");
+      return JSON.stringify(logged.mock.calls);
+    } finally {
+      logged.mockRestore();
+    }
+  };
+  it("says both are closed when both are route secrets", () => {
+    expect(logFor("KLEAR_STOCK_SYNC_SECRET")).toMatch(/both are closed/);
+  });
+  it("says only this route is closed when the other is a secret this server sends", () => {
+    const log = logFor("KLEAR_PROJECTION_SECRET");
+    expect(log).not.toMatch(/both are closed/);
+    expect(log).toMatch(/KLEAR_OPS_FEED_SECRET is closed/);
+  });
+});
